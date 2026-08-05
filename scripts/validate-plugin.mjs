@@ -12,6 +12,7 @@ const [{ default: entry }, { COMPANY_TOOL_NAMES }] = await Promise.all([
 
 assert(manifest.id === "company-os", "manifest id must be company-os");
 assert(entry.id === manifest.id, "runtime and manifest plugin ids must match");
+assert(pkg.version === manifest.version, "package and plugin manifest versions must match");
 assert(typeof entry.register === "function", "native plugin entry must expose register(api)");
 assert(pkg.peerDependencies?.openclaw === ">=2026.7.1", "OpenClaw peer dependency must be >=2026.7.1");
 assert(JSON.stringify(manifest.contracts?.tools) === JSON.stringify(COMPANY_TOOL_NAMES), "manifest tool contracts must exactly match runtime tools");

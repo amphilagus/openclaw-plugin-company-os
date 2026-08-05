@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-import { getMeeting, getSnapshot, getTask, post, subscribeToChanges } from "./api";
+import { deleteNotice, getMeeting, getSnapshot, getTask, post, subscribeToChanges } from "./api";
+import { BossMeetingGate } from "./BossMeetingGate";
 import { AgentAvatar, memberIdentity, memberName, useMemberIdentities, type MemberIdentityMap } from "./member-identity";
 import { MeetingHistory } from "./MeetingHistory";
 import type { MeetingDetail, MeetingSummary, Notice, Snapshot, Task, TaskDetail } from "./types";
@@ -73,6 +74,7 @@ function NoticesPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?
   const [history, setHistory] = useState(false);
   const [correcting, setCorrecting] = useState<Notice | null>(null);
   const [busy, setBusy] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const notices = snapshot.notices.filter((notice) => history || notice.effective);
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -101,6 +103,7 @@ function NoticesPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?
               <div className="coverage"><i style={{ width: `${notice.activeEmployeeCount ? notice.readCount / notice.activeEmployeeCount * 100 : 0}%` }} /></div>
               {notice.supersededById ? <span className="danger-text">已被后续公告替代</span> : null}
               {notice.effective ? <button className="text-button" onClick={() => setCorrecting(notice)}>发布更正</button> : null}
+              {confirmDelete === notice.id ? <button className="text-button danger-text" onClick={async () => { try { await deleteNotice(`/notices/${notice.id}`); setConfirmDelete(null); await reload(true); } catch (error) { window.alert(messageOf(error)); setConfirmDelete(null); } }}>确认删除</button> : <button className="text-button danger-text" onClick={() => setConfirmDelete(notice.id)}>删除</button>}
             </footer>
           </article>)}
       </section>
@@ -147,30 +150,58 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
     await post(`/meetings/${item.id}/cancel`, { reason });
     await reload(true);
   };
+  const startMeeting = async () => {
+    if (!meeting) return;
+    setBusy(true);
+    try {
+      setMeeting(await post<MeetingDetail>(`/meetings/${meeting.id}/start`, {}));
+      await reload(true);
+    } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
+  };
+  const approveEnd = async () => {
+    if (!meeting || !window.confirm("确认批准主持人的总结并结束这场会议？此操作会原子创建会议任务和公告。")) return;
+    setBusy(true);
+    try {
+      await post(`/meetings/${meeting.id}/approve-end`, {});
+      await reload(true);
+    } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
+  };
+  const rejectEnd = async () => {
+    if (!meeting) return;
+    const feedback = window.prompt("请告诉主持人为什么会议还不能结束：");
+    if (!feedback?.trim()) return;
+    setBusy(true);
+    try {
+      setMeeting(await post<MeetingDetail>(`/meetings/${meeting.id}/reject-end`, { feedback }));
+      await reload(true);
+    } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
+  };
   return <>
     <PageHeader eyebrow="SINGLE WORLDLINE · ONE ROOM" title="公司会议室" summary="所有公司会议严格串行。主持人控制发言权，Boss 插话排在当前发言之后。">
-      <span className={`room-state ${meeting ? "occupied" : "free"}`}>{meeting ? "会议进行中" : "会议室空闲"}</span>
+      <span className={`room-state ${meeting ? "occupied" : "free"}`}>{meeting?.awaitingBossStart ? "等待你开始" : meeting?.endRequestedAt ? "等待你决定结束" : meeting ? "会议进行中" : "会议室空闲"}</span>
     </PageHeader>
     {!meeting ? <Empty title="会议室现在是空的" body={snapshot.meetings.queue.length ? "排队会议即将由系统启动。" : "员工可通过 company_meeting_request 申请会议。"} /> :
       <div className="meeting-grid">
         <section className="meeting-stage panel">
           <div className="meeting-head">
             <div><div className="eyebrow">{meeting.type === "task" ? "任务会议" : "普通讨论"}</div><h2>{meeting.title}</h2><p>{meeting.agenda}</p></div>
-            <div className="meeting-facts"><span>主持人 <b>{memberName(identities, meeting.hostId)}</b> <code>{meeting.hostId}</code></span>{meeting.parentTaskId ? <span>父任务 <code>{shortId(meeting.parentTaskId)}</code></span> : null}</div>
+            <div className="meeting-facts"><span>主持人 <b>{memberName(identities, meeting.hostId)}</b> <code>{meeting.hostId}</code></span>{meeting.bossParticipates ? <span className="boss-required">Boss 直接参会</span> : null}{meeting.parentTaskId ? <span>父任务 <code>{shortId(meeting.parentTaskId)}</code></span> : null}</div>
           </div>
           <div className="transcript">
             {meeting.messages.map((message) => <MeetingMessageRow message={message} identities={identities} key={message.id} />)}
-            {meeting.currentTurn ? <div className="speaking"><i />等待 <b>{memberName(identities, meeting.currentTurn.speakerId)}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {memberName(identities, meeting.hostId)}</div>}
+            {meeting.awaitingBossStart || meeting.endRequestedAt
+              ? <BossMeetingGate meeting={meeting} busy={busy} start={() => void startMeeting()} approveEnd={() => void approveEnd()} rejectEnd={() => void rejectEnd()} />
+              : meeting.currentTurn ? <div className="speaking"><i />等待 <b>{memberName(identities, meeting.currentTurn.speakerId)}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {memberName(identities, meeting.hostId)}</div>}
           </div>
-          <form className="boss-composer" onSubmit={interject}>
+          {!meeting.awaitingBossStart && !meeting.endRequestedAt ? <form className="boss-composer" onSubmit={interject}>
             <div className="boss-label">BOSS 插话</div>
             <select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">共享记录（交给主持人）</option><option value={meeting.hostId}>@{memberName(identities, meeting.hostId)} · 主持人</option>{meeting.participants.map((p) => <option value={p.agentId} key={p.agentId}>@{memberName(identities, p.agentId, p.name)} · {p.role === "worker" ? "执行者" : "顾问"}</option>)}</select>
             <textarea value={body} onChange={(event) => setBody(event.target.value)} rows={3} placeholder="输入你的判断、追问或方向修正……" required />
             <button className="primary" disabled={busy}>{busy ? "排队中…" : target ? `在当前发言后 @${target}` : "加入会议记录"}</button>
-          </form>
+          </form> : null}
         </section>
         <aside className="meeting-side">
-          <section className="panel compact"><div className="panel-title">参会角色</div><div className="people-list"><Person id={meeting.hostId} role="主持人" identities={identities} />{meeting.participants.map((p) => <Person key={p.agentId} id={p.agentId} role={p.role === "worker" ? "执行者" : "顾问"} identities={identities} fallbackName={p.name} />)}</div></section>
+          <section className="panel compact"><div className="panel-title">参会角色</div><div className="people-list">{meeting.bossParticipates ? <Person id="boss" role={meeting.awaitingBossStart ? "待入场 · 最终决策者" : "直接参会 · 最终决策者"} identities={identities} /> : null}<Person id={meeting.hostId} role="主持人" identities={identities} />{meeting.participants.map((p) => <Person key={p.agentId} id={p.agentId} role={p.role === "worker" ? "执行者" : "顾问"} identities={identities} fallbackName={p.name} />)}</div></section>
           <section className="panel compact"><div className="panel-title">任务草案 <span>{meeting.taskDrafts.length}</span></div>{meeting.type === "discussion" ? <p className="muted">普通讨论会不能生成任务。</p> : meeting.taskDrafts.length ? meeting.taskDrafts.map((draft) => <div className="draft" key={draft.id}><b>{draft.title}</b><span>→ {memberName(identities, draft.assigneeId)}</span><small>{draft.acceptanceCriteria}</small></div>) : <p className="muted">主持人尚未提交任务草案。</p>}</section>
         </aside>
       </div>}
@@ -191,7 +222,7 @@ function MeetingMessageRow({ message, identities }: { message: MeetingDetail["me
 
 function QueueSection({ queue, history, reorder, cancel, identities }: { queue: MeetingSummary[]; history: MeetingSummary[]; reorder: (m: MeetingSummary, d: number) => void; cancel: (m: MeetingSummary) => void; identities: MemberIdentityMap }) {
   return <section className="queue-section"><div className="section-title"><div><span>WAITING LINE</span><h2>会议队列</h2></div><strong>{queue.length}</strong></div>
-    <div className="queue-list">{queue.length ? queue.map((item, index) => <div className="queue-item" key={item.id}><span className="queue-number">{index + 1}</span><div><b>{item.title}</b><small>{item.type === "task" ? "任务会议" : "普通讨论"} · 主持人 {memberName(identities, item.hostId)} · {formatTime(item.createdAt)}</small></div><div className="queue-actions"><button disabled={index === 0} onClick={() => void reorder(item, -1)}>↑</button><button disabled={index === queue.length - 1} onClick={() => void reorder(item, 1)}>↓</button><button className="danger" onClick={() => void cancel(item)}>取消</button></div></div>) : <p className="muted">当前没有排队会议。</p>}</div>
+    <div className="queue-list">{queue.length ? queue.map((item, index) => <div className="queue-item" key={item.id}><span className="queue-number">{index + 1}</span><div><b>{item.title}</b><small>{item.type === "task" ? "任务会议" : "普通讨论"} · 主持人 {memberName(identities, item.hostId)} · {item.bossParticipates ? "Boss 直接参会 · " : ""}{formatTime(item.createdAt)}</small></div><div className="queue-actions"><button disabled={index === 0} onClick={() => void reorder(item, -1)}>↑</button><button disabled={index === queue.length - 1} onClick={() => void reorder(item, 1)}>↓</button><button className="danger" onClick={() => void cancel(item)}>取消</button></div></div>) : <p className="muted">当前没有排队会议。</p>}</div>
     <MeetingHistory history={history} identities={identities} />
   </section>;
 }

@@ -18,6 +18,7 @@
 - 叶子负责人用 `company_task_submit` 提交摘要和 proof/artifact；派发者用 `company_task_review` 验收或驳回。
 - Agent 读取公告必须调用 `company_notice_read` 才会产生 read mark；读取 inbox 不会自动标记。
 - 后续可由架构师把 `company_inbox` 加入 Agent heartbeat；本插件本身不唤醒 Agent 处理任务或公告。
+- 需要 Boss 直接参加的会议在 `company_meeting_request` 中设置 `bossParticipates: true`。Boss 会收到创建和进入会议室两封邮件，并在会议室页面负责开始和最终结束审批。
 
 ## 会议恢复与超时
 
@@ -25,6 +26,7 @@
 - 恢复调度先按幂等 tag 删除同 tag 旧任务，再调度到 `agent:<agentId>:main`，避免重复点名。
 - 普通参会者默认 10 分钟未发言：轮次标记失败，控制权回主持人。
 - 主持人默认 30 分钟无动作：会议变成 `timed_out`，不创建任务、不发布正常汇报，会议室推进到下一场。
+- 等待 Boss 开始或等待 Boss 审批结束时暂停主持人超时；Gateway 重启后仍保持等待，不会误唤醒主持人。
 - Boss 只能取消排队会议，不能从 WebUI 中断当前活动会议。
 
 ## 数据与备份
@@ -85,3 +87,11 @@ openclaw config get gateway.controlUi.embedSandbox
 ### 任务会议无法结束
 
 必须同时满足：无未完成发言轮次、无待处理 Boss 插话、总结非空、每个 worker 至少一份草案、全部草案负责人仍是主持人的直属下属、父任务仍由主持人负责且可继续拆分。
+
+如果会议设置了 `bossParticipates: true`，满足上述条件后主持人的 `company_meeting_end` 只产生结束申请。Boss 需在「公司 → 会议室」中批准；选择「暂不结束」时必须填写反馈，系统随后重新唤醒主持人。
+
+### Boss 没有收到会议邮件
+
+默认读取 `~/.config/mail-skills/.env`，其中 QQ 默认账号至少需要 `PROVIDER=qq`、`USERNAME` 和 `PASSWORD`（QQ SMTP 授权码）。邮件采用持久 outbox，失败不会撤销会议；服务每 30 秒重试，最多五次，并将 `meeting.email_sent` 或 `meeting.email_failed` 写入审计。
+
+如果使用命名邮箱账号或不同收件地址，在插件配置中设置 `bossEmailNotifications.account` 或 `bossEmailNotifications.recipient`。检查 Gateway 日志中的 `company-os sent Boss meeting email` / `company-os failed to send Boss meeting email`，不要把授权码写入日志或仓库。

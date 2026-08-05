@@ -171,6 +171,67 @@ describe("notices", () => {
 });
 
 describe("meeting room", () => {
+  it("waits for Boss to start and requires Boss approval before a direct-participation meeting can end", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("Boss 参会父任务"), assigneeId: "cto" });
+    const requested = store.requestMeeting("cto", {
+      type: "task",
+      title: "Boss 直接参会大会",
+      agenda: "与 Boss 一起确定任务",
+      parentTaskId: root.id,
+      participants: [{ agentId: "eng-a", role: "worker" }],
+      bossParticipates: true,
+    });
+
+    expect(requested.meeting.status).toBe("active");
+    expect(requested.meeting.awaitingBossStart).toBe(true);
+    expect(requested.advance.schedule).toBeUndefined();
+    expect(store.pendingMeetingEmailNotifications().map((item) => item.kind)).toEqual(["created", "room_entered"]);
+    expect(() => store.speakMeeting("cto", requested.meeting.id, "提前开会")).toThrow(/waiting for Boss/);
+
+    store.db.prepare("UPDATE meetings SET waiting_on_host_since = ? WHERE id = ?")
+      .run(new Date(Date.now() - 60 * 60 * 1000).toISOString(), requested.meeting.id);
+    expect(store.sweepMeetingTimeouts(10 * 60 * 1000, 30 * 60 * 1000)).toEqual([]);
+    expect(store.meetingView(requested.meeting.id).status).toBe("active");
+
+    const start = store.startMeetingByBoss(requested.meeting.id);
+    expect(start.schedule?.agentId).toBe("cto");
+    expect(store.meetingView(requested.meeting.id).awaitingBossStart).toBe(false);
+    store.setMeetingTaskDrafts("cto", requested.meeting.id, [{ ...taskFields("执行任务"), assigneeId: "eng-a" }]);
+
+    const hostResult = store.endMeeting("cto", requested.meeting.id, "任务已经分配，请 Boss 批准结束", false);
+    expect(hostResult.meeting.status).toBe("active");
+    expect(hostResult.meeting.endRequestedSummary).toBe("任务已经分配，请 Boss 批准结束");
+    expect(hostResult.createdTasks).toHaveLength(0);
+    expect(store.listTasks("boss")).toHaveLength(1);
+    expect(() => store.endMeeting("cto", requested.meeting.id, "再次申请", false)).toThrow(/waiting for Boss/);
+
+    const approved = store.approveMeetingEndByBoss(requested.meeting.id);
+    expect(approved.meeting.status).toBe("completed");
+    expect(approved.createdTasks).toHaveLength(1);
+    expect(approved.notice?.kind).toBe("meeting_report");
+    expect(approved.meeting.audit.some((event: any) => event.actorId === "boss" && event.action === "meeting.completed")).toBe(true);
+  });
+
+  it("lets Boss reject an end request and returns control to the host", () => {
+    addOrg();
+    const meeting = store.requestMeeting("eng-a", {
+      type: "discussion",
+      title: "需要继续讨论",
+      agenda: "由 Boss 判断是否结束",
+      participants: [],
+      bossParticipates: true,
+    }).meeting;
+    store.startMeetingByBoss(meeting.id);
+    store.endMeeting("eng-a", meeting.id, "初步结论", false);
+
+    const advance = store.rejectMeetingEndByBoss(meeting.id, "风险还没有讨论清楚");
+    expect(advance.schedule?.agentId).toBe("eng-a");
+    const resumed = store.meetingView(meeting.id);
+    expect(resumed.endRequestedAt).toBeNull();
+    expect(resumed.messages.at(-1)?.body).toContain("风险还没有讨论清楚");
+  });
+
   it("serializes meetings and processes Boss @ intervention before returning to host", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("父任务"), assigneeId: "cto" });

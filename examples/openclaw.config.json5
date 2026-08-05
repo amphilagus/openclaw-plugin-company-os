@@ -13,6 +13,13 @@
           participantTurnTimeoutSeconds: 600,
           hostIdleTimeoutSeconds: 1800,
           taskStaleAfterHours: 72,
+          bossEmailNotifications: {
+            enabled: true,
+            // Defaults to ~/.config/mail-skills/.env and sends to USERNAME.
+            // account: "work",
+            // recipient: "boss@qq.com",
+            // configPath: "~/.config/mail-skills/.env",
+          },
           // Optional. Default: ~/.openclaw/plugins/company-os/company-os.sqlite
           // databasePath: "/absolute/path/company-os.sqlite",
         },

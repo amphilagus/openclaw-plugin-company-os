@@ -1,6 +1,6 @@
 # OpenClaw Company OS
 
-`company-os` 是一个原生 OpenClaw 插件，把公司治理收敛到一套共享基础设施和三种业务对象：会议、严格层级任务、不可变公告。Boss 在统一 WebUI 操作，Agent 只能通过 `company_*` 工具参与。
+`company-os` 是一个原生 OpenClaw 插件，把公司治理收敛到一套共享基础设施和三种业务对象：会议、严格层级任务、公司公告。Boss 在统一 WebUI 操作，Agent 只能通过 `company_*` 工具参与。
 
 ## 核心约束
 
@@ -8,7 +8,8 @@
 - 任务是严格树，不是 DAG：根任务只能由 Boss 派给一级直属员工；子任务只能由父任务负责人派给直属下属。
 - 任务只能自下而上关闭。负责人携 proof 提交 review，派发者验收后永久关闭。
 - 会议严格串行。任务会议结束时，子任务、会议总结和会议汇报公告在同一事务中原子提交。
-- 公告不可编辑或删除；修正通过 `supersedesNoticeId` 发布新公告。
+- 会议可设置 `bossParticipates=true`：进入会议室后等待 Boss 手动开始，主持人只能申请结束，最终结束权固定属于 Boss。
+- 公告不可编辑；修正通过 `supersedesNoticeId` 发布新公告。Boss 还可在 WebUI 二次确认后审计删除公告。
 - Boss 写操作由服务端固定记录为 `actor=boss`；Agent 身份只读取可信的 `toolContext.agentId`。
 - 任务与公告不主动唤醒 Agent；会议点名会调度 `agent:<agentId>:main`。
 
@@ -25,12 +26,12 @@ OpenClaw Gateway
     ├── organization + audit
     ├── task tree + versions + proof
     ├── notices + read marks
-    └── meeting queue + transcript + turns + drafts
+    └── meeting queue + transcript + turns + drafts + email outbox
 ```
 
 前端是 React + Vite，包含三个真实路由：
 
-- `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、Boss 插话、任务草案、队列和历史。
+- `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、Boss 开始/结束审批、插话、任务草案、队列和历史。
 - `/plugins/company-os-ui/tasks`：任务树、风险、版本/proof/审计、Boss 兜底操作和根任务创建。
 - `/plugins/company-os-ui/notices`：当前共识、历史更正、会议汇报和阅读覆盖。
 
@@ -66,6 +67,16 @@ npm run build
 
 默认数据库位于 `~/.openclaw/plugins/company-os/company-os.sqlite`。配置样例见 [examples/openclaw.config.json5](examples/openclaw.config.json5)，运行与恢复说明见 [docs/RUNBOOK.md](docs/RUNBOOK.md)。
 
+### Boss 直接参会
+
+Agent 申请会议时可传入 `bossParticipates: true`。该模式有三个额外约束：
+
+1. 创建会议时向 Boss 邮箱发送“会议已创建”提醒；轮到该会议进入唯一会议室时再发送“已进入会议室”提醒。
+2. 会议进入会议室后不会唤醒主持人，也不会触发主持人超时；Boss 必须在会议室页面点击「我已进入，开始会议」。
+3. 主持人调用 `company_meeting_end` 只会提交总结和结束申请。Boss 在 WebUI 批准后才会原子创建任务/公告并释放会议室，也可退回主持人继续讨论。
+
+邮件默认复用 `~/.config/mail-skills/.env` 的默认 SMTP 账号，并发送到该账号自身。本机已有的 QQ 邮箱配置无需复制授权码。可以通过 `bossEmailNotifications.account` 选择命名账号，或用 `recipient`、`configPath` 覆盖收件地址和配置路径。
+
 ## Agent 工具
 
 | 模块 | 工具 |
@@ -80,7 +91,7 @@ npm run build
 
 ## 测试
 
-`npm test` 覆盖组织环、非法员工、跨级派发、proof、版本、阻塞/停滞风险、取消分支、逐层关单、统一 inbox、单会议室、Boss `@` 插话、任务会议原子回滚、超时、重启恢复、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
+`npm test` 覆盖组织环、非法员工、跨级派发、proof、版本、阻塞/停滞风险、取消分支、逐层关单、统一 inbox、单会议室、Boss `@` 插话、Boss 参会开始/结束闸门、QQ SMTP 配置、持久邮件 outbox、数据库迁移、任务会议原子回滚、超时、重启恢复、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
 
 `npm run plugin:validate` 还会验证构建产物、清单与 28 个工具契约、长驻服务、相互隔离的 WebUI/API 路由，以及 `operator.write` Control UI 标签页。
 

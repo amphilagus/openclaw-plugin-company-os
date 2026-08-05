@@ -2,7 +2,7 @@
   "id": "company-os",
   "name": "Company OS",
   "description": "公司级会议、多级任务和告示板治理系统。",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -23,6 +23,26 @@
       },
       "databasePath": {
         "type": "string"
+      },
+      "bossEmailNotifications": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "account": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9]+$"
+          },
+          "recipient": {
+            "type": "string"
+          },
+          "configPath": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       }
     },
     "additionalProperties": false

@@ -18,6 +18,12 @@ export type CompanyOsConfig = {
   hostIdleTimeoutSeconds?: number;
   taskStaleAfterHours?: number;
   databasePath?: string;
+  bossEmailNotifications?: {
+    enabled?: boolean;
+    account?: string;
+    recipient?: string;
+    configPath?: string;
+  };
 };
 
 export type ResolvedCompanyOsConfig = {
@@ -25,6 +31,12 @@ export type ResolvedCompanyOsConfig = {
   hostIdleTimeoutSeconds: number;
   taskStaleAfterHours: number;
   databasePath?: string;
+  bossEmailNotifications: {
+    enabled: boolean;
+    account?: string;
+    recipient?: string;
+    configPath?: string;
+  };
 };
 
 export type EvidenceInput = {
@@ -75,11 +87,18 @@ export type HttpMutationActor = {
 };
 
 export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedCompanyOsConfig {
+  const email = config?.bossEmailNotifications;
   return {
     participantTurnTimeoutSeconds: clampInteger(config?.participantTurnTimeoutSeconds, 600, 60),
     hostIdleTimeoutSeconds: clampInteger(config?.hostIdleTimeoutSeconds, 1800, 60),
     taskStaleAfterHours: clampInteger(config?.taskStaleAfterHours, 72, 1),
     ...(config?.databasePath?.trim() ? { databasePath: config.databasePath.trim() } : {}),
+    bossEmailNotifications: {
+      enabled: email?.enabled !== false,
+      ...(email?.account?.trim() ? { account: email.account.trim() } : {}),
+      ...(email?.recipient?.trim() ? { recipient: email.recipient.trim() } : {}),
+      ...(email?.configPath?.trim() ? { configPath: email.configPath.trim() } : {}),
+    },
   };
 }
 

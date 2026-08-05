@@ -73,7 +73,8 @@ export function MeetingHistoryDetail({ meeting, identities = {}, close }: { meet
       <div className="history-facts">
         <span>主持人 <b>{memberName(identities, meeting.hostId)}</b></span>
         <span>申请人 <b>{memberName(identities, meeting.requestedBy)}</b></span>
-        <span>开始 <b>{formatTime(meeting.startedAt ?? meeting.createdAt)}</b></span>
+        {meeting.bossParticipates ? <span><b>Boss 直接参会</b></span> : null}
+        <span>开始 <b>{formatTime(meeting.bossStartedAt ?? meeting.startedAt ?? meeting.createdAt)}</b></span>
         <span>结束 <b>{formatTime(meeting.endedAt)}</b></span>
         {meeting.parentTaskId ? <span>父任务 <code>{meeting.parentTaskId}</code></span> : null}
       </div>

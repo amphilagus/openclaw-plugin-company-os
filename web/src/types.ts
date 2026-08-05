@@ -63,6 +63,12 @@ export type MeetingSummary = {
   requestedBy: string;
   parentTaskId: string | null;
   summary: string | null;
+  bossParticipates: boolean;
+  bossStartedAt: string | null;
+  awaitingBossStart: boolean;
+  endRequestedAt: string | null;
+  endRequestedSummary: string | null;
+  endRequestedPublishNotice: boolean;
   queuePosition: number;
   participantCount: number;
   currentTurnId: string | null;

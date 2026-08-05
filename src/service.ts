@@ -1,5 +1,6 @@
 import type { PluginLogger } from "openclaw/plugin-sdk/core";
 
+import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
 import { resolveAgentVisualIdentity, type AgentVisualIdentity } from "./identity.js";
 import { CompanyOsStore } from "./store.js";
 import type { MeetingAdvance, ResolvedCompanyOsConfig, ServiceEvent } from "./types.js";
@@ -23,10 +24,12 @@ export class CompanyOsService {
   private readonly workflow: SessionWorkflow;
   private readonly logger: PluginLogger;
   private readonly runtimeConfig: unknown;
+  private readonly meetingEmailSender: MeetingEmailSender;
   private readonly identityCache = new Map<string, AgentVisualIdentity>();
   private readonly listeners = new Set<(event: ServiceEvent) => void>();
   private readonly eventHistory: ServiceEvent[] = [];
   private scanTimer?: NodeJS.Timeout;
+  private emailFlush?: Promise<void>;
 
   constructor(options: {
     databasePath: string;
@@ -35,11 +38,13 @@ export class CompanyOsService {
     runtimeConfig: unknown;
     workflow: SessionWorkflow;
     logger: PluginLogger;
+    meetingEmailSender?: MeetingEmailSender;
   }) {
     this.config = options.config;
     this.runtimeConfig = options.runtimeConfig;
     this.workflow = options.workflow;
     this.logger = options.logger;
+    this.meetingEmailSender = options.meetingEmailSender ?? new SmtpMeetingEmailSender(options.config.bossEmailNotifications);
     this.store = new CompanyOsStore({
       databasePath: options.databasePath,
       allowedAgentIds: options.allowedAgentIds,
@@ -50,6 +55,7 @@ export class CompanyOsService {
 
   async start() {
     await this.recover();
+    await this.flushMeetingEmails();
     this.scanTimer = setInterval(() => {
       void this.scanTimeouts().catch((error) => this.logger.error(`company-os timeout scan failed: ${formatError(error)}`));
     }, 30_000);
@@ -114,6 +120,7 @@ export class CompanyOsService {
   }
 
   async dispatchAdvance(advance: MeetingAdvance | null | undefined) {
+    await this.flushMeetingEmails();
     if (!advance?.schedule) return;
     const schedule = advance.schedule;
     const sessionKey = `agent:${schedule.agentId}:main`;
@@ -157,6 +164,32 @@ export class CompanyOsService {
       this.config.hostIdleTimeoutSeconds * 1000,
     );
     for (const advance of advances) await this.dispatchAdvance(advance);
+    if (advances.length === 0) await this.flushMeetingEmails();
+  }
+
+  private async flushMeetingEmails(): Promise<void> {
+    if (this.emailFlush) {
+      await this.emailFlush;
+      return this.flushMeetingEmails();
+    }
+    this.emailFlush = (async () => {
+      for (const notification of this.store.pendingMeetingEmailNotifications()) {
+        try {
+          await this.meetingEmailSender.send(notification);
+          this.store.markMeetingEmailSent(notification.id);
+          this.logger.info(`company-os sent Boss meeting email ${notification.kind} for ${notification.meetingId}`);
+        } catch (error) {
+          const message = formatError(error);
+          this.store.markMeetingEmailFailed(notification.id, message);
+          this.logger.error(`company-os failed to send Boss meeting email ${notification.kind} for ${notification.meetingId}: ${message}`);
+        }
+      }
+    })();
+    try {
+      await this.emailFlush;
+    } finally {
+      this.emailFlush = undefined;
+    }
   }
 }
 

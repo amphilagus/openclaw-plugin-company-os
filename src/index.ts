@@ -27,6 +27,12 @@ const ConfigSchema = Type.Object({
   hostIdleTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 60, default: 1800 })),
   taskStaleAfterHours: Type.Optional(Type.Integer({ minimum: 1, default: 72 })),
   databasePath: Type.Optional(Type.String({ minLength: 1 })),
+  bossEmailNotifications: Type.Optional(Type.Object({
+    enabled: Type.Optional(Type.Boolean({ default: true })),
+    account: Type.Optional(Type.String({ minLength: 1, pattern: "^[A-Za-z0-9]+$" })),
+    recipient: Type.Optional(Type.String({ minLength: 3 })),
+    configPath: Type.Optional(Type.String({ minLength: 1 })),
+  }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
 const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({

@@ -44,6 +44,12 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 201, data: store.publishNotice("boss", body as any) };
   }
 
+  const noticeAction = route.match(/^\/notices\/([^/]+)$/);
+  if (method === "DELETE" && noticeAction) {
+    store.deleteNotice("boss", decodeURIComponent(noticeAction[1]!));
+    return { status: 200, data: { ok: true } };
+  }
+
   if (method === "POST" && route === "/meetings") {
     const result = store.requestMeeting("boss", body as any);
     await service.dispatchAdvance(result.advance);
@@ -66,7 +72,7 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 200, data };
   }
 
-  const meetingAction = route.match(/^\/meetings\/([^/]+)\/(interject|reorder|cancel)$/);
+  const meetingAction = route.match(/^\/meetings\/([^/]+)\/(interject|reorder|cancel|start|approve-end|reject-end)$/);
   if (method === "POST" && meetingAction) {
     const meetingId = decodeURIComponent(meetingAction[1]!);
     const action = meetingAction[2]!;
@@ -77,6 +83,21 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     }
     if (action === "reorder") {
       return { status: 200, data: store.reorderMeeting(meetingId, Number(body.targetPosition)) };
+    }
+    if (action === "start") {
+      const advance = store.startMeetingByBoss(meetingId);
+      await service.dispatchAdvance(advance);
+      return { status: 200, data: store.meetingView(meetingId) };
+    }
+    if (action === "approve-end") {
+      const result = store.approveMeetingEndByBoss(meetingId);
+      await service.dispatchAdvance(result.advance);
+      return { status: 200, data: result };
+    }
+    if (action === "reject-end") {
+      const advance = store.rejectMeetingEndByBoss(meetingId, body.feedback);
+      await service.dispatchAdvance(advance);
+      return { status: 200, data: store.meetingView(meetingId) };
     }
     return { status: 200, data: store.cancelMeeting("boss", meetingId, body.reason) };
   }

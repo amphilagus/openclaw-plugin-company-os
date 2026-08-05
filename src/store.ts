@@ -15,6 +15,7 @@ import type {
   TaskDraftInput,
   TaskStatus,
 } from "./types.js";
+import type { MeetingEmailKind, MeetingEmailNotification } from "./email.js";
 
 type Row = Record<string, any>;
 
@@ -57,8 +58,12 @@ export class CompanyOsStore {
     const schemaRow = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as Row | undefined;
     const currentVersion = schemaRow ? Number(schemaRow.value) : 0;
     if (!Number.isInteger(currentVersion) || currentVersion < 0) throw new Error("company-os schema version is invalid");
-    if (currentVersion > 1) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
-    if (currentVersion === 1) return;
+    if (currentVersion > 2) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
+    if (currentVersion === 2) return;
+    if (currentVersion === 1) {
+      this.migrateSchemaV2();
+      return;
+    }
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.exec(`
@@ -185,6 +190,11 @@ export class CompanyOsStore {
         parent_task_id TEXT REFERENCES tasks(id),
         summary TEXT,
         publish_notice INTEGER NOT NULL DEFAULT 0 CHECK (publish_notice IN (0, 1)),
+        boss_participates INTEGER NOT NULL DEFAULT 0 CHECK (boss_participates IN (0, 1)),
+        boss_started_at TEXT,
+        end_requested_at TEXT,
+        end_requested_summary TEXT,
+        end_requested_publish_notice INTEGER NOT NULL DEFAULT 0 CHECK (end_requested_publish_notice IN (0, 1)),
         queue_position INTEGER NOT NULL,
         current_turn_id TEXT,
         waiting_on_host_since TEXT,
@@ -249,15 +259,59 @@ export class CompanyOsStore {
         UNIQUE(meeting_id, position)
       );
 
+      CREATE TABLE IF NOT EXISTS meeting_email_notifications (
+        id TEXT PRIMARY KEY,
+        meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('created', 'room_entered')),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        sent_at TEXT,
+        UNIQUE(meeting_id, kind)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee_id, status);
       CREATE INDEX IF NOT EXISTS idx_tasks_issuer_status ON tasks(issuer_id, status);
       CREATE INDEX IF NOT EXISTS idx_notices_created ON notices(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_meetings_status_queue ON meetings(status, queue_position);
       CREATE INDEX IF NOT EXISTS idx_meeting_messages_sequence ON meeting_messages(meeting_id, sequence);
+      CREATE INDEX IF NOT EXISTS idx_meeting_email_pending ON meeting_email_notifications(status, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meeting ON meetings(status) WHERE status = 'active';
       `);
-      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')").run();
+      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2')").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV2() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        ALTER TABLE meetings ADD COLUMN boss_participates INTEGER NOT NULL DEFAULT 0 CHECK (boss_participates IN (0, 1));
+        ALTER TABLE meetings ADD COLUMN boss_started_at TEXT;
+        ALTER TABLE meetings ADD COLUMN end_requested_at TEXT;
+        ALTER TABLE meetings ADD COLUMN end_requested_summary TEXT;
+        ALTER TABLE meetings ADD COLUMN end_requested_publish_notice INTEGER NOT NULL DEFAULT 0 CHECK (end_requested_publish_notice IN (0, 1));
+
+        CREATE TABLE meeting_email_notifications (
+          id TEXT PRIMARY KEY,
+          meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('created', 'room_entered')),
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          sent_at TEXT,
+          UNIQUE(meeting_id, kind)
+        );
+        CREATE INDEX idx_meeting_email_pending ON meeting_email_notifications(status, created_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '2' WHERE key = 'schema_version'").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -884,6 +938,15 @@ export class CompanyOsStore {
     return { noticeId, readAt };
   }
 
+  deleteNotice(actorId: Actor, noticeId: string) {
+    if (actorId !== "boss")
+      throw new Error("only Boss can delete notices");
+    const notice = this.db.prepare("SELECT id FROM notices WHERE id = ?").get(noticeId) as Row | undefined;
+    if (!notice) throw new Error(`notice not found: ${noticeId}`);
+    this.db.prepare("DELETE FROM notices WHERE id = ?").run(noticeId);
+    this.audit({ actorId, action: "notice.deleted", entityType: "notice", entityId: noticeId });
+  }
+
   publishNotice(actorId: Actor, input: { title: string; body: string; supersedesNoticeId?: string }) {
     if (actorId !== "boss") this.requireAgentMember(actorId);
     if (!this.canPublishNotice(actorId)) throw new Error("only Boss, main, or a current manager can publish notices");
@@ -944,6 +1007,7 @@ export class CompanyOsStore {
     parentTaskId?: string;
     hostId?: string;
     participants?: MeetingParticipantInput[];
+    bossParticipates?: boolean;
   }): { meeting: ReturnType<CompanyOsStore["meetingView"]>; advance: MeetingAdvance } {
     if (actorId !== "boss") this.requireAgentMember(actorId);
     const hostId = actorId === "boss" ? required(input.hostId, "hostId") : actorId;
@@ -969,6 +1033,7 @@ export class CompanyOsStore {
     }
     const meetingId = randomUUID();
     const createdAt = nowIso();
+    const bossParticipates = Boolean(input.bossParticipates);
     const advance = this.transaction(() => {
       const active = this.db.prepare("SELECT id FROM meetings WHERE status = 'active'").get() as Row | undefined;
       const queue = this.db.prepare("SELECT COALESCE(MAX(queue_position), 0) AS position FROM meetings WHERE status = 'queued'").get() as Row;
@@ -976,9 +1041,9 @@ export class CompanyOsStore {
       const position = status === "active" ? 0 : Number(queue.position) + 1;
       this.db.prepare(`
         INSERT INTO meetings (
-          id, type, status, title, agenda, host_id, requested_by, parent_task_id, queue_position,
+          id, type, status, title, agenda, host_id, requested_by, parent_task_id, boss_participates, queue_position,
           waiting_on_host_since, created_at, started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         meetingId,
         input.type,
@@ -988,8 +1053,9 @@ export class CompanyOsStore {
         hostId,
         actorId,
         parentTaskId,
+        bossParticipates ? 1 : 0,
         position,
-        status === "active" ? createdAt : null,
+        status === "active" && !bossParticipates ? createdAt : null,
         createdAt,
         status === "active" ? createdAt : null,
       );
@@ -997,11 +1063,76 @@ export class CompanyOsStore {
         this.db.prepare("INSERT INTO meeting_participants (meeting_id, member_id, role) VALUES (?, ?, ?)")
           .run(meetingId, participant.agentId, participant.role);
       }
-      if (status === "active") this.addMeetingMessage(meetingId, "system", null, null, "会议室已开放，主持人开始组织会议。");
-      this.audit({ actorId, action: "meeting.requested", entityType: "meeting", entityId: meetingId, after: { ...input, hostId, status } });
-      return status === "active" ? { schedule: this.hostSchedule(meetingId, "会议已开始，请组织第一轮发言。") } : {};
+      if (bossParticipates) {
+        this.queueMeetingEmail(meetingId, "created");
+        if (status === "active") this.queueMeetingEmail(meetingId, "room_entered");
+      }
+      if (status === "active") {
+        this.addMeetingMessage(
+          meetingId,
+          "system",
+          null,
+          null,
+          bossParticipates
+            ? "会议已进入会议室，正在等待 Boss 点击“开始会议”。"
+            : "会议室已开放，主持人开始组织会议。",
+        );
+      }
+      this.audit({ actorId, action: "meeting.requested", entityType: "meeting", entityId: meetingId, after: { ...input, hostId, status, bossParticipates } });
+      if (status !== "active") return {};
+      if (bossParticipates) return { activatedMeetingId: meetingId };
+      return { activatedMeetingId: meetingId, schedule: this.hostSchedule(meetingId, "会议已开始，请组织第一轮发言。") };
     });
     return { meeting: this.meetingView(meetingId), advance };
+  }
+
+  pendingMeetingEmailNotifications(limit = 20): MeetingEmailNotification[] {
+    const rows = this.db.prepare(`
+      SELECT n.id AS notification_id, n.kind, m.id AS meeting_id, m.title, m.agenda, m.type,
+        m.host_id, host.name AS host_name, m.created_at, m.started_at
+      FROM meeting_email_notifications n
+      JOIN meetings m ON m.id = n.meeting_id
+      JOIN members host ON host.id = m.host_id
+      WHERE n.status IN ('pending', 'failed') AND n.attempts < 5
+      ORDER BY n.created_at, n.rowid LIMIT ?
+    `).all(Math.min(Math.max(Math.floor(limit), 1), 100)) as Row[];
+    return rows.map((row) => ({
+      id: row.notification_id,
+      meetingId: row.meeting_id,
+      kind: row.kind as MeetingEmailKind,
+      title: row.title,
+      agenda: row.agenda,
+      type: row.type as MeetingType,
+      hostId: row.host_id,
+      hostName: row.host_name,
+      createdAt: row.created_at,
+      startedAt: row.started_at,
+    }));
+  }
+
+  markMeetingEmailSent(notificationId: string) {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_email_notifications WHERE id = ?").get(notificationId) as Row | undefined;
+      if (!row || row.status === "sent") return;
+      this.db.prepare(`
+        UPDATE meeting_email_notifications SET status = 'sent', attempts = attempts + 1,
+          last_error = NULL, sent_at = ? WHERE id = ?
+      `).run(nowIso(), notificationId);
+      this.audit({ actorId: "system", action: "meeting.email_sent", entityType: "meeting", entityId: row.meeting_id, after: { kind: row.kind } });
+    });
+  }
+
+  markMeetingEmailFailed(notificationId: string, error: string) {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_email_notifications WHERE id = ?").get(notificationId) as Row | undefined;
+      if (!row || row.status === "sent") return;
+      const message = error.trim().slice(0, 1000) || "unknown SMTP error";
+      this.db.prepare(`
+        UPDATE meeting_email_notifications SET status = 'failed', attempts = attempts + 1,
+          last_error = ? WHERE id = ?
+      `).run(message, notificationId);
+      this.audit({ actorId: "system", action: "meeting.email_failed", entityType: "meeting", entityId: row.meeting_id, reason: message, after: { kind: row.kind } });
+    });
   }
 
   listMeetings(actorId: Actor = "boss") {
@@ -1043,6 +1174,22 @@ export class CompanyOsStore {
     };
   }
 
+  startMeetingByBoss(meetingId: string): MeetingAdvance {
+    const meeting = this.getMeetingRow(meetingId);
+    if (meeting.status !== "active") throw new Error("meeting is not active");
+    if (!meeting.boss_participates) throw new Error("this meeting does not require Boss to start it");
+    if (meeting.boss_started_at) throw new Error("meeting has already been started by Boss");
+    if (meeting.current_turn_id) throw new Error("meeting cannot start during an active speaking turn");
+    return this.transaction(() => {
+      const startedAt = nowIso();
+      this.db.prepare("UPDATE meetings SET boss_started_at = ?, waiting_on_host_since = ? WHERE id = ?")
+        .run(startedAt, startedAt, meetingId);
+      this.addMeetingMessage(meetingId, "boss", "boss", null, "我已进入会议室，现在开始会议。");
+      this.audit({ actorId: "boss", action: "meeting.started_by_boss", entityType: "meeting", entityId: meetingId });
+      return { schedule: this.hostSchedule(meetingId, "Boss 已进入会议室并点击开始，请组织第一轮发言。") };
+    });
+  }
+
   delegateMeeting(actorId: string, meetingId: string, speakerId: string, prompt: string): MeetingAdvance {
     this.requireAgentMember(actorId);
     const meeting = this.requireActiveHostedMeeting(actorId, meetingId);
@@ -1065,6 +1212,8 @@ export class CompanyOsStore {
     this.requireAgentMember(actorId);
     const meeting = this.getMeetingRow(meetingId);
     if (meeting.status !== "active") throw new Error("meeting is not active");
+    if (this.isAwaitingBossStart(meeting)) throw new Error("meeting is waiting for Boss to start it");
+    if (meeting.end_requested_at) throw new Error("meeting is waiting for Boss to decide whether it can end");
     const message = required(body, "body");
     return this.transaction(() => {
       if (!meeting.current_turn_id) {
@@ -1092,6 +1241,8 @@ export class CompanyOsStore {
   bossInterject(meetingId: string, body: string, targetId?: string): MeetingAdvance {
     const meeting = this.getMeetingRow(meetingId);
     if (meeting.status !== "active") throw new Error("meeting is not active");
+    if (this.isAwaitingBossStart(meeting)) throw new Error("start the meeting before speaking");
+    if (meeting.end_requested_at) throw new Error("decide the pending end request before speaking");
     if (targetId) {
       const related = targetId === meeting.host_id || Boolean(this.db.prepare(
         "SELECT 1 AS ok FROM meeting_participants WHERE meeting_id = ? AND member_id = ?",
@@ -1147,7 +1298,59 @@ export class CompanyOsStore {
     advance: MeetingAdvance;
   } {
     this.requireAgentMember(actorId);
-    const meeting = this.requireActiveHostedMeeting(actorId, meetingId);
+    const prepared = this.prepareMeetingEnd(actorId, meetingId, summary, publishNotice);
+    if (prepared.meeting.boss_participates) {
+      this.transaction(() => {
+        if (prepared.meeting.end_requested_at) throw new Error("meeting end is already awaiting Boss approval");
+        const requestedAt = nowIso();
+        this.db.prepare(`
+          UPDATE meetings SET end_requested_at = ?, end_requested_summary = ?,
+            end_requested_publish_notice = ?, waiting_on_host_since = NULL WHERE id = ?
+        `).run(requestedAt, prepared.summary, publishNotice ? 1 : 0, meetingId);
+        this.addMeetingMessage(meetingId, "system", null, null, "主持人已提交会议总结并申请结束，正在等待 Boss 决定。");
+        this.audit({
+          actorId,
+          action: "meeting.end_requested",
+          entityType: "meeting",
+          entityId: meetingId,
+          after: { summary: prepared.summary, publishNotice },
+        });
+      });
+      return { meeting: this.meetingView(meetingId, actorId), createdTasks: [], notice: null, advance: {} };
+    }
+    return this.finalizeMeeting(actorId, actorId, prepared.meeting, prepared.summary, publishNotice, prepared.drafts);
+  }
+
+  approveMeetingEndByBoss(meetingId: string) {
+    const meeting = this.getMeetingRow(meetingId);
+    if (meeting.status !== "active") throw new Error("meeting is not active");
+    if (!meeting.boss_participates) throw new Error("this meeting does not require Boss end approval");
+    if (!meeting.boss_started_at) throw new Error("meeting has not been started by Boss");
+    if (!meeting.end_requested_at || !meeting.end_requested_summary) throw new Error("the host has not requested to end this meeting");
+    const publishNotice = Boolean(meeting.end_requested_publish_notice);
+    const prepared = this.prepareMeetingEnd(meeting.host_id, meetingId, meeting.end_requested_summary, publishNotice, true);
+    return this.finalizeMeeting("boss", meeting.host_id, prepared.meeting, prepared.summary, publishNotice, prepared.drafts);
+  }
+
+  rejectMeetingEndByBoss(meetingId: string, feedback: string): MeetingAdvance {
+    const meeting = this.getMeetingRow(meetingId);
+    if (meeting.status !== "active") throw new Error("meeting is not active");
+    if (!meeting.boss_participates || !meeting.end_requested_at) throw new Error("there is no Boss end approval request");
+    const reason = required(feedback, "feedback");
+    return this.transaction(() => {
+      const resumedAt = nowIso();
+      this.db.prepare(`
+        UPDATE meetings SET end_requested_at = NULL, end_requested_summary = NULL,
+          end_requested_publish_notice = 0, waiting_on_host_since = ? WHERE id = ?
+      `).run(resumedAt, meetingId);
+      this.addMeetingMessage(meetingId, "boss", "boss", meeting.host_id, `暂不结束会议：${reason}`);
+      this.audit({ actorId: "boss", action: "meeting.end_rejected", entityType: "meeting", entityId: meetingId, reason });
+      return { schedule: this.hostSchedule(meetingId, `Boss 暂未批准结束会议：${reason}\n请继续主持。`) };
+    });
+  }
+
+  private prepareMeetingEnd(hostId: string, meetingId: string, summary: string, publishNotice: boolean, allowExistingRequest = false) {
+    const meeting = this.requireActiveHostedMeeting(hostId, meetingId, allowExistingRequest);
     if (meeting.current_turn_id) throw new Error("the current speaking turn must finish before the meeting can end");
     const pendingInterventions = this.db.prepare("SELECT COUNT(*) AS count FROM meeting_interventions WHERE meeting_id = ? AND status != 'delivered'")
       .get(meetingId) as Row;
@@ -1156,7 +1359,7 @@ export class CompanyOsStore {
     const drafts = this.db.prepare("SELECT * FROM meeting_task_drafts WHERE meeting_id = ? ORDER BY position").all(meetingId) as Row[];
     if (meeting.type === "task") {
       const parent = this.getTaskRow(meeting.parent_task_id);
-      if (parent.assignee_id !== actorId || !ACTIVE_TASK_STATUSES.has(parent.status as TaskStatus) || parent.status === "review") {
+      if (parent.assignee_id !== hostId || !ACTIVE_TASK_STATUSES.has(parent.status as TaskStatus) || parent.status === "review") {
         throw new Error("the bound parent task is no longer eligible for delegation");
       }
       const workers = this.db.prepare("SELECT member_id FROM meeting_participants WHERE meeting_id = ? AND role = 'worker'").all(meetingId) as Row[];
@@ -1167,11 +1370,22 @@ export class CompanyOsStore {
         }
       }
       for (const draft of drafts) {
-        if (!this.isDirectReport(actorId, draft.assignee_id)) throw new Error(`draft assignee is no longer a direct report: ${draft.assignee_id}`);
+        if (!this.isDirectReport(hostId, draft.assignee_id)) throw new Error(`draft assignee is no longer a direct report: ${draft.assignee_id}`);
       }
-    } else if (publishNotice && !this.canPublishNotice(actorId)) {
+    } else if (publishNotice && !this.canPublishNotice(hostId)) {
       throw new Error("the host does not have permission to publish a notice");
     }
+    return { meeting, summary: finalSummary, drafts };
+  }
+
+  private finalizeMeeting(
+    actorId: Actor,
+    hostId: string,
+    meeting: Row,
+    finalSummary: string,
+    publishNotice: boolean,
+    drafts: Row[],
+  ) {
     let createdTasks: ReturnType<CompanyOsStore["listTasks"]> = [];
     let notice: ReturnType<CompanyOsStore["listNotices"]>[number] | null = null;
     let advance: MeetingAdvance = {};
@@ -1180,41 +1394,42 @@ export class CompanyOsStore {
         createdTasks = drafts.map((draft) => this.insertTask({
           actorId,
           parentId: meeting.parent_task_id,
-          issuerId: actorId,
+          issuerId: hostId,
           assigneeId: draft.assignee_id,
           title: draft.title,
           description: draft.description,
           acceptanceCriteria: draft.acceptance_criteria,
-          sourceMeetingId: meetingId,
+          sourceMeetingId: meeting.id,
         }));
         notice = this.insertNotice({
           actorId,
-          authorId: actorId,
+          authorId: hostId,
           kind: "meeting_report",
           title: `会议汇报：${meeting.title}`,
           body: meetingReportBody(finalSummary, meeting.parent_task_id, createdTasks),
-          sourceMeetingId: meetingId,
+          sourceMeetingId: meeting.id,
         });
       } else if (publishNotice) {
         notice = this.insertNotice({
           actorId,
-          authorId: actorId,
+          authorId: hostId,
           kind: "meeting_report",
           title: `讨论会汇报：${meeting.title}`,
           body: finalSummary,
-          sourceMeetingId: meetingId,
+          sourceMeetingId: meeting.id,
         });
       }
       const endedAt = nowIso();
       this.db.prepare(`
         UPDATE meetings SET status = 'completed', summary = ?, publish_notice = ?, current_turn_id = NULL,
-          waiting_on_host_since = NULL, ended_at = ? WHERE id = ?
-      `).run(finalSummary, notice ? 1 : 0, endedAt, meetingId);
-      this.addMeetingMessage(meetingId, "system", null, null, "会议已完成，会议室已释放。");
-      this.audit({ actorId, action: "meeting.completed", entityType: "meeting", entityId: meetingId, after: { summary: finalSummary, createdTaskIds: createdTasks.map((task) => task.id), noticeId: notice?.id } });
+          waiting_on_host_since = NULL, end_requested_at = NULL, end_requested_summary = NULL,
+          end_requested_publish_notice = 0, ended_at = ? WHERE id = ?
+      `).run(finalSummary, notice ? 1 : 0, endedAt, meeting.id);
+      this.addMeetingMessage(meeting.id, "system", null, null, "会议已完成，会议室已释放。");
+      this.audit({ actorId, action: "meeting.completed", entityType: "meeting", entityId: meeting.id, after: { summary: finalSummary, createdTaskIds: createdTasks.map((task) => task.id), noticeId: notice?.id } });
       advance = this.activateNextMeeting();
     });
-    return { meeting: this.meetingView(meetingId), createdTasks, notice, advance };
+    return { meeting: this.meetingView(meeting.id), createdTasks, notice, advance };
   }
 
   cancelMeeting(actorId: Actor, meetingId: string, reason: string) {
@@ -1250,6 +1465,7 @@ export class CompanyOsStore {
   sweepMeetingTimeouts(participantTimeoutMs: number, hostTimeoutMs: number): MeetingAdvance[] {
     const meeting = this.db.prepare("SELECT * FROM meetings WHERE status = 'active'").get() as Row | undefined;
     if (!meeting) return [];
+    if (this.isAwaitingBossStart(meeting) || meeting.end_requested_at) return [];
     const now = Date.now();
     if (meeting.current_turn_id) {
       const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ? AND status = 'waiting'").get(meeting.current_turn_id) as Row | undefined;
@@ -1282,6 +1498,7 @@ export class CompanyOsStore {
   recoveryAdvance(): MeetingAdvance | null {
     const meeting = this.db.prepare("SELECT * FROM meetings WHERE status = 'active'").get() as Row | undefined;
     if (!meeting) return null;
+    if (this.isAwaitingBossStart(meeting) || meeting.end_requested_at) return null;
     if (meeting.current_turn_id) {
       const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ? AND status = 'waiting'").get(meeting.current_turn_id) as Row | undefined;
       if (turn) return { schedule: this.turnSchedule(meeting.id, turn.id, turn.speaker_id, turn.prompt) };
@@ -1289,11 +1506,17 @@ export class CompanyOsStore {
     return { schedule: this.hostSchedule(meeting.id, "Gateway 已恢复，请根据当前会议记录继续主持。") };
   }
 
-  private requireActiveHostedMeeting(actorId: string, meetingId: string) {
+  private requireActiveHostedMeeting(actorId: string, meetingId: string, allowExistingEndRequest = false) {
     const meeting = this.getMeetingRow(meetingId);
     if (meeting.status !== "active") throw new Error("meeting is not active");
     if (meeting.host_id !== actorId) throw new Error("only the host can perform this meeting action");
+    if (this.isAwaitingBossStart(meeting)) throw new Error("meeting is waiting for Boss to start it");
+    if (!allowExistingEndRequest && meeting.end_requested_at) throw new Error("meeting is waiting for Boss to decide whether it can end");
     return meeting;
+  }
+
+  private isAwaitingBossStart(meeting: Row) {
+    return Boolean(meeting.boss_participates) && !meeting.boss_started_at;
   }
 
   private getMeetingRow(meetingId: string) {
@@ -1324,6 +1547,12 @@ export class CompanyOsStore {
       parentTaskId: row.parent_task_id,
       summary: row.summary,
       publishNotice: Boolean(row.publish_notice),
+      bossParticipates: Boolean(row.boss_participates),
+      bossStartedAt: row.boss_started_at,
+      awaitingBossStart: row.status === "active" && this.isAwaitingBossStart(row),
+      endRequestedAt: row.end_requested_at,
+      endRequestedSummary: row.end_requested_summary,
+      endRequestedPublishNotice: Boolean(row.end_requested_publish_notice),
       queuePosition: Number(row.queue_position),
       participantCount: Number(participantCount.count),
       currentTurnId: row.current_turn_id,
@@ -1333,6 +1562,17 @@ export class CompanyOsStore {
       endedAt: row.ended_at,
       canceledReason: row.canceled_reason,
     };
+  }
+
+  private queueMeetingEmail(meetingId: string, kind: MeetingEmailKind) {
+    const id = randomUUID();
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO meeting_email_notifications (id, meeting_id, kind, status, created_at)
+      VALUES (?, ?, ?, 'pending', ?)
+    `).run(id, meetingId, kind, nowIso());
+    if (Number(result.changes) > 0) {
+      this.audit({ actorId: "system", action: "meeting.email_queued", entityType: "meeting", entityId: meetingId, after: { kind } });
+    }
   }
 
   private addMeetingMessage(
@@ -1397,10 +1637,13 @@ export class CompanyOsStore {
 
   private hostSchedule(meetingId: string, context: string) {
     const meeting = this.getMeetingRow(meetingId);
+    const endInstruction = meeting.boss_participates
+      ? "需要结束时请调用 company_meeting_end 提交总结并申请 Boss 批准；你不能直接关闭会议。"
+      : "需要结束时可调用 company_meeting_end。";
     return {
       meetingId,
       agentId: meeting.host_id,
-      prompt: `${context}\n会议 ID：${meetingId}\n请先调用 company_meeting_status 读取会议记录，再使用 company_meeting_speak、company_meeting_delegate、company_meeting_set_task_drafts 或 company_meeting_end 推进会议。`,
+      prompt: `${context}\n会议 ID：${meetingId}\n请先调用 company_meeting_status 读取会议记录，再使用 company_meeting_speak、company_meeting_delegate 或 company_meeting_set_task_drafts 推进会议。${endInstruction}`,
       tag: `company-os-host-${meetingId}`,
     };
   }
@@ -1419,12 +1662,23 @@ export class CompanyOsStore {
     const next = this.db.prepare("SELECT * FROM meetings WHERE status = 'queued' ORDER BY queue_position, created_at LIMIT 1").get() as Row | undefined;
     if (!next) return {};
     const startedAt = nowIso();
+    const bossParticipates = Boolean(next.boss_participates);
     this.db.prepare(`
       UPDATE meetings SET status = 'active', queue_position = 0, started_at = ?, waiting_on_host_since = ? WHERE id = ?
-    `).run(startedAt, startedAt, next.id);
-    this.addMeetingMessage(next.id, "system", null, null, "前一场会议已结束，会议室现已开放。");
+    `).run(startedAt, bossParticipates ? null : startedAt, next.id);
+    this.addMeetingMessage(
+      next.id,
+      "system",
+      null,
+      null,
+      bossParticipates
+        ? "前一场会议已结束，本场已进入会议室，正在等待 Boss 点击“开始会议”。"
+        : "前一场会议已结束，会议室现已开放。",
+    );
+    if (bossParticipates) this.queueMeetingEmail(next.id, "room_entered");
     this.normalizeMeetingQueue();
     this.audit({ actorId: "system", action: "meeting.activated", entityType: "meeting", entityId: next.id });
+    if (bossParticipates) return { activatedMeetingId: next.id };
     return { activatedMeetingId: next.id, schedule: this.hostSchedule(next.id, "排队会议现已开始，请组织第一轮发言。") };
   }
 

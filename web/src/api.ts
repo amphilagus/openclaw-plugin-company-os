@@ -29,6 +29,10 @@ export async function post<T = unknown>(path: string, body: unknown) {
   return request<T>(path, { method: "POST", body });
 }
 
+export async function deleteNotice<T = unknown>(path: string) {
+  return request<T>(path, { method: "DELETE" });
+}
+
 export function subscribeToChanges(onChange: () => void, onConnection: (live: boolean) => void) {
   const controller = new AbortController();
   void stream(controller.signal, onChange, onConnection);
@@ -83,7 +87,7 @@ async function stream(signal: AbortSignal, onChange: () => void, onConnection: (
   }
 }
 
-type RequestOptions = { method?: "GET" | "POST"; body?: unknown };
+type RequestOptions = { method?: "GET" | "POST" | "DELETE"; body?: unknown };
 
 async function request<T>(path: string, options: RequestOptions = {}) {
   const method = options.method ?? "GET";
@@ -109,7 +113,7 @@ async function request<T>(path: string, options: RequestOptions = {}) {
   return response.json() as Promise<T>;
 }
 
-function authHeaders() {
+function authHeaders(): Record<string, string> {
   const token = readControlUiToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }

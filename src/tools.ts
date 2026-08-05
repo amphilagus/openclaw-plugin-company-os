@@ -99,12 +99,13 @@ export function createCompanyOsTools(options: {
       supersedesNoticeId: Type.Optional(Id),
     }, { additionalProperties: false }), async (p) => store.publishNotice(actorId(), p as any)),
 
-    tool("company_meeting_request", "申请会议", "申请任务会议或普通讨论会；任务会议必须绑定你负责的父任务。", Type.Object({
+    tool("company_meeting_request", "申请会议", "申请任务会议或普通讨论会；bossParticipates=true 时会议进入会议室后必须等待 Boss 从 WebUI 开始和批准结束。", Type.Object({
       type: Type.Union([Type.Literal("task"), Type.Literal("discussion")]),
       title: Id,
       agenda: Id,
       parentTaskId: Type.Optional(Id),
       participants: Type.Optional(Type.Array(Participant)),
+      bossParticipates: Type.Optional(Type.Boolean()),
     }, { additionalProperties: false }), async (p) => {
       const result = store.requestMeeting(actorId(), p as any);
       await service.dispatchAdvance(result.advance);
@@ -131,7 +132,7 @@ export function createCompanyOsTools(options: {
     tool("company_meeting_set_task_drafts", "会议任务草案", "任务会议主持人整体替换子任务草案；每个 worker 结束前必须至少得到一项。", Type.Object({
       meetingId: Id, drafts: Type.Array(TaskDraft),
     }, { additionalProperties: false }), async (p) => store.setMeetingTaskDrafts(actorId(), p.meetingId, p.drafts)),
-    tool("company_meeting_end", "结束会议", "主持人结束会议。任务会议会原子创建子任务、总结和会议汇报公告。", Type.Object({
+    tool("company_meeting_end", "结束或申请结束会议", "普通会议由主持人结束；Boss 直接参会时只提交总结并申请结束，必须由 Boss 在 WebUI 批准。", Type.Object({
       meetingId: Id,
       summary: Id,
       publishNotice: Type.Optional(Type.Boolean()),

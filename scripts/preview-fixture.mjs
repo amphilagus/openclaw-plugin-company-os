@@ -17,17 +17,17 @@ const tasks = [
   { ...task("child-001", "root-001", "完成原生会议引擎", "cto", "eng-a", "blocked", []), blockedReason: "等待 Session 调度接口确认" },
   task("child-002", "root-001", "完成任务树与审计", "cto", "eng-b", "review", []),
 ];
-const activeMeeting = { id: "meeting-001", type: "task", status: "active", title: "Company OS 战略拆解会", agenda: "确定首版交付边界、负责人和验收标准", hostId: "cto", requestedBy: "cto", parentTaskId: "root-001", summary: null, queuePosition: 0, participantCount: 3, currentTurnId: "turn-001", createdAt: now, startedAt: now, endedAt: null, canceledReason: null };
+const activeMeeting = { id: "meeting-001", type: "task", status: "active", title: "Company OS 战略拆解会", agenda: "确定首版交付边界、负责人和验收标准", hostId: "cto", requestedBy: "cto", parentTaskId: "root-001", summary: null, bossParticipates: true, bossStartedAt: null, awaitingBossStart: true, endRequestedAt: null, endRequestedSummary: null, endRequestedPublishNotice: false, queuePosition: 0, participantCount: 3, currentTurnId: null, createdAt: now, startedAt: now, endedAt: null, canceledReason: null };
 const meeting = {
   ...activeMeeting,
   participants: [{ agentId: "eng-a", role: "worker", name: "高工 A", title: "高级工程师" }, { agentId: "eng-b", role: "worker", name: "高工 B", title: "高级工程师" }, { agentId: "main", role: "advisor", name: "架构师", title: "首席架构师" }],
   messages: [
-    { id: "m1", sequence: 1, authorKind: "system", authorId: null, targetId: null, body: "会议室已开放，主持人开始组织会议。", createdAt: now },
+    { id: "m1", sequence: 1, authorKind: "system", authorId: null, targetId: null, body: "会议已进入会议室，正在等待 Boss 点击“开始会议”。", createdAt: now },
     { id: "m2", sequence: 2, authorKind: "member", authorId: "cto", targetId: "eng-a", body: "请说明会议引擎的主要风险。", createdAt: now },
     { id: "m3", sequence: 3, authorKind: "boss", authorId: "boss", targetId: "main", body: "请从整体架构一致性上做一次判断。", createdAt: now },
   ],
   taskDrafts: [{ id: "d1", position: 0, title: "实现会议状态机", description: "队列与发言编排", acceptanceCriteria: "超时和恢复测试通过", assigneeId: "eng-a" }, { id: "d2", position: 1, title: "完成任务 API", description: "严格层级校验", acceptanceCriteria: "逐层验收演练通过", assigneeId: "eng-b" }],
-  currentTurn: { speakerId: "eng-a", prompt: "请说明会议引擎的主要风险。", startedAt: now },
+  currentTurn: null,
 };
 const historySummary = { ...activeMeeting, id: "meeting-history-001", status: "completed", title: "Company OS 立项会", summary: "确定会议、任务和告示板三大模块。", currentTurnId: null, endedAt: now };
 const historyMeeting = { ...meeting, ...historySummary, currentTurn: null };

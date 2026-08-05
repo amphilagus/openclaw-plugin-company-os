@@ -20,6 +20,12 @@ const summary: MeetingSummary = {
   requestedBy: "main",
   parentTaskId: "task-root-1",
   summary: "确定三个执行方向。",
+  bossParticipates: true,
+  bossStartedAt: "2026-08-05T08:05:00.000Z",
+  awaitingBossStart: false,
+  endRequestedAt: null,
+  endRequestedSummary: null,
+  endRequestedPublishNotice: false,
   queuePosition: 0,
   participantCount: 1,
   currentTurnId: null,
@@ -50,6 +56,7 @@ describe("meeting history UI", () => {
     expect(html).toContain("建议优先完成任务树");
     expect(html).toContain("高级工程师");
     expect(html).toContain("实现任务树");
+    expect(html).toContain("Boss 直接参会");
     expect(html).toContain("data:image/png;base64,aW1hZ2U=");
   });
 });

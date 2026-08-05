@@ -1,13 +1,13 @@
 {
   "name": "openclaw-plugin-company-os",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hierarchical company governance for OpenClaw: meetings, tasks, notices, and organization.",
   "type": "module",
   "private": true,
   "scripts": {
     "build": "npm run build:server && npm run build:web",
     "build:server": "tsc -p tsconfig.json",
-    "build:web": "vite build --config web/vite.config.ts",
+    "build:web": "tsc -p web/tsconfig.json && vite build --config web/vite.config.ts",
     "dev:web": "vite --config web/vite.config.ts",
     "preview:fixture": "node scripts/preview-fixture.mjs",
     "test": "vitest run",
@@ -25,12 +25,14 @@
     "openclaw": ">=2026.7.1"
   },
   "dependencies": {
+    "nodemailer": "^9.0.4",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "typebox": "^1.1.38"
   },
   "devDependencies": {
     "@types/node": "^25.0.0",
+    "@types/nodemailer": "^7.0.12",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^5.0.0",
