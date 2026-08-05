@@ -159,17 +159,15 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
     } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
   };
   const approveEnd = async () => {
-    if (!meeting || !window.confirm("确认批准主持人的总结并结束这场会议？此操作会原子创建会议任务和公告。")) return;
+    if (!meeting) return;
     setBusy(true);
     try {
       await post(`/meetings/${meeting.id}/approve-end`, {});
       await reload(true);
     } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
   };
-  const rejectEnd = async () => {
-    if (!meeting) return;
-    const feedback = window.prompt("请告诉主持人为什么会议还不能结束：");
-    if (!feedback?.trim()) return;
+  const rejectEnd = async (feedback: string) => {
+    if (!meeting || !feedback.trim()) return;
     setBusy(true);
     try {
       setMeeting(await post<MeetingDetail>(`/meetings/${meeting.id}/reject-end`, { feedback }));
@@ -190,7 +188,7 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
           <div className="transcript">
             {meeting.messages.map((message) => <MeetingMessageRow message={message} identities={identities} key={message.id} />)}
             {meeting.awaitingBossStart || meeting.endRequestedAt
-              ? <BossMeetingGate meeting={meeting} busy={busy} start={() => void startMeeting()} approveEnd={() => void approveEnd()} rejectEnd={() => void rejectEnd()} />
+              ? <BossMeetingGate meeting={meeting} busy={busy} start={() => void startMeeting()} approveEnd={() => void approveEnd()} rejectEnd={(fb) => void rejectEnd(fb)} />
               : meeting.currentTurn ? <div className="speaking"><i />等待 <b>{memberName(identities, meeting.currentTurn.speakerId)}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {memberName(identities, meeting.hostId)}</div>}
           </div>
           {!meeting.awaitingBossStart && !meeting.endRequestedAt ? <form className="boss-composer" onSubmit={interject}>
