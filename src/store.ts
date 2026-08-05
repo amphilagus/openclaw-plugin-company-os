@@ -928,6 +928,9 @@ export class CompanyOsStore {
       input.supersedesNoticeId ?? null,
       createdAt,
     );
+    this.db.prepare(`
+      INSERT OR IGNORE INTO notice_reads (notice_id, member_id, read_at) VALUES (?, ?, ?)
+    `).run(id, input.authorId, createdAt);
     this.audit({ actorId: input.actorId, action: "notice.published", entityType: "notice", entityId: id, after: { ...input, id } });
     return this.listNotices("boss").find((notice) => notice.id === id)!;
   }

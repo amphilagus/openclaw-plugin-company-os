@@ -1,6 +1,8 @@
-import type { MeetingDetail, Snapshot, TaskDetail } from "./types";
+import type { MeetingDetail, MemberIdentity, Snapshot, TaskDetail } from "./types";
+import { COMPANY_OS_GATEWAY_METHOD, getControlUiGatewayClient } from "./gateway-bridge";
 
 const API = "/plugins/company-os/api/v1";
+const identityRequests = new Map<string, Promise<MemberIdentity>>();
 
 export async function getSnapshot() {
   return request<Snapshot>("/snapshot");
@@ -14,8 +16,17 @@ export async function getTask(id: string) {
   return request<TaskDetail>(`/tasks/${encodeURIComponent(id)}`);
 }
 
+export function getMemberIdentity(id: string) {
+  const cached = identityRequests.get(id);
+  if (cached) return cached;
+  const pending = request<MemberIdentity>(`/identities/${encodeURIComponent(id)}`);
+  identityRequests.set(id, pending);
+  void pending.catch(() => identityRequests.delete(id));
+  return pending;
+}
+
 export async function post<T = unknown>(path: string, body: unknown) {
-  return request<T>(path, { method: "POST", body: JSON.stringify(body) });
+  return request<T>(path, { method: "POST", body });
 }
 
 export function subscribeToChanges(onChange: () => void, onConnection: (live: boolean) => void) {
@@ -25,11 +36,24 @@ export function subscribeToChanges(onChange: () => void, onConnection: (live: bo
 }
 
 async function stream(signal: AbortSignal, onChange: () => void, onConnection: (live: boolean) => void) {
-  let lastEventId = "";
+  let lastEventId: number | undefined;
   while (!signal.aborted) {
     try {
+      const client = getControlUiGatewayClient();
+      if (client) {
+        const result = await client.request<{ changed: boolean; lastEventId: number }>(
+          COMPANY_OS_GATEWAY_METHOD,
+          { method: "GET", path: "/events", lastEventId },
+        );
+        if (signal.aborted) return;
+        onConnection(true);
+        if (lastEventId === undefined || result.changed) onChange();
+        lastEventId = result.lastEventId;
+        continue;
+      }
+
       const response = await fetch(`${API}/events`, {
-        headers: { ...authHeaders(), ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}) },
+        headers: { ...authHeaders(), ...(lastEventId !== undefined ? { "Last-Event-ID": String(lastEventId) } : {}) },
         credentials: "same-origin",
         signal,
       });
@@ -47,7 +71,7 @@ async function stream(signal: AbortSignal, onChange: () => void, onConnection: (
         buffer = records.pop() ?? "";
         for (const record of records) {
           const id = record.match(/^id:\s*(.+)$/m)?.[1]?.trim();
-          if (id) lastEventId = id;
+          if (id && Number.isSafeInteger(Number(id))) lastEventId = Number(id);
           if (record.includes("event: change")) onChange();
         }
       }
@@ -59,15 +83,28 @@ async function stream(signal: AbortSignal, onChange: () => void, onConnection: (
   }
 }
 
-async function request<T>(path: string, init?: RequestInit) {
+type RequestOptions = { method?: "GET" | "POST"; body?: unknown };
+
+async function request<T>(path: string, options: RequestOptions = {}) {
+  const method = options.method ?? "GET";
+  const client = getControlUiGatewayClient();
+  if (client) {
+    return client.request<T>(COMPANY_OS_GATEWAY_METHOD, {
+      method,
+      path,
+      ...(options.body === undefined ? {} : { body: options.body }),
+    });
+  }
+
   const response = await fetch(`${API}${path}`, {
-    ...init,
+    method,
+    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
     credentials: "same-origin",
-    headers: { Accept: "application/json", ...(init?.body ? { "Content-Type": "application/json" } : {}), ...authHeaders(), ...init?.headers },
+    headers: { Accept: "application/json", ...(options.body === undefined ? {} : { "Content-Type": "application/json" }), ...authHeaders() },
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ error: response.statusText })) as { error?: string };
-    throw new Error(body.error || `HTTP ${response.status}`);
+    const body = await response.json().catch(() => ({ error: response.statusText })) as unknown;
+    throw new Error(apiErrorMessage(body) || `HTTP ${response.status}`);
   }
   return response.json() as Promise<T>;
 }
@@ -77,14 +114,32 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-function readControlUiToken() {
+export function readControlUiToken() {
+  return readControlUiTokenFrom(
+    [window.sessionStorage, window.localStorage],
+    window.location.host,
+  );
+}
+
+export function readControlUiTokenFrom(
+  stores: Array<Pick<Storage, "length" | "key" | "getItem">>,
+  host: string,
+) {
   const scopedPrefix = "openclaw.control.token.v1:";
-  const matchingKeys = Array.from({ length: window.localStorage.length }, (_, index) => window.localStorage.key(index))
-    .filter((key): key is string => Boolean(key?.startsWith(scopedPrefix)));
-  const scopedKey = matchingKeys.find((key) => key.includes(window.location.host))
-    ?? (matchingKeys.length === 1 ? matchingKeys[0] : undefined);
-  const raw = (scopedKey ? window.localStorage.getItem(scopedKey) : null)
-    ?? window.localStorage.getItem("openclaw.control.token.v1");
+  for (const store of stores) {
+    const matchingKeys = Array.from({ length: store.length }, (_, index) => store.key(index))
+      .filter((key): key is string => Boolean(key?.startsWith(scopedPrefix)));
+    const scopedKey = matchingKeys.find((key) => key.includes(host))
+      ?? (matchingKeys.length === 1 ? matchingKeys[0] : undefined);
+    const raw = (scopedKey ? store.getItem(scopedKey) : null)
+      ?? store.getItem("openclaw.control.token.v1");
+    const token = parseStoredToken(raw);
+    if (token) return token;
+  }
+  return "";
+}
+
+function parseStoredToken(raw: string | null) {
   if (!raw) return "";
   try {
     const value = JSON.parse(raw) as unknown;
@@ -95,6 +150,16 @@ function readControlUiToken() {
     }
   } catch {
     return raw;
+  }
+  return "";
+}
+
+function apiErrorMessage(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const error = (value as { error?: unknown }).error;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string") {
+    return (error as { message: string }).message;
   }
   return "";
 }

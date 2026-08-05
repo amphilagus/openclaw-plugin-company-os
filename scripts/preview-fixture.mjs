@@ -29,11 +29,13 @@ const meeting = {
   taskDrafts: [{ id: "d1", position: 0, title: "实现会议状态机", description: "队列与发言编排", acceptanceCriteria: "超时和恢复测试通过", assigneeId: "eng-a" }, { id: "d2", position: 1, title: "完成任务 API", description: "严格层级校验", acceptanceCriteria: "逐层验收演练通过", assigneeId: "eng-b" }],
   currentTurn: { speakerId: "eng-a", prompt: "请说明会议引擎的主要风险。", startedAt: now },
 };
+const historySummary = { ...activeMeeting, id: "meeting-history-001", status: "completed", title: "Company OS 立项会", summary: "确定会议、任务和告示板三大模块。", currentTurnId: null, endedAt: now };
+const historyMeeting = { ...meeting, ...historySummary, currentTurn: null };
 const snapshot = {
   organization: members,
   tasks,
   notices: [{ id: "notice-001", authorId: "main", kind: "manual", title: "Company OS 架构基线", body: "所有治理行为统一进入会议、任务和公告三个模块。\n任务关闭严格遵循自下而上原则。", sourceMeetingId: null, supersedesNoticeId: null, supersededById: null, effective: true, activeEmployeeCount: 4, readCount: 3, createdAt: now }],
-  meetings: { active: activeMeeting, queue: [{ ...activeMeeting, id: "meeting-002", type: "discussion", status: "queued", title: "前端交互评审", hostId: "eng-a", parentTaskId: null, queuePosition: 1, currentTurnId: null }], history: [] },
+  meetings: { active: activeMeeting, queue: [{ ...activeMeeting, id: "meeting-002", type: "discussion", status: "queued", title: "前端交互评审", hostId: "eng-a", parentTaskId: null, queuePosition: 1, currentTurnId: null }], history: [historySummary] },
   generatedAt: now,
 };
 
@@ -41,6 +43,12 @@ const server = createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   if (url.pathname.endsWith("/api/v1/snapshot")) return json(res, snapshot);
   if (url.pathname.endsWith("/api/v1/meetings/meeting-001")) return json(res, meeting);
+  if (url.pathname.endsWith("/api/v1/meetings/meeting-history-001")) return json(res, historyMeeting);
+  if (url.pathname.includes("/api/v1/identities/")) {
+    const id = decodeURIComponent(url.pathname.split("/").at(-1));
+    const member = members.find((candidate) => candidate.id === id);
+    return json(res, { id, name: member?.name ?? id, title: member?.title ?? "", emoji: id === "main" ? "⚙️" : "🔧", avatarUrl: "data:image/png;base64,iVBORw0KGgo=" });
+  }
   if (url.pathname.includes("/api/v1/tasks/")) return json(res, { ...tasks.find((item) => url.pathname.endsWith(item.id)), versions: [], progress: [], submissions: [], audit: [] });
   if (url.pathname.endsWith("/api/v1/events")) {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
@@ -48,14 +56,14 @@ const server = createServer((req, res) => {
     return;
   }
   if (req.method === "POST") return json(res, meeting);
-  const relative = url.pathname.replace(/^\/plugins\/company-os\/?/, "") || "index.html";
+  const relative = url.pathname.replace(/^\/plugins\/company-os-ui\/?/, "") || "index.html";
   const candidate = path.resolve(root, relative);
   const file = candidate.startsWith(`${root}${path.sep}`) && existsSync(candidate) && statSync(candidate).isFile() ? candidate : path.join(root, "index.html");
   res.writeHead(200, { "Content-Type": contentType(file) });
   createReadStream(file).pipe(res);
 });
 
-server.listen(4174, "127.0.0.1", () => console.log("Company OS fixture: http://127.0.0.1:4174/plugins/company-os/meeting-room"));
+server.listen(4174, "127.0.0.1", () => console.log("Company OS fixture: http://127.0.0.1:4174/plugins/company-os-ui/meeting-room"));
 
 function task(id, parentId, title, issuerId, assigneeId, status, childIds) {
   return { id, parentId, issuerId, assigneeId, title, description: `${title} 的具体说明`, acceptanceCriteria: "相关测试与验收证据完整", status, revision: 1, blockedReason: null, reviewFeedback: null, childIds, childCounts: { total: childIds.length, active: childIds.length, closed: 0, canceled: 0 }, risks: { blockedDescendants: id === "root-001" ? 1 : 0, staleDescendants: 0, stale: false }, createdAt: now, updatedAt: now, lastActivityAt: now };

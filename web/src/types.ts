@@ -9,6 +9,14 @@ export type Member = {
   active: boolean;
 };
 
+export type MemberIdentity = {
+  id: string;
+  name: string;
+  title: string;
+  emoji: string | null;
+  avatarUrl: string | null;
+};
+
 export type Task = {
   id: string;
   parentId: string | null;

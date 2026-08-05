@@ -2,23 +2,33 @@ import { createReadStream, existsSync, statSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 
+import { executeBossApi } from "./boss-api.js";
 import type { CompanyOsService } from "./service.js";
 
-const PREFIX = "/plugins/company-os";
-const API_PREFIX = `${PREFIX}/api/v1`;
+export const COMPANY_OS_API_PREFIX = "/plugins/company-os/api/v1";
+export const COMPANY_OS_WEB_PREFIX = "/plugins/company-os-ui";
 
-export function createCompanyOsHttpHandler(options: {
+export function createCompanyOsApiHttpHandler(options: {
   getService: () => CompanyOsService;
-  staticDir: string;
 }) {
   return async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://localhost");
-    if (!url.pathname.startsWith(PREFIX)) return false;
+    if (!isPathWithin(url.pathname, COMPANY_OS_API_PREFIX)) return false;
     try {
-      if (url.pathname.startsWith(API_PREFIX)) {
-        return await handleApi(options.getService(), req, res, url);
-      }
-      return serveWebAsset(options.staticDir, res, url.pathname.slice(PREFIX.length));
+      return await handleApi(options.getService(), req, res, url);
+    } catch (error) {
+      sendJson(res, statusForError(error), { ok: false, error: error instanceof Error ? error.message : String(error) });
+      return true;
+    }
+  };
+}
+
+export function createCompanyOsWebHttpHandler(options: { staticDir: string }) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    if (!isPathWithin(url.pathname, COMPANY_OS_WEB_PREFIX)) return false;
+    try {
+      return serveWebAsset(options.staticDir, res, url.pathname.slice(COMPANY_OS_WEB_PREFIX.length));
     } catch (error) {
       sendJson(res, statusForError(error), { ok: false, error: error instanceof Error ? error.message : String(error) });
       return true;
@@ -27,12 +37,7 @@ export function createCompanyOsHttpHandler(options: {
 }
 
 async function handleApi(service: CompanyOsService, req: IncomingMessage, res: ServerResponse, url: URL) {
-  const store = service.store;
-  const route = url.pathname.slice(API_PREFIX.length) || "/";
-  if (req.method === "GET" && route === "/snapshot") {
-    sendJson(res, 200, store.bossSnapshot());
-    return true;
-  }
+  const route = url.pathname.slice(COMPANY_OS_API_PREFIX.length) || "/";
   if (req.method === "GET" && route === "/events") {
     res.statusCode = 200;
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -55,64 +60,12 @@ async function handleApi(service: CompanyOsService, req: IncomingMessage, res: S
     res.once("close", close);
     return true;
   }
-  const taskDetail = route.match(/^\/tasks\/([^/]+)$/);
-  if (req.method === "GET" && taskDetail) {
-    sendJson(res, 200, store.readTask("boss", decodeURIComponent(taskDetail[1]!), false));
-    return true;
-  }
-  const meetingDetail = route.match(/^\/meetings\/([^/]+)$/);
-  if (req.method === "GET" && meetingDetail) {
-    sendJson(res, 200, store.meetingView(decodeURIComponent(meetingDetail[1]!)));
-    return true;
-  }
-  if (req.method === "POST" && route === "/tasks") {
-    sendJson(res, 201, store.createRootTask(await readJson(req) as any));
-    return true;
-  }
-  if (req.method === "POST" && route === "/notices") {
-    sendJson(res, 201, store.publishNotice("boss", await readJson(req) as any));
-    return true;
-  }
-  if (req.method === "POST" && route === "/meetings") {
-    const result = store.requestMeeting("boss", await readJson(req) as any);
-    await service.dispatchAdvance(result.advance);
-    sendJson(res, 201, result.meeting);
-    return true;
-  }
-  const taskAction = route.match(/^\/tasks\/([^/]+)\/(review|revise|reassign|cancel|unblock)$/);
-  if (req.method === "POST" && taskAction) {
-    const taskId = decodeURIComponent(taskAction[1]!);
-    const action = taskAction[2]!;
-    const body = await readJson(req) as Record<string, any>;
-    const result = action === "review"
-      ? store.reviewTask("boss", taskId, body.decision, body.feedback)
-      : action === "revise"
-        ? store.reviseTask("boss", taskId, body, body.reason)
-        : action === "reassign"
-          ? store.reassignTask("boss", taskId, body.assigneeId, body.reason)
-          : action === "cancel"
-            ? store.cancelTask("boss", taskId, body.reason)
-            : store.unblockTask("boss", taskId, body.reason);
-    sendJson(res, 200, result);
-    return true;
-  }
-  const meetingAction = route.match(/^\/meetings\/([^/]+)\/(interject|reorder|cancel)$/);
-  if (req.method === "POST" && meetingAction) {
-    const meetingId = decodeURIComponent(meetingAction[1]!);
-    const action = meetingAction[2]!;
-    const body = await readJson(req) as Record<string, any>;
-    if (action === "interject") {
-      const advance = store.bossInterject(meetingId, body.body, body.targetId);
-      await service.dispatchAdvance(advance);
-      sendJson(res, 200, store.meetingView(meetingId));
-    } else if (action === "reorder") {
-      sendJson(res, 200, store.reorderMeeting(meetingId, Number(body.targetPosition)));
-    } else {
-      sendJson(res, 200, store.cancelMeeting("boss", meetingId, body.reason));
-    }
-    return true;
-  }
-  sendJson(res, 404, { ok: false, error: "API route not found" });
+  const result = await executeBossApi(service, {
+    method: req.method ?? "GET",
+    path: route,
+    body: req.method === "POST" ? await readJson(req) : undefined,
+  });
+  sendJson(res, result.status, result.data);
   return true;
 }
 
@@ -178,4 +131,8 @@ function mimeType(file: string) {
     case ".woff2": return "font/woff2";
     default: return "text/html; charset=utf-8";
   }
+}
+
+function isPathWithin(pathname: string, prefix: string) {
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
 }

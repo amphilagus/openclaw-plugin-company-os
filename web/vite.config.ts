@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   root: new URL(".", import.meta.url).pathname,
-  base: "/plugins/company-os/",
+  base: "/plugins/company-os-ui/",
   plugins: [react()],
   server: {
     host: "127.0.0.1",

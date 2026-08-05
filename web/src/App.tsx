@@ -1,6 +1,8 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 import { getMeeting, getSnapshot, getTask, post, subscribeToChanges } from "./api";
+import { AgentAvatar, memberIdentity, memberName, useMemberIdentities, type MemberIdentityMap } from "./member-identity";
+import { MeetingHistory } from "./MeetingHistory";
 import type { MeetingDetail, MeetingSummary, Notice, Snapshot, Task, TaskDetail } from "./types";
 
 type Route = "notices" | "meeting-room" | "tasks";
@@ -39,7 +41,7 @@ export default function App() {
   }, []);
 
   const navigate = (next: Route) => {
-    window.history.pushState({}, "", `/plugins/company-os/${next}`);
+    window.history.pushState({}, "", `/plugins/company-os-ui/${next}`);
     setRoute(next);
   };
 
@@ -117,6 +119,7 @@ function NoticesPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?
 
 function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: boolean) => Promise<void> }) {
   const activeId = snapshot.meetings.active?.id;
+  const identities = useMemberIdentities(snapshot.organization);
   const [meeting, setMeeting] = useState<MeetingDetail | null>(null);
   const [target, setTarget] = useState("");
   const [body, setBody] = useState("");
@@ -153,35 +156,43 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
         <section className="meeting-stage panel">
           <div className="meeting-head">
             <div><div className="eyebrow">{meeting.type === "task" ? "任务会议" : "普通讨论"}</div><h2>{meeting.title}</h2><p>{meeting.agenda}</p></div>
-            <div className="meeting-facts"><span>主持人 <b>{meeting.hostId}</b></span>{meeting.parentTaskId ? <span>父任务 <code>{shortId(meeting.parentTaskId)}</code></span> : null}</div>
+            <div className="meeting-facts"><span>主持人 <b>{memberName(identities, meeting.hostId)}</b> <code>{meeting.hostId}</code></span>{meeting.parentTaskId ? <span>父任务 <code>{shortId(meeting.parentTaskId)}</code></span> : null}</div>
           </div>
           <div className="transcript">
-            {meeting.messages.map((message) => <div className={`message ${message.authorKind}`} key={message.id}>
-              <div className="avatar">{message.authorKind === "boss" ? "B" : message.authorKind === "system" ? "·" : (message.authorId ?? "?").slice(0, 1).toUpperCase()}</div>
-              <div><div className="message-meta"><b>{message.authorKind === "boss" ? "Boss" : message.authorKind === "system" ? "系统" : message.authorId}</b>{message.targetId ? <span>@{message.targetId}</span> : null}<time>{formatTime(message.createdAt)}</time></div><p>{message.body}</p></div>
-            </div>)}
-            {meeting.currentTurn ? <div className="speaking"><i />等待 <b>{meeting.currentTurn.speakerId}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {meeting.hostId}</div>}
+            {meeting.messages.map((message) => <MeetingMessageRow message={message} identities={identities} key={message.id} />)}
+            {meeting.currentTurn ? <div className="speaking"><i />等待 <b>{memberName(identities, meeting.currentTurn.speakerId)}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {memberName(identities, meeting.hostId)}</div>}
           </div>
           <form className="boss-composer" onSubmit={interject}>
             <div className="boss-label">BOSS 插话</div>
-            <select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">共享记录（交给主持人）</option><option value={meeting.hostId}>@{meeting.hostId} · 主持人</option>{meeting.participants.map((p) => <option value={p.agentId} key={p.agentId}>@{p.agentId} · {p.role}</option>)}</select>
+            <select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">共享记录（交给主持人）</option><option value={meeting.hostId}>@{memberName(identities, meeting.hostId)} · 主持人</option>{meeting.participants.map((p) => <option value={p.agentId} key={p.agentId}>@{memberName(identities, p.agentId, p.name)} · {p.role === "worker" ? "执行者" : "顾问"}</option>)}</select>
             <textarea value={body} onChange={(event) => setBody(event.target.value)} rows={3} placeholder="输入你的判断、追问或方向修正……" required />
             <button className="primary" disabled={busy}>{busy ? "排队中…" : target ? `在当前发言后 @${target}` : "加入会议记录"}</button>
           </form>
         </section>
         <aside className="meeting-side">
-          <section className="panel compact"><div className="panel-title">参会角色</div><div className="people-list"><Person id={meeting.hostId} role="主持人" />{meeting.participants.map((p) => <Person key={p.agentId} id={p.agentId} role={p.role === "worker" ? "执行者" : "顾问"} />)}</div></section>
-          <section className="panel compact"><div className="panel-title">任务草案 <span>{meeting.taskDrafts.length}</span></div>{meeting.type === "discussion" ? <p className="muted">普通讨论会不能生成任务。</p> : meeting.taskDrafts.length ? meeting.taskDrafts.map((draft) => <div className="draft" key={draft.id}><b>{draft.title}</b><span>→ {draft.assigneeId}</span><small>{draft.acceptanceCriteria}</small></div>) : <p className="muted">主持人尚未提交任务草案。</p>}</section>
+          <section className="panel compact"><div className="panel-title">参会角色</div><div className="people-list"><Person id={meeting.hostId} role="主持人" identities={identities} />{meeting.participants.map((p) => <Person key={p.agentId} id={p.agentId} role={p.role === "worker" ? "执行者" : "顾问"} identities={identities} fallbackName={p.name} />)}</div></section>
+          <section className="panel compact"><div className="panel-title">任务草案 <span>{meeting.taskDrafts.length}</span></div>{meeting.type === "discussion" ? <p className="muted">普通讨论会不能生成任务。</p> : meeting.taskDrafts.length ? meeting.taskDrafts.map((draft) => <div className="draft" key={draft.id}><b>{draft.title}</b><span>→ {memberName(identities, draft.assigneeId)}</span><small>{draft.acceptanceCriteria}</small></div>) : <p className="muted">主持人尚未提交任务草案。</p>}</section>
         </aside>
       </div>}
-    <QueueSection queue={snapshot.meetings.queue} history={snapshot.meetings.history} reorder={reorder} cancel={cancel} />
+    <QueueSection queue={snapshot.meetings.queue} history={snapshot.meetings.history} reorder={reorder} cancel={cancel} identities={identities} />
   </>;
 }
 
-function QueueSection({ queue, history, reorder, cancel }: { queue: MeetingSummary[]; history: MeetingSummary[]; reorder: (m: MeetingSummary, d: number) => void; cancel: (m: MeetingSummary) => void }) {
+function MeetingMessageRow({ message, identities }: { message: MeetingDetail["messages"][number]; identities: MemberIdentityMap }) {
+  const id = message.authorKind === "boss" ? "boss" : message.authorId ?? "system";
+  const identity = message.authorKind === "system"
+    ? { id: "system", name: "系统", title: "", avatarUrl: null, emoji: null }
+    : memberIdentity(identities, id);
+  return <div className={`message ${message.authorKind}`}>
+    <AgentAvatar identity={identity} className="avatar" fallback={message.authorKind === "system" ? "·" : undefined} />
+    <div><div className="message-meta"><b>{identity.name}</b>{message.authorKind === "member" ? <small className="speaker-id">{id}</small> : null}{message.targetId ? <span>@{memberName(identities, message.targetId)}</span> : null}<time>{formatTime(message.createdAt)}</time></div><p>{message.body}</p></div>
+  </div>;
+}
+
+function QueueSection({ queue, history, reorder, cancel, identities }: { queue: MeetingSummary[]; history: MeetingSummary[]; reorder: (m: MeetingSummary, d: number) => void; cancel: (m: MeetingSummary) => void; identities: MemberIdentityMap }) {
   return <section className="queue-section"><div className="section-title"><div><span>WAITING LINE</span><h2>会议队列</h2></div><strong>{queue.length}</strong></div>
-    <div className="queue-list">{queue.length ? queue.map((item, index) => <div className="queue-item" key={item.id}><span className="queue-number">{index + 1}</span><div><b>{item.title}</b><small>{item.type === "task" ? "任务会议" : "普通讨论"} · 主持人 {item.hostId} · {formatTime(item.createdAt)}</small></div><div className="queue-actions"><button disabled={index === 0} onClick={() => void reorder(item, -1)}>↑</button><button disabled={index === queue.length - 1} onClick={() => void reorder(item, 1)}>↓</button><button className="danger" onClick={() => void cancel(item)}>取消</button></div></div>) : <p className="muted">当前没有排队会议。</p>}</div>
-    {history.length ? <details className="history"><summary>查看会议历史（{history.length}）</summary>{history.map((item) => <div className="history-row" key={item.id}><Badge tone={item.status}>{meetingStatus(item.status)}</Badge><b>{item.title}</b><span>{item.hostId}</span><time>{formatTime(item.endedAt ?? item.createdAt)}</time></div>)}</details> : null}
+    <div className="queue-list">{queue.length ? queue.map((item, index) => <div className="queue-item" key={item.id}><span className="queue-number">{index + 1}</span><div><b>{item.title}</b><small>{item.type === "task" ? "任务会议" : "普通讨论"} · 主持人 {memberName(identities, item.hostId)} · {formatTime(item.createdAt)}</small></div><div className="queue-actions"><button disabled={index === 0} onClick={() => void reorder(item, -1)}>↑</button><button disabled={index === queue.length - 1} onClick={() => void reorder(item, 1)}>↓</button><button className="danger" onClick={() => void cancel(item)}>取消</button></div></div>) : <p className="muted">当前没有排队会议。</p>}</div>
+    <MeetingHistory history={history} identities={identities} />
   </section>;
 }
 
@@ -251,7 +262,7 @@ function RootTaskForm({ members, submit, compact = false }: { members: Snapshot[
 
 function PageHeader({ eyebrow, title, summary, children }: { eyebrow: string; title: string; summary: string; children?: React.ReactNode }) { return <div className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{summary}</p></div><div>{children}</div></div>; }
 function Badge({ children, tone }: { children: React.ReactNode; tone: string }) { return <span className={`badge tone-${tone}`}>{children}</span>; }
-function Person({ id, role }: { id: string; role: string }) { return <div className="person"><span>{id.slice(0, 1).toUpperCase()}</span><div><b>{id}</b><small>{role}</small></div></div>; }
+function Person({ id, role, identities, fallbackName }: { id: string; role: string; identities: MemberIdentityMap; fallbackName?: string }) { const identity = memberIdentity(identities, id, fallbackName); return <div className="person"><AgentAvatar identity={identity} /><div><b>{identity.name}</b><small>{role} · {identity.title || id}<span className="speaker-id">{id}</span></small></div></div>; }
 function DetailBlock({ title, children }: { title: string; children: React.ReactNode }) { return <section className="detail-block"><h3>{title}</h3><div>{children}</div></section>; }
 function Empty({ title, body }: { title: string; body: string }) { return <div className="empty"><span>◎</span><h2>{title}</h2><p>{body}</p></div>; }
 function Loading() { return <div className="loading"><i /><span>正在载入公司运行状态…</span></div>; }

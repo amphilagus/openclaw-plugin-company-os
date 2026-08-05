@@ -18,7 +18,8 @@
 OpenClaw Gateway
 ├── CompanyOsService（恢复、超时扫描、SSE、会议调度）
 ├── 28 个 company_* Agent 工具
-├── /plugins/company-os/api/v1/*（Gateway 鉴权）
+├── /plugins/company-os/api/v1/*（Gateway 鉴权，仅 API）
+├── /plugins/company-os-ui/*（无敏感数据的 WebUI 静态壳）
 ├── Control UI 标签页「公司」（operator.write）
 └── company-os.sqlite
     ├── organization + audit
@@ -29,9 +30,9 @@ OpenClaw Gateway
 
 前端是 React + Vite，包含三个真实路由：
 
-- `/plugins/company-os/meeting-room`：默认页面，当前会议、Boss 插话、任务草案、队列和历史。
-- `/plugins/company-os/tasks`：任务树、风险、版本/proof/审计、Boss 兜底操作和根任务创建。
-- `/plugins/company-os/notices`：当前共识、历史更正、会议汇报和阅读覆盖。
+- `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、Boss 插话、任务草案、队列和历史。
+- `/plugins/company-os-ui/tasks`：任务树、风险、版本/proof/审计、Boss 兜底操作和根任务创建。
+- `/plugins/company-os-ui/notices`：当前共识、历史更正、会议汇报和阅读覆盖。
 
 ## 安装与开发
 
@@ -47,7 +48,7 @@ openclaw config set gateway.controlUi.embedSandbox trusted
 openclaw gateway restart
 ```
 
-`trusted` 让同源插件 iframe 复用 Control UI 的 Gateway 登录令牌；页面本身不提供第二套认证。标签页和写接口面向拥有 `operator.write` 的 Boss 操作者。
+`trusted` 让同源插件 iframe 在静态壳加载后复用 Control UI 保存在同一顶层浏览上下文 `sessionStorage` 中的 Gateway 登录令牌；页面本身不提供第二套认证。静态壳不包含公司数据，所有读取、写入和 SSE 请求仍访问 Gateway 鉴权的 `/plugins/company-os/api/v1/*`。标签页和写接口面向拥有 `operator.write` 的 Boss 操作者。
 
 开发前端：
 
@@ -81,7 +82,7 @@ npm run build
 
 `npm test` 覆盖组织环、非法员工、跨级派发、proof、版本、阻塞/停滞风险、取消分支、逐层关单、统一 inbox、单会议室、Boss `@` 插话、任务会议原子回滚、超时、重启恢复、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
 
-`npm run plugin:validate` 还会验证构建产物、清单与 28 个工具契约、长驻服务、Gateway 鉴权路由，以及 `operator.write` Control UI 标签页。
+`npm run plugin:validate` 还会验证构建产物、清单与 28 个工具契约、长驻服务、相互隔离的 WebUI/API 路由，以及 `operator.write` Control UI 标签页。
 
 ## 来源说明
 

@@ -8,7 +8,13 @@ import {
 } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
 
-import { createCompanyOsHttpHandler } from "./http.js";
+import {
+  COMPANY_OS_API_PREFIX,
+  COMPANY_OS_WEB_PREFIX,
+  createCompanyOsApiHttpHandler,
+  createCompanyOsWebHttpHandler,
+} from "./http.js";
+import { COMPANY_OS_GATEWAY_METHOD, createCompanyOsGatewayHandler } from "./rpc.js";
 import { CompanyOsService } from "./service.js";
 import { COMPANY_TOOL_NAMES, createCompanyOsTools } from "./tools.js";
 import { resolveConfig, type CompanyOsConfig } from "./types.js";
@@ -30,14 +36,33 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
   configSchema: buildJsonPluginConfigSchema(ConfigSchema as never),
   register(api) {
     let service: CompanyOsService | undefined;
-    const getService = () => {
-      if (!service) throw new Error("Company OS service is not running");
+    const getService = (
+      runtimeConfig = api.config,
+      stateDir?: string,
+      logger = api.logger,
+    ) => {
+      if (!service) {
+        const config = resolveConfig(api.pluginConfig as CompanyOsConfig | undefined);
+        service = new CompanyOsService({
+          databasePath: resolveDatabasePath(api, config.databasePath, stateDir),
+          allowedAgentIds: resolveConfiguredAgentIds(runtimeConfig),
+          config,
+          runtimeConfig,
+          workflow: api.session.workflow,
+          logger,
+        });
+      }
       return service;
     };
 
     for (const name of COMPANY_TOOL_NAMES) {
       api.registerTool(
-        (toolContext) => createCompanyOsTools({ getService, toolContext }).find((tool) => tool.name === name),
+        (toolContext) => createCompanyOsTools({
+          getService: () => getService(
+            toolContext.getRuntimeConfig?.() ?? toolContext.runtimeConfig ?? toolContext.config ?? api.config,
+          ),
+          toolContext,
+        }).find((tool) => tool.name === name),
         { name },
       );
     }
@@ -45,16 +70,12 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
     api.registerService({
       id: PLUGIN_ID,
       start: async (context) => {
-        const config = resolveConfig(api.pluginConfig as CompanyOsConfig | undefined);
-        const databasePath = resolveDatabasePath(api, config.databasePath, context.stateDir);
-        service = new CompanyOsService({
-          databasePath,
-          allowedAgentIds: resolveConfiguredAgentIds(context.config),
-          config,
-          workflow: api.session.workflow,
-          logger: context.logger,
-        });
-        await service.start();
+        const databasePath = resolveDatabasePath(
+          api,
+          resolveConfig(api.pluginConfig as CompanyOsConfig | undefined).databasePath,
+          context.stateDir,
+        );
+        await getService(context.config, context.stateDir, context.logger).start();
         context.logger.info(`company-os database ready: ${databasePath}`);
       },
       stop: async () => {
@@ -71,17 +92,29 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
       icon: "building-2",
       group: "control",
       order: 30,
-      path: "/plugins/company-os/meeting-room",
+      path: `${COMPANY_OS_WEB_PREFIX}/meeting-room`,
       requiredScopes: ["operator.write"],
     });
 
+    api.registerGatewayMethod(
+      COMPANY_OS_GATEWAY_METHOD,
+      createCompanyOsGatewayHandler({ getService }),
+      { scope: "operator.write" },
+    );
+
     api.registerHttpRoute({
-      path: "/plugins/company-os",
+      path: COMPANY_OS_API_PREFIX,
       auth: "gateway",
       match: "prefix",
       gatewayRuntimeScopeSurface: "trusted-operator",
-      handler: createCompanyOsHttpHandler({
-        getService,
+      handler: createCompanyOsApiHttpHandler({ getService }),
+    });
+
+    api.registerHttpRoute({
+      path: COMPANY_OS_WEB_PREFIX,
+      auth: "plugin",
+      match: "prefix",
+      handler: createCompanyOsWebHttpHandler({
         staticDir: path.join(api.rootDir ?? process.cwd(), "web", "dist"),
       }),
     });
@@ -90,13 +123,12 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
 
 export default entry;
 
-function resolveDatabasePath(api: OpenClawPluginApi, configured: string | undefined, serviceStateDir: string) {
+function resolveDatabasePath(api: OpenClawPluginApi, configured: string | undefined, serviceStateDir?: string) {
   if (configured) {
     const expanded = configured.startsWith("~/") ? path.join(os.homedir(), configured.slice(2)) : configured;
     return path.resolve(expanded);
   }
-  const runtime = api.runtime as unknown as { state?: { resolveStateDir?: () => string } };
-  const stateDir = runtime.state?.resolveStateDir?.() ?? serviceStateDir;
+  const stateDir = serviceStateDir ?? api.runtime.state.resolveStateDir();
   return path.join(stateDir, "plugins", PLUGIN_ID, SQLITE_FILE);
 }
 

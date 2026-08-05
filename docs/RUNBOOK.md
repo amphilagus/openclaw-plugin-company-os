@@ -50,13 +50,25 @@ Schema 版本保存在 `schema_meta`，迁移在服务启动时执行。不要�
 
 ### WebUI 返回 401
 
-确认从已登录的 Control UI「公司」标签进入，且：
+先确认静态壳无需 Gateway Bearer token 即可加载：
+
+```bash
+curl -I http://127.0.0.1:18789/plugins/company-os-ui/meeting-room
+```
+
+应返回 `200`。公司数据 API 必须继续拒绝无 token 请求：
+
+```bash
+curl -i http://127.0.0.1:18789/plugins/company-os/api/v1/snapshot
+```
+
+应返回 `401`。如果静态壳正常但页面内数据请求返回 401，再确认从已登录的 Control UI「公司」标签进入，且：
 
 ```bash
 openclaw config get gateway.controlUi.embedSandbox
 ```
 
-结果为 `trusted`。严格 sandbox 无法读取同源 Control UI 登录令牌。
+结果为 `trusted`。严格 sandbox 无法读取同源 Control UI 在当前顶层浏览上下文中的 `sessionStorage` 登录令牌。
 
 ### 新员工无法加入组织
 
