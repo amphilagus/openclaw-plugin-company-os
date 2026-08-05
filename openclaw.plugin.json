@@ -2,7 +2,7 @@
   "id": "company-os",
   "name": "Company OS",
   "description": "公司级会议、多级任务和告示板治理系统。",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -16,6 +16,11 @@
         "minimum": 60,
         "default": 1800
       },
+      "meetingAutoEndDelaySeconds": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 60
+      },
       "taskStaleAfterHours": {
         "type": "integer",
         "minimum": 1,
@@ -23,6 +28,13 @@
       },
       "databasePath": {
         "type": "string"
+      },
+      "organizationAdminAgentId": {
+        "type": "string"
+      },
+      "bossAvatarPath": {
+        "type": "string",
+        "default": "~/.openclaw/workspace-boss/avatar.png"
       },
       "bossEmailNotifications": {
         "type": "object",

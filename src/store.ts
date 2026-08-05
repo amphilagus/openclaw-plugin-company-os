@@ -9,7 +9,9 @@ import type {
   MeetingAdvance,
   MeetingContextEnvelope,
   MeetingParticipantInput,
+  MeetingSessionContextAppend,
   MeetingStatus,
+  MeetingToolSessionIdentity,
   MeetingTurnDelivery,
   MeetingTurnDispatch,
   MeetingType,
@@ -30,6 +32,8 @@ export class CompanyOsStore {
   readonly db: DatabaseSync;
   private readonly allowedAgentIds: Set<string>;
   private readonly staleAfterMs: number;
+  private readonly automaticEndDelayMs: number;
+  private readonly organizationAdminAgentId: string;
   private readonly onEvent?: (event: ServiceEvent) => void;
   private transactionDepth = 0;
   private pendingEvents: ServiceEvent[] = [];
@@ -38,14 +42,17 @@ export class CompanyOsStore {
     databasePath: string;
     allowedAgentIds: Iterable<string>;
     config: ResolvedCompanyOsConfig;
+    organizationAdminAgentId?: string;
     onEvent?: (event: ServiceEvent) => void;
   }) {
     mkdirSync(path.dirname(options.databasePath), { recursive: true });
     this.db = new DatabaseSync(options.databasePath);
     this.allowedAgentIds = new Set([...options.allowedAgentIds].map((id) => id.trim()).filter(Boolean));
     this.staleAfterMs = options.config.taskStaleAfterHours * 60 * 60 * 1000;
+    this.automaticEndDelayMs = options.config.meetingAutoEndDelaySeconds * 1000;
     this.onEvent = options.onEvent;
     this.initializeSchema();
+    this.organizationAdminAgentId = this.resolveOrganizationAdminAgentId(options.organizationAdminAgentId);
     this.seedOrganization();
   }
 
@@ -61,15 +68,28 @@ export class CompanyOsStore {
     const schemaRow = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as Row | undefined;
     const currentVersion = schemaRow ? Number(schemaRow.value) : 0;
     if (!Number.isInteger(currentVersion) || currentVersion < 0) throw new Error("company-os schema version is invalid");
-    if (currentVersion > 3) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
-    if (currentVersion === 3) return;
+    if (currentVersion > 5) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
+    if (currentVersion === 5) return;
     if (currentVersion === 1) {
       this.migrateSchemaV2();
       this.migrateSchemaV3();
+      this.migrateSchemaV4();
+      this.migrateSchemaV5();
       return;
     }
     if (currentVersion === 2) {
       this.migrateSchemaV3();
+      this.migrateSchemaV4();
+      this.migrateSchemaV5();
+      return;
+    }
+    if (currentVersion === 3) {
+      this.migrateSchemaV4();
+      this.migrateSchemaV5();
+      return;
+    }
+    if (currentVersion === 4) {
+      this.migrateSchemaV5();
       return;
     }
     this.db.exec("BEGIN IMMEDIATE");
@@ -290,6 +310,34 @@ export class CompanyOsStore {
         PRIMARY KEY(meeting_id, member_id)
       );
 
+      CREATE TABLE IF NOT EXISTS meeting_session_context_appends (
+        id TEXT PRIMARY KEY,
+        meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id),
+        runtime_agent_id TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL CHECK (tool_name IN ('company_meeting_speak', 'company_meeting_delegate')),
+        tool_call_id TEXT NOT NULL,
+        message_id TEXT NOT NULL REFERENCES meeting_messages(id) ON DELETE CASCADE,
+        message_sequence INTEGER NOT NULL CHECK (message_sequence > 0),
+        turn_id TEXT,
+        round_number INTEGER CHECK (round_number IS NULL OR round_number > 0),
+        record_kind TEXT NOT NULL CHECK (record_kind IN ('speech', 'delegate', 'host_speech')),
+        target_id TEXT REFERENCES members(id),
+        target_name TEXT,
+        member_name TEXT NOT NULL,
+        body TEXT NOT NULL,
+        formatted_text TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'appending', 'appended', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        appended_message_id TEXT,
+        created_at TEXT NOT NULL,
+        appended_at TEXT,
+        UNIQUE(session_id, tool_call_id)
+      );
+
       CREATE TABLE IF NOT EXISTS meeting_agent_dispatches (
         id TEXT PRIMARY KEY,
         meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
@@ -303,6 +351,7 @@ export class CompanyOsStore {
         attempts INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         lease_expires_at TEXT,
+        wait_for_context_append_id TEXT REFERENCES meeting_session_context_appends(id),
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT
@@ -315,10 +364,11 @@ export class CompanyOsStore {
       CREATE INDEX IF NOT EXISTS idx_meetings_status_queue ON meetings(status, queue_position);
       CREATE INDEX IF NOT EXISTS idx_meeting_messages_sequence ON meeting_messages(meeting_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_meeting_email_pending ON meeting_email_notifications(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_meeting_context_append_pending ON meeting_session_context_appends(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_meeting_dispatch_pending ON meeting_agent_dispatches(status, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meeting ON meetings(status) WHERE status = 'active';
       `);
-      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3')").run();
+      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '5')").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -404,6 +454,121 @@ export class CompanyOsStore {
     }
   }
 
+  private migrateSchemaV4() {
+    const memberReferences: Array<[string, string]> = [
+      ["members", "manager_id"],
+      ["tasks", "issuer_id"],
+      ["tasks", "assignee_id"],
+      ["task_versions", "changed_by"],
+      ["task_progress", "author_id"],
+      ["task_submissions", "submitter_id"],
+      ["task_submissions", "reviewer_id"],
+      ["task_acknowledgements", "member_id"],
+      ["notices", "author_id"],
+      ["notice_reads", "member_id"],
+      ["meetings", "host_id"],
+      ["meetings", "requested_by"],
+      ["meeting_participants", "member_id"],
+      ["meeting_messages", "author_id"],
+      ["meeting_messages", "target_id"],
+      ["meeting_turns", "speaker_id"],
+      ["meeting_turns", "requested_by"],
+      ["meeting_interventions", "target_id"],
+      ["meeting_task_drafts", "assignee_id"],
+      ["meeting_context_watermarks", "member_id"],
+      ["meeting_agent_dispatches", "target_agent_id"],
+      ["audit_events", "actor_id"],
+    ];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec("PRAGMA defer_foreign_keys = ON");
+      const aliases = this.tableExists("members")
+        ? this.db.prepare("SELECT id, agent_id FROM members WHERE kind = 'agent' AND agent_id IS NOT NULL AND id != agent_id").all() as Row[]
+        : [];
+      for (const alias of aliases) {
+        const oldId = String(alias.id);
+        const agentId = String(alias.agent_id);
+        if (!this.allowedAgentIds.has(agentId)) continue;
+        const conflict = this.db.prepare("SELECT id FROM members WHERE id = ? AND id != ?").get(agentId, oldId);
+        if (conflict) throw new Error(`cannot normalize member ${oldId} to Agent ID ${agentId}: target member already exists`);
+        for (const [table, column] of memberReferences) {
+          if (this.tableExists(table) && this.columnExists(table, column)) {
+            this.db.prepare(`UPDATE ${table} SET ${column} = ? WHERE ${column} = ?`).run(agentId, oldId);
+          }
+        }
+        if (this.tableExists("audit_events")) {
+          this.db.prepare("UPDATE audit_events SET entity_id = ? WHERE entity_type = 'member' AND entity_id = ?").run(agentId, oldId);
+        }
+        this.db.prepare("UPDATE members SET id = ? WHERE id = ?").run(agentId, oldId);
+        this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'organization_admin_id' AND value = ?").run(agentId, oldId);
+        if (this.tableExists("audit_events")) {
+          this.db.prepare(`
+            INSERT INTO audit_events (actor_id, action, entity_type, entity_id, reason, before_json, after_json, created_at)
+            VALUES ('system', 'org.member_id_normalized', 'member', ?, ?, ?, ?, ?)
+          `).run(
+            agentId,
+            "organization member IDs now equal their configured OpenClaw Agent IDs",
+            JSON.stringify({ id: oldId, agentId }),
+            JSON.stringify({ id: agentId, agentId }),
+            nowIso(),
+          );
+        }
+      }
+      const violations = this.db.prepare("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) throw new Error(`company-os v4 member ID migration violated foreign keys: ${JSON.stringify(violations)}`);
+      this.db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV5() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS meeting_session_context_appends (
+          id TEXT PRIMARY KEY,
+          meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+          member_id TEXT NOT NULL REFERENCES members(id),
+          runtime_agent_id TEXT NOT NULL,
+          session_key TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL CHECK (tool_name IN ('company_meeting_speak', 'company_meeting_delegate')),
+          tool_call_id TEXT NOT NULL,
+          message_id TEXT NOT NULL REFERENCES meeting_messages(id) ON DELETE CASCADE,
+          message_sequence INTEGER NOT NULL CHECK (message_sequence > 0),
+          turn_id TEXT,
+          round_number INTEGER CHECK (round_number IS NULL OR round_number > 0),
+          record_kind TEXT NOT NULL CHECK (record_kind IN ('speech', 'delegate', 'host_speech')),
+          target_id TEXT REFERENCES members(id),
+          target_name TEXT,
+          member_name TEXT NOT NULL,
+          body TEXT NOT NULL,
+          formatted_text TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'appending', 'appended', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          appended_message_id TEXT,
+          created_at TEXT NOT NULL,
+          appended_at TEXT,
+          UNIQUE(session_id, tool_call_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_meeting_context_append_pending
+          ON meeting_session_context_appends(status, created_at);
+      `);
+      if (!this.columnExists("meeting_agent_dispatches", "wait_for_context_append_id")) {
+        this.db.exec("ALTER TABLE meeting_agent_dispatches ADD COLUMN wait_for_context_append_id TEXT REFERENCES meeting_session_context_appends(id)");
+      }
+      this.db.prepare("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private tableExists(table: string) {
     return Boolean(this.db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
   }
@@ -412,18 +577,30 @@ export class CompanyOsStore {
     return (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((row) => row.name === column);
   }
 
+  private resolveOrganizationAdminAgentId(preferred?: string) {
+    const persisted = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'organization_admin_id'").get() as Row | undefined;
+    const candidate = preferred?.trim() || String(persisted?.value ?? "").trim()
+      || (this.allowedAgentIds.has("main") ? "main" : [...this.allowedAgentIds][0]);
+    if (!candidate || !this.allowedAgentIds.has(candidate)) {
+      throw new Error(`organization admin Agent does not exist in OpenClaw configuration: ${candidate || "<empty>"}`);
+    }
+    this.db.prepare(`
+      INSERT INTO schema_meta (key, value) VALUES ('organization_admin_id', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(candidate);
+    return candidate;
+  }
+
   private seedOrganization() {
     const now = nowIso();
     this.db.prepare(`
       INSERT OR IGNORE INTO members (id, agent_id, kind, name, title, manager_id, active, created_at, updated_at)
       VALUES ('boss', NULL, 'boss', 'Boss', 'CEO', NULL, 1, ?, ?)
     `).run(now, now);
-    if (this.allowedAgentIds.has("main")) {
-      this.db.prepare(`
-        INSERT OR IGNORE INTO members (id, agent_id, kind, name, title, manager_id, active, created_at, updated_at)
-        VALUES ('main', 'main', 'agent', '架构师', '首席架构师', 'boss', 1, ?, ?)
-      `).run(now, now);
-    }
+    this.db.prepare(`
+      INSERT OR IGNORE INTO members (id, agent_id, kind, name, title, manager_id, active, created_at, updated_at)
+      VALUES (?, ?, 'agent', '架构师', '首席架构师', 'boss', 1, ?, ?)
+    `).run(this.organizationAdminAgentId, this.organizationAdminAgentId, now, now);
   }
 
   transaction<T>(run: () => T): T {
@@ -542,14 +719,14 @@ export class CompanyOsStore {
   }
 
   requireAgentMember(agentId: string) {
-    const row = (this.db.prepare("SELECT * FROM members WHERE agent_id = ? AND active = 1").get(agentId)
-      ?? this.db.prepare("SELECT * FROM members WHERE id = ? AND kind = 'agent' AND active = 1").get(agentId)) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM members WHERE id = ? AND agent_id = ? AND kind = 'agent' AND active = 1")
+      .get(agentId, agentId) as Row | undefined;
     if (!row) throw new Error(`agent is not an active company member: ${agentId}`);
     return row;
   }
 
   addMember(actorId: string, input: { agentId: string; name: string; title: string; managerId: string }) {
-    requireOrganizationAdmin(actorId);
+    this.requireOrganizationAdmin(actorId);
     const agentId = required(input.agentId, "agentId");
     if (!this.allowedAgentIds.has(agentId)) throw new Error(`OpenClaw agent does not exist: ${agentId}`);
     if (agentId === "boss") throw new Error("boss is a reserved member id");
@@ -566,7 +743,7 @@ export class CompanyOsStore {
   }
 
   updateMember(actorId: string, memberId: string, patch: { name?: string; title?: string; managerId?: string }, reason: string) {
-    requireOrganizationAdmin(actorId);
+    this.requireOrganizationAdmin(actorId);
     if (memberId === "boss") throw new Error("boss cannot be edited");
     const before = this.getMember(memberId, { active: false });
     if (!before.active) throw new Error("inactive member cannot be edited");
@@ -590,8 +767,8 @@ export class CompanyOsStore {
   }
 
   deactivateMember(actorId: string, memberId: string, reason: string) {
-    requireOrganizationAdmin(actorId);
-    if (memberId === "boss" || memberId === "main") throw new Error(`${memberId} cannot be deactivated`);
+    this.requireOrganizationAdmin(actorId);
+    if (memberId === "boss" || memberId === this.organizationAdminAgentId) throw new Error(`${memberId} cannot be deactivated`);
     const before = this.getMember(memberId);
     if (this.memberHasOpenWork(memberId)) throw new Error("member cannot be deactivated while open work exists");
     const activeReports = this.db.prepare("SELECT COUNT(*) AS count FROM members WHERE manager_id = ? AND active = 1").get(memberId) as Row;
@@ -610,9 +787,15 @@ export class CompanyOsStore {
   }
 
   canPublishNotice(memberId: string) {
-    if (memberId === "boss" || memberId === "main") return true;
+    if (memberId === "boss" || memberId === this.organizationAdminAgentId) return true;
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM members WHERE manager_id = ? AND active = 1").get(memberId) as Row;
     return Number(row.count) > 0;
+  }
+
+  private requireOrganizationAdmin(actorId: string) {
+    if (actorId !== this.organizationAdminAgentId) {
+      throw new Error(`only organization admin ${this.organizationAdminAgentId} can manage organization`);
+    }
   }
 
   private memberView(memberId: string, includeInactive = false) {
@@ -1043,7 +1226,7 @@ export class CompanyOsStore {
 
   publishNotice(actorId: Actor, input: { title: string; body: string; supersedesNoticeId?: string }) {
     if (actorId !== "boss") this.requireAgentMember(actorId);
-    if (!this.canPublishNotice(actorId)) throw new Error("only Boss, main, or a current manager can publish notices");
+    if (!this.canPublishNotice(actorId)) throw new Error("only Boss, the organization admin, or a current manager can publish notices");
     return this.transaction(() => this.insertNotice({
       actorId,
       authorId: actorId,
@@ -1278,6 +1461,16 @@ export class CompanyOsStore {
     };
   }
 
+  activeMeetingId(actorId: string) {
+    this.requireAgentMember(actorId);
+    const rows = this.db.prepare("SELECT * FROM meetings WHERE status = 'active' ORDER BY started_at, created_at").all() as Row[];
+    const meeting = rows[0];
+    if (!meeting) throw new Error("there is no active meeting in the meeting room");
+    if (rows.length > 1) throw new Error("meeting room invariant violated: multiple active meetings");
+    this.assertMeetingReadable(actorId, meeting);
+    return meeting.id as string;
+  }
+
   startMeetingByBoss(meetingId: string): MeetingAdvance {
     const meeting = this.getMeetingRow(meetingId);
     if (meeting.status !== "active") throw new Error("meeting is not active");
@@ -1301,16 +1494,67 @@ export class CompanyOsStore {
     });
   }
 
-  delegateMeeting(actorId: string, meetingId: string, speakerId: string, prompt: string): MeetingTurnDispatch {
+  rejectMeetingByBoss(meetingId: string, reason: string) {
+    const meeting = this.getMeetingRow(meetingId);
+    if (meeting.status !== "active") throw new Error("meeting is not active");
+    if (!meeting.boss_participates) throw new Error("Boss can only reject a meeting that requires Boss participation");
+    if (meeting.boss_started_at) throw new Error("a meeting that Boss already started cannot be rejected");
+    if (meeting.current_turn_id) throw new Error("meeting cannot be rejected during an active speaking turn");
+    const rejectionReason = required(reason, "reason");
+    let advance: MeetingAdvance = {};
+    this.transaction(() => {
+      const endedAt = nowIso();
+      this.db.prepare(`
+        UPDATE meetings SET status = 'canceled', canceled_reason = ?, current_turn_id = NULL,
+          waiting_on_host_since = NULL, ended_at = ? WHERE id = ?
+      `).run(`Boss 拒绝：${rejectionReason}`, endedAt, meetingId);
+      this.cancelOpenHostDispatches(meetingId);
+      this.addMeetingMessage(meetingId, "system", null, null, `Boss 已拒绝召开本次会议：${rejectionReason}。会议室已释放。`);
+      this.audit({
+        actorId: "boss",
+        action: "meeting.rejected_by_boss",
+        entityType: "meeting",
+        entityId: meetingId,
+        reason: rejectionReason,
+      });
+      advance = this.activateNextMeeting();
+    });
+    return { meeting: this.meetingView(meetingId), advance };
+  }
+
+  delegateMeeting(
+    actorId: string,
+    meetingId: string,
+    speakerId: string,
+    prompt: string,
+    sessionIdentity?: MeetingToolSessionIdentity,
+  ): MeetingTurnDispatch {
     this.requireAgentMember(actorId);
     const meeting = this.requireActiveHostedMeeting(actorId, meetingId);
     if (meeting.current_turn_id) throw new Error("the current speaker has not finished");
     const participant = this.db.prepare("SELECT 1 AS ok FROM meeting_participants WHERE meeting_id = ? AND member_id = ?")
       .get(meetingId, speakerId) as Row | undefined;
     if (!participant) throw new Error("the selected speaker is not a meeting participant");
+    const trustedSession = sessionIdentity ? this.validateMeetingToolSession(actorId, sessionIdentity) : undefined;
     return this.transaction(() => {
-      const turn = this.createMeetingTurn(meetingId, speakerId, actorId, "delegate", required(prompt, "prompt"));
-      this.addMeetingMessage(meetingId, "member", actorId, speakerId, `点名 ${speakerId}：${prompt}`, turn.id);
+      const normalizedPrompt = required(prompt, "prompt");
+      const turn = this.createMeetingTurn(meetingId, speakerId, actorId, "delegate", normalizedPrompt);
+      const pointMessage = this.addMeetingMessage(meetingId, "member", actorId, speakerId, normalizedPrompt, turn.id);
+      const roundNumber = this.meetingRoundNumber(turn.id);
+      const contextAppendId = trustedSession
+        ? this.queueMeetingSessionContextAppend({
+            meetingId,
+            memberId: actorId,
+            sessionIdentity: trustedSession,
+            toolName: "company_meeting_delegate",
+            message: pointMessage,
+            turnId: turn.id,
+            roundNumber,
+            recordKind: "delegate",
+            targetId: speakerId,
+            body: normalizedPrompt,
+          })
+        : undefined;
       this.db.prepare("UPDATE meetings SET current_turn_id = ?, waiting_on_host_since = NULL WHERE id = ?").run(turn.id, meetingId);
       const context = this.buildMeetingContext(meetingId, speakerId, {
         turnId: turn.id,
@@ -1319,23 +1563,62 @@ export class CompanyOsStore {
       });
       this.db.prepare("UPDATE meeting_turns SET context_from_sequence = ?, context_to_sequence = ? WHERE id = ?")
         .run(context.fromSequence, context.toSequence, turn.id);
-      this.audit({ actorId, action: "meeting.delegated", entityType: "meeting", entityId: meetingId, after: { turnId: turn.id, speakerId, prompt } });
-      return { ...context, turnId: turn.id, speakerId, agentId: this.runtimeAgentId(speakerId) };
+      this.audit({ actorId, action: "meeting.delegated", entityType: "meeting", entityId: meetingId, after: { turnId: turn.id, speakerId, prompt: normalizedPrompt } });
+      return {
+        ...context,
+        turnId: turn.id,
+        speakerId,
+        agentId: this.runtimeAgentId(speakerId),
+        messageId: pointMessage.id,
+        messageSequence: pointMessage.sequence,
+        roundNumber,
+        ...(contextAppendId ? { contextAppendId } : {}),
+      };
     });
   }
 
-  speakMeeting(actorId: string, meetingId: string, body: string, turnId?: string): MeetingTurnDelivery | null {
+  speakMeeting(
+    actorId: string,
+    meetingId: string,
+    body: string,
+    turnId?: string,
+    sessionIdentity?: MeetingToolSessionIdentity,
+  ): MeetingTurnDelivery | null {
     this.requireAgentMember(actorId);
     const meeting = this.getMeetingRow(meetingId);
     if (meeting.status !== "active") throw new Error("meeting is not active");
     if (this.isAwaitingBossStart(meeting)) throw new Error("meeting is waiting for Boss to start it");
     if (meeting.end_requested_at) throw new Error("meeting is waiting for Boss to decide whether it can end");
     const message = required(body, "body");
+    const trustedSession = sessionIdentity ? this.validateMeetingToolSession(actorId, sessionIdentity) : undefined;
     return this.transaction(() => {
       if (!meeting.current_turn_id) {
         if (meeting.host_id !== actorId) throw new Error("only the current speaker can speak");
         if (turnId) throw new Error("the supplied meeting turn is no longer current");
-        this.addMeetingMessage(meetingId, "member", actorId, null, message);
+        const written = this.addMeetingMessage(meetingId, "member", actorId, null, message);
+        const contextAppendId = trustedSession
+          ? this.queueMeetingSessionContextAppend({
+              meetingId,
+              memberId: actorId,
+              sessionIdentity: trustedSession,
+              toolName: "company_meeting_speak",
+              message: written,
+              turnId: null,
+              roundNumber: null,
+              recordKind: "host_speech",
+              targetId: null,
+              body: message,
+            })
+          : undefined;
+        if (contextAppendId) {
+          this.enqueueHostDispatch(
+            meetingId,
+            "host_resume",
+            "你刚刚完成了一次主持人发言。该发言已写回 main session，请继续主持会议。",
+            `host-resume-after-speak:${meetingId}:${written.id}`,
+            contextAppendId,
+          );
+        }
         this.db.prepare("UPDATE meetings SET waiting_on_host_since = ? WHERE id = ?").run(nowIso(), meetingId);
         this.audit({ actorId, action: "meeting.host_spoke", entityType: "meeting", entityId: meetingId, after: { body: message } });
         return null;
@@ -1345,13 +1628,28 @@ export class CompanyOsStore {
       if (!turnId || turn.id !== turnId) throw new Error("meeting turn does not match the current speaking round");
       const completedAt = nowIso();
       this.db.prepare("UPDATE meeting_turns SET status = 'completed', completion_source = 'tool', completed_at = ? WHERE id = ?").run(completedAt, turn.id);
-      this.addMeetingMessage(meetingId, "member", actorId, null, message, turn.id);
+      const written = this.addMeetingMessage(meetingId, "member", actorId, null, message, turn.id);
+      const roundNumber = this.meetingRoundNumber(turn.id);
+      if (trustedSession) {
+        this.queueMeetingSessionContextAppend({
+          meetingId,
+          memberId: actorId,
+          sessionIdentity: trustedSession,
+          toolName: "company_meeting_speak",
+          message: written,
+          turnId: turn.id,
+          roundNumber,
+          recordKind: "speech",
+          targetId: null,
+          body: message,
+        });
+      }
       if (turn.intervention_id) {
         this.db.prepare("UPDATE meeting_interventions SET status = 'delivered', delivered_at = ? WHERE id = ?")
           .run(completedAt, turn.intervention_id);
       }
       this.db.prepare("UPDATE meetings SET current_turn_id = NULL, waiting_on_host_since = ? WHERE id = ?").run(completedAt, meetingId);
-      this.advanceMeetingWatermark(meetingId, actorId, this.maxMeetingSequence(meetingId));
+      if (!trustedSession) this.advanceMeetingWatermark(meetingId, actorId, this.maxMeetingSequence(meetingId));
       this.audit({ actorId, action: "meeting.spoke", entityType: "meeting", entityId: meetingId, after: { turnId: turn.id, body: message } });
       return this.meetingTurnDelivery(turn.id);
     });
@@ -1426,26 +1724,57 @@ export class CompanyOsStore {
   } {
     this.requireAgentMember(actorId);
     const prepared = this.prepareMeetingEnd(actorId, meetingId, summary, publishNotice);
-    if (prepared.meeting.boss_participates) {
-      this.transaction(() => {
-        if (prepared.meeting.end_requested_at) throw new Error("meeting end is already awaiting Boss approval");
-        const requestedAt = nowIso();
-        this.db.prepare(`
-          UPDATE meetings SET end_requested_at = ?, end_requested_summary = ?,
-            end_requested_publish_notice = ?, waiting_on_host_since = NULL WHERE id = ?
-        `).run(requestedAt, prepared.summary, publishNotice ? 1 : 0, meetingId);
-        this.addMeetingMessage(meetingId, "system", null, null, "主持人已提交会议总结并申请结束，正在等待 Boss 决定。");
-        this.audit({
-          actorId,
-          action: "meeting.end_requested",
-          entityType: "meeting",
-          entityId: meetingId,
-          after: { summary: prepared.summary, publishNotice },
-        });
+    this.transaction(() => {
+      if (prepared.meeting.end_requested_at) throw new Error("meeting end is already pending");
+      const requestedAt = nowIso();
+      const autoEndAt = prepared.meeting.boss_participates
+        ? null
+        : new Date(Date.parse(requestedAt) + this.automaticEndDelayMs).toISOString();
+      this.db.prepare(`
+        UPDATE meetings SET end_requested_at = ?, end_requested_summary = ?,
+          end_requested_publish_notice = ?, waiting_on_host_since = NULL WHERE id = ?
+      `).run(requestedAt, prepared.summary, publishNotice ? 1 : 0, meetingId);
+      this.addMeetingMessage(
+        meetingId,
+        "system",
+        null,
+        null,
+        prepared.meeting.boss_participates
+          ? "主持人已提交会议总结并申请结束，正在等待 Boss 决定。"
+          : `主持人已提交会议总结并申请结束，${Math.ceil(this.automaticEndDelayMs / 1000)} 秒后自动结束。`,
+      );
+      this.audit({
+        actorId,
+        action: "meeting.end_requested",
+        entityType: "meeting",
+        entityId: meetingId,
+        after: { summary: prepared.summary, publishNotice, autoEndAt },
       });
-      return { meeting: this.meetingView(meetingId, actorId), createdTasks: [], notice: null, advance: {} };
-    }
-    return this.finalizeMeeting(actorId, actorId, prepared.meeting, prepared.summary, publishNotice, prepared.drafts);
+    });
+    return { meeting: this.meetingView(meetingId, actorId), createdTasks: [], notice: null, advance: {} };
+  }
+
+  nextAutomaticMeetingEnd() {
+    const meeting = this.db.prepare(`
+      SELECT id, end_requested_at FROM meetings
+      WHERE status = 'active' AND boss_participates = 0 AND end_requested_at IS NOT NULL
+      ORDER BY end_requested_at LIMIT 1
+    `).get() as Row | undefined;
+    if (!meeting) return null;
+    return {
+      meetingId: meeting.id as string,
+      autoEndAt: new Date(Date.parse(meeting.end_requested_at) + this.automaticEndDelayMs).toISOString(),
+    };
+  }
+
+  finalizeDueAutomaticMeetingEnd(now = Date.now()) {
+    const pending = this.nextAutomaticMeetingEnd();
+    if (!pending || now < Date.parse(pending.autoEndAt)) return null;
+    const meeting = this.getMeetingRow(pending.meetingId);
+    if (!meeting.end_requested_summary) throw new Error("automatic meeting end is missing the host summary");
+    const publishNotice = Boolean(meeting.end_requested_publish_notice);
+    const prepared = this.prepareMeetingEnd(meeting.host_id, meeting.id, meeting.end_requested_summary, publishNotice, true);
+    return this.finalizeMeeting("system", meeting.host_id, prepared.meeting, prepared.summary, publishNotice, prepared.drafts);
   }
 
   approveMeetingEndByBoss(meetingId: string) {
@@ -1710,6 +2039,9 @@ export class CompanyOsStore {
       endRequestedAt: row.end_requested_at,
       endRequestedSummary: row.end_requested_summary,
       endRequestedPublishNotice: Boolean(row.end_requested_publish_notice),
+      autoEndAt: row.status === "active" && row.end_requested_at && !row.boss_participates
+        ? new Date(Date.parse(row.end_requested_at) + this.automaticEndDelayMs).toISOString()
+        : null,
       queuePosition: Number(row.queue_position),
       participantCount: Number(participantCount.count),
       currentTurnId: row.current_turn_id,
@@ -1750,6 +2082,97 @@ export class CompanyOsStore {
     return { id, sequence: Number(row.sequence) };
   }
 
+  private queueMeetingSessionContextAppend(input: {
+    meetingId: string;
+    memberId: string;
+    sessionIdentity: MeetingToolSessionIdentity;
+    toolName: "company_meeting_speak" | "company_meeting_delegate";
+    message: { id: string; sequence: number };
+    turnId: string | null;
+    roundNumber: number | null;
+    recordKind: "speech" | "delegate" | "host_speech";
+    targetId: string | null;
+    body: string;
+  }) {
+    const member = this.getMember(input.memberId, { active: false });
+    const target = input.targetId ? this.getMember(input.targetId, { active: false }) : null;
+    const id = randomUUID();
+    const formattedText = formatSelfMeetingContextMessage({
+      sequence: input.message.sequence,
+      roundNumber: input.roundNumber,
+      recordKind: input.recordKind,
+      memberName: member.name,
+      targetName: target?.name ?? null,
+      body: input.body,
+    });
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO meeting_session_context_appends (
+        id, meeting_id, member_id, runtime_agent_id, session_key, session_id,
+        tool_name, tool_call_id, message_id, message_sequence, turn_id, round_number,
+        record_kind, target_id, target_name, member_name, body, formatted_text,
+        status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(
+      id,
+      input.meetingId,
+      input.memberId,
+      input.sessionIdentity.agentId,
+      input.sessionIdentity.sessionKey,
+      input.sessionIdentity.sessionId,
+      input.toolName,
+      input.sessionIdentity.toolCallId,
+      input.message.id,
+      input.message.sequence,
+      input.turnId,
+      input.roundNumber,
+      input.recordKind,
+      input.targetId,
+      target?.name ?? null,
+      member.name,
+      input.body,
+      formattedText,
+      nowIso(),
+    );
+    const appendId = Number(result.changes) > 0
+      ? id
+      : (this.db.prepare(`
+          SELECT id FROM meeting_session_context_appends WHERE session_id = ? AND tool_call_id = ?
+        `).get(input.sessionIdentity.sessionId, input.sessionIdentity.toolCallId) as Row).id as string;
+    if (Number(result.changes) > 0) {
+      this.audit({
+        actorId: input.memberId,
+        action: "meeting.session_context_append_queued",
+        entityType: "meeting",
+        entityId: input.meetingId,
+        after: {
+          appendId,
+          toolName: input.toolName,
+          messageId: input.message.id,
+          messageSequence: input.message.sequence,
+          roundNumber: input.roundNumber,
+        },
+      });
+    }
+    return appendId;
+  }
+
+  private validateMeetingToolSession(actorId: string, identity: MeetingToolSessionIdentity) {
+    const runtimeAgentId = this.runtimeAgentId(actorId);
+    if (required(identity.agentId, "tool session agentId") !== runtimeAgentId) {
+      throw new Error("meeting tool session Agent does not match the authenticated member");
+    }
+    const expectedSessionKey = `agent:${runtimeAgentId}:main`;
+    if (required(identity.sessionKey, "tool sessionKey") !== expectedSessionKey) {
+      throw new Error(`meeting tools must run in the Agent main session: ${expectedSessionKey}`);
+    }
+    return {
+      agentId: runtimeAgentId,
+      sessionKey: expectedSessionKey,
+      sessionId: required(identity.sessionId, "tool sessionId"),
+      toolCallId: required(identity.toolCallId, "tool call ID"),
+    };
+  }
+
   private createMeetingTurn(
     meetingId: string,
     speakerId: string,
@@ -1765,6 +2188,26 @@ export class CompanyOsStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', ?)
     `).run(id, meetingId, speakerId, requestedBy, kind, prompt, interventionId ?? null, startedAt);
     return { id, startedAt };
+  }
+
+  private meetingRoundNumber(turnId: string) {
+    const row = this.db.prepare(`
+      WITH turn_base AS (
+        SELECT t.id, t.started_at, MIN(msg.sequence) AS first_sequence
+        FROM meeting_turns t
+        LEFT JOIN meeting_messages msg ON msg.turn_id = t.id
+        WHERE t.meeting_id = (SELECT meeting_id FROM meeting_turns WHERE id = ?)
+        GROUP BY t.id
+      ), ordered AS (
+        SELECT id, ROW_NUMBER() OVER (
+          ORDER BY COALESCE(first_sequence, 9223372036854775807), started_at, id
+        ) AS round_number
+        FROM turn_base
+      )
+      SELECT round_number FROM ordered WHERE id = ?
+    `).get(turnId, turnId) as Row | undefined;
+    if (!row) throw new Error(`meeting turn not found: ${turnId}`);
+    return Number(row.round_number);
   }
 
   nextPendingInterventionTurn(meetingId: string): MeetingTurnDispatch | null {
@@ -1829,13 +2272,38 @@ export class CompanyOsStore {
     const fromSequence = Number(watermark?.sequence ?? 0);
     const toSequence = this.maxMeetingSequence(meetingId);
     const rows = this.db.prepare(`
-      SELECT msg.*, author.name AS author_name, target.name AS target_name
+      WITH turn_base AS (
+        SELECT
+          turn.*,
+          MIN(msg.sequence) AS turn_first_sequence
+        FROM meeting_turns turn
+        LEFT JOIN meeting_messages msg ON msg.turn_id = turn.id
+        WHERE turn.meeting_id = ?
+        GROUP BY turn.id
+      ), turn_order AS (
+        SELECT
+          turn_base.*,
+          ROW_NUMBER() OVER (
+            ORDER BY COALESCE(turn_first_sequence, 9223372036854775807), started_at, id
+          ) AS round_number
+        FROM turn_base
+      )
+      SELECT
+        msg.*,
+        author.name AS author_name,
+        target.name AS target_name,
+        turn_order.round_number,
+        turn_order.turn_first_sequence,
+        turn_order.speaker_id AS turn_speaker_id,
+        turn_order.requested_by AS turn_requested_by,
+        turn_order.kind AS turn_kind
       FROM meeting_messages msg
       LEFT JOIN members author ON author.id = msg.author_id
       LEFT JOIN members target ON target.id = msg.target_id
+      LEFT JOIN turn_order ON turn_order.id = msg.turn_id
       WHERE msg.meeting_id = ? AND msg.sequence > ? AND msg.sequence <= ?
       ORDER BY msg.sequence
-    `).all(meetingId, fromSequence, toSequence) as Row[];
+    `).all(meetingId, meetingId, fromSequence, toSequence) as Row[];
     const host = this.getMember(meeting.host_id, { active: false });
     const lines = [
       "【Company OS 公司会议】",
@@ -1847,25 +2315,23 @@ export class CompanyOsStore {
       `你的身份：${member.name}（${memberId}）`,
       "",
       rows.length
-        ? `以下是你自上次成功参与后新增的会议记录（#${fromSequence + 1}–#${toSequence}）：`
+        ? `【新增会议时间线｜消息 #${padMeetingSequence(Number(rows[0]?.sequence))} → #${padMeetingSequence(toSequence)}｜必须严格按消息号顺序阅读】`
         : "自你上次成功参与后没有新增会议消息。",
-      ...rows.map((row) => formatMeetingContextMessage(row)),
+      ...rows.map((row) => formatMeetingContextMessage(row, memberId, fromSequence)),
       "",
       `当前要求：${required(options.instruction, "instruction")}`,
       "",
     ];
     if (options.role === "speaker") {
       lines.push(
-        `当前轮次 ID：${required(options.turnId, "turnId")}`,
-        "你现在拥有发言权。请结合会议记录作出实质性回应，然后调用 company_meeting_speak 提交发言。",
-        `必须把 meetingId=${meetingId}、turnId=${required(options.turnId, "turnId")} 和正文一起传给 company_meeting_speak；不要只在普通回复中返回发言内容。`,
+        "你现在拥有发言权。请结合会议记录作出实质性回应，然后调用 company_meeting_speak 提交正文。",
       );
     } else {
       lines.push(
         "你是本场主持人。请先回应新增内容，再使用 company_meeting_speak、company_meeting_delegate 或 company_meeting_set_task_drafts 推进会议。",
         meeting.boss_participates
           ? "需要结束时调用 company_meeting_end 提交总结并申请 Boss 批准；你不能直接关闭会议。"
-          : "需要结束时调用 company_meeting_end。",
+          : `需要结束时调用 company_meeting_end 提交总结；申请后倒计时 ${Math.ceil(this.automaticEndDelayMs / 1000)} 秒自动关闭会议。`,
       );
     }
     return { meetingId, memberId, fromSequence, toSequence, prompt: lines.join("\n") };
@@ -1978,6 +2444,112 @@ export class CompanyOsStore {
     });
   }
 
+  recoverSessionContextAppends() {
+    return this.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE meeting_session_context_appends
+        SET status = 'pending', last_error = 'Gateway restarted during session context append'
+        WHERE status = 'appending'
+      `).run();
+      return Number(result.changes);
+    });
+  }
+
+  claimNextSessionContextAppend(identity?: { agentId: string; sessionKey: string; sessionId: string }) {
+    return this.transaction(() => {
+      const filters = identity
+        ? "AND runtime_agent_id = ? AND session_key = ? AND session_id = ?"
+        : "";
+      const params = identity ? [identity.agentId, identity.sessionKey, identity.sessionId] : [];
+      const row = this.db.prepare(`
+        SELECT * FROM meeting_session_context_appends
+        WHERE status = 'pending' AND attempts < 3 ${filters}
+        ORDER BY created_at, rowid LIMIT 1
+      `).get(...params) as Row | undefined;
+      if (!row) return null;
+      this.db.prepare(`
+        UPDATE meeting_session_context_appends
+        SET status = 'appending', attempts = attempts + 1, last_error = NULL
+        WHERE id = ? AND status = 'pending'
+      `).run(row.id);
+      return mapMeetingSessionContextAppend({ ...row, status: "appending", attempts: Number(row.attempts) + 1 });
+    });
+  }
+
+  completeSessionContextAppend(appendId: string, appendedMessageId: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_session_context_appends WHERE id = ?").get(appendId) as Row | undefined;
+      if (!row || row.status === "appended") return false;
+      if (row.status !== "appending") throw new Error("session context append is not currently claimed");
+      const appendedAt = nowIso();
+      this.db.prepare(`
+        UPDATE meeting_session_context_appends
+        SET status = 'appended', appended_message_id = ?, appended_at = ?, last_error = NULL
+        WHERE id = ?
+      `).run(required(appendedMessageId, "appended message ID"), appendedAt, appendId);
+      this.advanceMeetingWatermark(row.meeting_id, row.member_id, Number(row.message_sequence));
+      this.audit({
+        actorId: "system",
+        action: "meeting.session_context_appended",
+        entityType: "meeting",
+        entityId: row.meeting_id,
+        after: {
+          appendId,
+          memberId: row.member_id,
+          messageId: row.message_id,
+          messageSequence: Number(row.message_sequence),
+          sessionId: row.session_id,
+        },
+      });
+      return true;
+    });
+  }
+
+  failSessionContextAppend(appendId: string, error: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_session_context_appends WHERE id = ?").get(appendId) as Row | undefined;
+      if (!row || row.status !== "appending") return false;
+      const reason = required(error, "session context append error").slice(0, 1000);
+      const retry = Number(row.attempts) < 3;
+      this.db.prepare(`
+        UPDATE meeting_session_context_appends
+        SET status = ?, last_error = ? WHERE id = ?
+      `).run(retry ? "pending" : "failed", reason, appendId);
+      this.audit({
+        actorId: "system",
+        action: retry ? "meeting.session_context_append_retry" : "meeting.session_context_append_failed",
+        entityType: "meeting",
+        entityId: row.meeting_id,
+        reason,
+        after: { appendId, memberId: row.member_id, attempts: Number(row.attempts) },
+      });
+      return retry;
+    });
+  }
+
+  hasPendingSessionContextAppends(identity?: { agentId: string; sessionKey: string; sessionId: string }) {
+    const filters = identity
+      ? "AND runtime_agent_id = ? AND session_key = ? AND session_id = ?"
+      : "";
+    const params = identity ? [identity.agentId, identity.sessionKey, identity.sessionId] : [];
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM meeting_session_context_appends
+      WHERE status = 'pending' AND attempts < 3 ${filters} LIMIT 1
+    `).get(...params));
+  }
+
+  queueHostResumeAfterContextAppend(meetingId: string, contextAppendId: string, reason: string, dedupeKey: string) {
+    const append = this.db.prepare("SELECT * FROM meeting_session_context_appends WHERE id = ?").get(contextAppendId) as Row | undefined;
+    if (!append || append.meeting_id !== meetingId) throw new Error("host resume context append does not belong to the meeting");
+    const meeting = this.getMeetingRow(meetingId);
+    if (append.member_id !== meeting.host_id) throw new Error("host resume must wait for the host's own context append");
+    return this.enqueueHostDispatch(meetingId, "host_resume", reason, dedupeKey, contextAppendId);
+  }
+
+  queueHostResume(meetingId: string, reason: string, dedupeKey: string) {
+    return this.enqueueHostDispatch(meetingId, "host_resume", reason, dedupeKey);
+  }
+
   recoverAgentDispatches() {
     return this.transaction(() => {
       const rows = this.db.prepare("SELECT * FROM meeting_agent_dispatches WHERE status = 'running'").all() as Row[];
@@ -1998,6 +2570,12 @@ export class CompanyOsStore {
         const row = this.db.prepare(`
           SELECT d.* FROM meeting_agent_dispatches d
           WHERE d.status = 'pending' AND d.attempts < 3
+            AND (
+              d.wait_for_context_append_id IS NULL OR EXISTS (
+                SELECT 1 FROM meeting_session_context_appends a
+                WHERE a.id = d.wait_for_context_append_id AND a.status = 'appended'
+              )
+            )
           ORDER BY d.created_at, d.rowid LIMIT 1
         `).get() as Row | undefined;
         if (!row) return null;
@@ -2025,7 +2603,17 @@ export class CompanyOsStore {
   }
 
   hasPendingHostDispatches() {
-    return Boolean(this.db.prepare("SELECT 1 AS ok FROM meeting_agent_dispatches WHERE status = 'pending' AND attempts < 3 LIMIT 1").get());
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM meeting_agent_dispatches d
+      WHERE d.status = 'pending' AND d.attempts < 3
+        AND (
+          d.wait_for_context_append_id IS NULL OR EXISTS (
+            SELECT 1 FROM meeting_session_context_appends a
+            WHERE a.id = d.wait_for_context_append_id AND a.status = 'appended'
+          )
+        )
+      LIMIT 1
+    `).get());
   }
 
   setHostDispatchContext(dispatchId: string, context: MeetingContextEnvelope) {
@@ -2100,14 +2688,25 @@ export class CompanyOsStore {
     kind: "host_start" | "host_resume" | "host_recovery",
     reason: string,
     dedupeKey: string,
+    waitForContextAppendId?: string,
   ) {
     const meeting = this.getMeetingRow(meetingId);
     const id = randomUUID();
     const result = this.db.prepare(`
       INSERT OR IGNORE INTO meeting_agent_dispatches (
-        id, meeting_id, kind, target_agent_id, reason, dedupe_key, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(id, meetingId, kind, meeting.host_id, required(reason, "dispatch reason"), dedupeKey, nowIso());
+        id, meeting_id, kind, target_agent_id, reason, dedupe_key,
+        wait_for_context_append_id, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(
+      id,
+      meetingId,
+      kind,
+      meeting.host_id,
+      required(reason, "dispatch reason"),
+      dedupeKey,
+      waitForContextAppendId ?? null,
+      nowIso(),
+    );
     const dispatchId = Number(result.changes) > 0
       ? id
       : (this.db.prepare("SELECT id FROM meeting_agent_dispatches WHERE dedupe_key = ?").get(dedupeKey) as Row).id as string;
@@ -2133,6 +2732,7 @@ export class CompanyOsStore {
   private runtimeAgentId(memberId: string) {
     const member = this.getMember(memberId);
     const agentId = required(member.agent_id, `member ${memberId} agentId`);
+    if (agentId !== memberId) throw new Error(`company member ID must equal its OpenClaw Agent ID: ${memberId} != ${agentId}`);
     if (!this.allowedAgentIds.has(agentId)) throw new Error(`OpenClaw agent does not exist: ${agentId}`);
     return agentId;
   }
@@ -2238,10 +2838,6 @@ export class CompanyOsStore {
       generatedAt: nowIso(),
     };
   }
-}
-
-function requireOrganizationAdmin(actorId: string) {
-  if (actorId !== "main") throw new Error("only agent main can manage organization");
 }
 
 function required(value: string | undefined, field: string) {
@@ -2432,6 +3028,7 @@ function mapHostDispatch(row: Row) {
     status: row.status,
     attempts: Number(row.attempts),
     lastError: row.last_error ?? null,
+    waitForContextAppendId: row.wait_for_context_append_id ?? null,
     contextFromSequence: row.context_from_sequence === null || row.context_from_sequence === undefined
       ? null
       : Number(row.context_from_sequence),
@@ -2444,14 +3041,84 @@ function mapHostDispatch(row: Row) {
   };
 }
 
-function formatMeetingContextMessage(row: Row) {
+function mapMeetingSessionContextAppend(row: Row): MeetingSessionContextAppend {
+  return {
+    id: row.id,
+    meetingId: row.meeting_id,
+    memberId: row.member_id,
+    runtimeAgentId: row.runtime_agent_id,
+    sessionKey: row.session_key,
+    sessionId: row.session_id,
+    toolName: row.tool_name,
+    toolCallId: row.tool_call_id,
+    messageId: row.message_id,
+    messageSequence: Number(row.message_sequence),
+    turnId: row.turn_id ?? null,
+    roundNumber: row.round_number === null || row.round_number === undefined ? null : Number(row.round_number),
+    recordKind: row.record_kind,
+    targetId: row.target_id ?? null,
+    targetName: row.target_name ?? null,
+    memberName: row.member_name,
+    body: row.body,
+    formattedText: row.formatted_text,
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error ?? null,
+    createdAt: row.created_at,
+    appendedAt: row.appended_at ?? null,
+  };
+}
+
+function formatSelfMeetingContextMessage(input: {
+  sequence: number;
+  roundNumber: number | null;
+  recordKind: "speech" | "delegate" | "host_speech";
+  memberName: string;
+  targetName: string | null;
+  body: string;
+}) {
+  const sequence = padMeetingSequence(input.sequence);
+  if (input.recordKind === "host_speech") {
+    return `【消息 #${sequence}｜主持人发言事件】\n你（${input.memberName}）：\n${input.body}`;
+  }
+  const round = required(String(input.roundNumber ?? ""), "meeting round number");
+  const kind = input.recordKind === "delegate" ? "点名" : "发言";
+  const target = input.recordKind === "delegate" && input.targetName ? ` @${input.targetName}` : "";
+  return `【消息 #${sequence}｜第 ${round} 轮｜${kind}】\n你（${input.memberName}）${target}：\n${input.body}`;
+}
+
+function padMeetingSequence(sequence: number) {
+  return Math.max(0, Math.floor(sequence)).toString().padStart(6, "0");
+}
+
+function formatMeetingContextMessage(row: Row, recipientId: string, fromSequence: number) {
   const author = row.author_kind === "system"
     ? "系统"
     : row.author_kind === "boss"
       ? "Boss"
-      : `${row.author_name ?? row.author_id ?? "未知成员"}（${row.author_id ?? "unknown"}）`;
+      : row.author_id === recipientId
+        ? `你（${row.author_name ?? row.author_id ?? "未知成员"}）`
+        : `${row.author_name ?? row.author_id ?? "未知成员"}（${row.author_id ?? "unknown"}）`;
   const target = row.target_id ? ` @${row.target_name ?? row.target_id}` : "";
-  return `[#${Number(row.sequence)}] ${author}${target}：${row.body}`;
+  let classification: string;
+  if (row.turn_id && row.round_number) {
+    const continued = Number(row.turn_first_sequence ?? row.sequence) <= fromSequence ? "（续）" : "";
+    const kind = row.author_kind === "system"
+      ? "轮次事件"
+      : row.author_id === row.turn_requested_by && row.target_id === row.turn_speaker_id
+        ? "点名"
+        : row.author_id === row.turn_speaker_id
+          ? "发言"
+          : "轮次事件";
+    classification = `第 ${Number(row.round_number)} 轮${continued}｜${kind}`;
+  } else if (row.author_kind === "system") {
+    classification = "系统穿插事件";
+  } else if (row.author_kind === "boss") {
+    classification = "Boss 穿插事件";
+  } else {
+    classification = "主持人发言事件";
+  }
+  return `【消息 #${padMeetingSequence(Number(row.sequence))}｜${classification}】\n${author}${target}：\n${row.body}`;
 }
 
 function mapTaskDraft(row: Row) {

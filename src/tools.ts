@@ -42,6 +42,7 @@ const Id = Type.String({ minLength: 1 });
 const Reason = Type.String({ minLength: 1 });
 const TaskId = Type.Object({ taskId: Id }, { additionalProperties: false });
 const MeetingId = Type.Object({ meetingId: Id }, { additionalProperties: false });
+const OptionalMeetingId = Type.Object({ meetingId: Type.Optional(Id) }, { additionalProperties: false });
 const TaskFields = {
   title: Type.String({ minLength: 1 }),
   description: Type.String({ minLength: 1 }),
@@ -74,17 +75,17 @@ export function createCompanyOsTools(options: {
     tool("company_org_list", "组织架构", "查看公司成员、职位、直属上级、层级和在职状态。", Type.Object({
       includeInactive: Type.Optional(Type.Boolean()),
     }, { additionalProperties: false }), async (p) => store.listMembers(Boolean(p.includeInactive))),
-    tool("company_org_add", "新增员工", "仅架构师 main 可新增员工；Agent ID 必须已存在于 OpenClaw 配置。", Type.Object({
+    tool("company_org_add", "新增员工", "仅配置的组织架构师可新增员工；Agent ID 必须已存在于 OpenClaw 配置。", Type.Object({
       agentId: Id, name: Id, title: Id, managerId: Id,
     }, { additionalProperties: false }), async (p) => store.addMember(actorId(), p as any)),
-    tool("company_org_update", "更新员工", "仅架构师 main 可更新姓名、职位或直属上级。", Type.Object({
+    tool("company_org_update", "更新员工", "仅配置的组织架构师可更新姓名、职位或直属上级。", Type.Object({
       memberId: Id,
       name: Type.Optional(Id),
       title: Type.Optional(Id),
       managerId: Type.Optional(Id),
       reason: Reason,
     }, { additionalProperties: false }), async (p) => store.updateMember(actorId(), p.memberId, p, p.reason)),
-    tool("company_org_deactivate", "停用员工", "仅架构师 main 可停用没有活动工作和直属下属的员工。", Type.Object({
+    tool("company_org_deactivate", "停用员工", "仅配置的组织架构师可停用没有活动工作和直属下属的员工。", Type.Object({
       memberId: Id, reason: Reason,
     }, { additionalProperties: false }), async (p) => store.deactivateMember(actorId(), p.memberId, p.reason)),
 
@@ -93,7 +94,7 @@ export function createCompanyOsTools(options: {
     }, { additionalProperties: false }), async (p) => store.listNotices(actorId(), { effectiveOnly: Boolean(p.effectiveOnly) })),
     tool("company_notice_read", "阅读公告", "读取公告并写入自己的 read mark。", Type.Object({ noticeId: Id }, { additionalProperties: false }),
       async (p) => store.readNotice(actorId(), p.noticeId)),
-    tool("company_notice_publish", "发布公告", "Boss、main 或当前拥有直属下属的管理者可发布不可变公告；更正需指向旧公告。", Type.Object({
+    tool("company_notice_publish", "发布公告", "Boss、组织架构师或当前拥有直属下属的管理者可发布不可变公告；更正需指向旧公告。", Type.Object({
       title: Id,
       body: Id,
       supersedesNoticeId: Type.Optional(Id),
@@ -113,41 +114,57 @@ export function createCompanyOsTools(options: {
     }),
     tool("company_meeting_list", "会议列表", "查看与你有关的排队、活动和历史会议。", Empty,
       async () => store.listMeetings(actorId())),
-    tool("company_meeting_status", "会议状态", "查看会议对话、当前发言者、参会角色和任务草案。", MeetingId,
+    tool("company_meeting_status", "会议状态", "查看会议对话、当前发言者、参会角色和任务草案；省略 ID 时读取当前活动会议。", OptionalMeetingId,
       async (p) => {
         const actor = actorId();
-        const meeting = store.meetingView(p.meetingId, actor);
-        store.acknowledgeHostContext(p.meetingId, actor);
+        const meetingId = p.meetingId ?? store.activeMeetingId(actor);
+        const meeting = store.meetingView(meetingId, actor);
+        store.acknowledgeHostContext(meetingId, actor);
         return meeting;
       }),
-    tool("company_meeting_speak", "会议发言", "当前发言者提交本轮发言；主持人在没有活动轮次时也可发言。", Type.Object({
-      meetingId: Id, turnId: Type.Optional(Id), body: Id,
-    }, { additionalProperties: false }), async (p) => {
+    terminatingTool("company_meeting_speak", "会议发言", "在当前活动会议中提交发言；系统自动识别会议和当前轮次。", Type.Object({
+      body: Id,
+    }, { additionalProperties: false }), async (p, toolCallId) => {
       const actor = actorId();
-      const delivery = store.speakMeeting(actor, p.meetingId, p.body, p.turnId);
-      const meeting = store.meetingView(p.meetingId, actor);
-      store.acknowledgeHostContext(p.meetingId, actor);
-      return { accepted: true, delivery, meeting };
+      const meetingId = store.activeMeetingId(actor);
+      const turnId = store.meetingView(meetingId, actor).currentTurn?.id;
+      const sessionIdentity = meetingToolSession(options.toolContext, toolCallId);
+      store.speakMeeting(actor, meetingId, p.body, turnId, sessionIdentity);
+      service.scheduleSessionContextAppendAfterTurn(sessionIdentity);
+      return { accepted: true, receipt: "成功，本轮会话结束" };
     }),
-    tool("company_meeting_delegate", "会议点名", "主持人选择下一位发言者并提出问题。", Type.Object({
-      meetingId: Id, speakerId: Id, prompt: Id,
-    }, { additionalProperties: false }), async (p) => service.delegateMeeting(actorId(), p.meetingId, p.speakerId, p.prompt)),
-    tool("company_meeting_set_task_drafts", "会议任务草案", "任务会议主持人整体替换子任务草案；每个 worker 结束前必须至少得到一项。", Type.Object({
-      meetingId: Id, drafts: Type.Array(TaskDraft),
+    terminatingTool("company_meeting_delegate", "会议点名", "在当前活动会议中点名下一位发言者；系统自动识别会议。", Type.Object({
+      speakerId: Id, prompt: Id,
+    }, { additionalProperties: false }), async (p, toolCallId) => {
+      const actor = actorId();
+      const sessionIdentity = meetingToolSession(options.toolContext, toolCallId);
+      await service.delegateMeeting(
+        actor,
+        store.activeMeetingId(actor),
+        p.speakerId,
+        p.prompt,
+        sessionIdentity,
+      );
+      service.scheduleSessionContextAppendAfterTurn(sessionIdentity);
+      return { accepted: true, receipt: "成功，本轮会话结束" };
+    }),
+    tool("company_meeting_set_task_drafts", "会议任务草案", "为当前任务会议整体替换子任务草案；每个 worker 结束前必须至少得到一项。", Type.Object({
+      drafts: Type.Array(TaskDraft),
     }, { additionalProperties: false }), async (p) => {
       const actor = actorId();
-      const meeting = store.setMeetingTaskDrafts(actor, p.meetingId, p.drafts);
-      store.acknowledgeHostContext(p.meetingId, actor);
+      const meetingId = store.activeMeetingId(actor);
+      const meeting = store.setMeetingTaskDrafts(actor, meetingId, p.drafts);
+      store.acknowledgeHostContext(meetingId, actor);
       return meeting;
     }),
-    tool("company_meeting_end", "结束或申请结束会议", "普通会议由主持人结束；Boss 直接参会时只提交总结并申请结束，必须由 Boss 在 WebUI 批准。", Type.Object({
-      meetingId: Id,
+    tool("company_meeting_end", "申请结束会议", "申请结束当前活动会议；未邀请 Boss 时倒计时自动结束，Boss 直接参会时由 Boss 在 WebUI 决定。", Type.Object({
       summary: Id,
       publishNotice: Type.Optional(Type.Boolean()),
     }, { additionalProperties: false }), async (p) => {
       const actor = actorId();
-      const result = store.endMeeting(actor, p.meetingId, p.summary, Boolean(p.publishNotice));
-      store.acknowledgeHostContext(p.meetingId, actor);
+      const meetingId = store.activeMeetingId(actor);
+      const result = store.endMeeting(actor, meetingId, p.summary, Boolean(p.publishNotice));
+      store.acknowledgeHostContext(meetingId, actor);
       await service.dispatchAdvance(result.advance);
       return result;
     }),
@@ -208,10 +225,38 @@ function tool(name: ToolName, label: string, description: string, parameters: TS
   };
 }
 
+function terminatingTool(
+  name: "company_meeting_speak" | "company_meeting_delegate",
+  label: string,
+  description: string,
+  parameters: TSchema,
+  execute: (params: Params, toolCallId: string) => Promise<unknown> | unknown,
+): AnyAgentTool {
+  return {
+    name,
+    label,
+    description,
+    parameters,
+    executionMode: "sequential",
+    execute: async (toolCallId: string, rawParams: unknown) => ({
+      ...jsonResult(await execute((rawParams ?? {}) as Params, toolCallId)),
+      terminate: true,
+    }),
+  };
+}
+
 function requireAgentId(context: OpenClawPluginToolContext) {
   const agentId = context.agentId?.trim();
   if (!agentId) throw new Error("OpenClaw toolContext.agentId is required");
   return agentId;
+}
+
+function meetingToolSession(context: OpenClawPluginToolContext, toolCallId: string) {
+  const agentId = requireAgentId(context);
+  const sessionKey = context.sessionKey?.trim();
+  const sessionId = context.sessionId?.trim();
+  if (!sessionKey || !sessionId) throw new Error("meeting tools require a trusted OpenClaw main-session identity");
+  return { agentId, sessionKey, sessionId, toolCallId };
 }
 
 function lazyObject<T extends object>(resolve: () => T): T {

@@ -6,6 +6,7 @@ import { MeetingHistory, MeetingHistoryDetail } from "../web/src/MeetingHistory"
 import type { MeetingDetail, MeetingSummary, MemberIdentity } from "../web/src/types";
 
 const identities: Record<string, MemberIdentity> = {
+  boss: { id: "boss", name: "Boss", title: "CEO", emoji: null, avatarUrl: "data:image/png;base64,Ym9zcw==" },
   main: { id: "main", name: "架构师", title: "首席架构师", emoji: "⚙️", avatarUrl: "data:image/png;base64,aW1hZ2U=" },
   engineer: { id: "engineer", name: "高级工程师", title: "工程师", emoji: "🔧", avatarUrl: "data:image/png;base64,aW1hZ2U=" },
 };
@@ -26,6 +27,7 @@ const summary: MeetingSummary = {
   endRequestedAt: null,
   endRequestedSummary: null,
   endRequestedPublishNotice: false,
+  autoEndAt: null,
   queuePosition: 0,
   participantCount: 1,
   currentTurnId: null,
@@ -47,7 +49,10 @@ describe("meeting history UI", () => {
     const detail: MeetingDetail = {
       ...summary,
       participants: [{ agentId: "engineer", role: "worker", name: "高级工程师", title: "工程师" }],
-      messages: [{ id: "message-1", sequence: 1, authorKind: "member", authorId: "engineer", targetId: null, body: "建议优先完成任务树。", createdAt: summary.startedAt! }],
+      messages: [
+        { id: "message-0", sequence: 1, authorKind: "boss", authorId: "boss", targetId: null, body: "现在开始会议。", createdAt: summary.startedAt! },
+        { id: "message-1", sequence: 2, authorKind: "member", authorId: "engineer", targetId: null, body: "建议优先完成任务树。", createdAt: summary.startedAt! },
+      ],
       taskDrafts: [{ id: "draft-1", position: 1, title: "实现任务树", description: "完成树形交互", acceptanceCriteria: "测试通过", assigneeId: "engineer" }],
       currentTurn: null,
     };
@@ -57,6 +62,7 @@ describe("meeting history UI", () => {
     expect(html).toContain("高级工程师");
     expect(html).toContain("实现任务树");
     expect(html).toContain("Boss 直接参会");
+    expect(html).toContain("data:image/png;base64,Ym9zcw==");
     expect(html).toContain("data:image/png;base64,aW1hZ2U=");
   });
 });

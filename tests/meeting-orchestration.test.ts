@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentInvoker } from "../src/agent-invoker.js";
 import { executeBossApi } from "../src/boss-api.js";
+import type { SessionContextAppender } from "../src/session-context.js";
 import { CompanyOsService } from "../src/service.js";
 import { resolveConfig } from "../src/types.js";
 
@@ -22,7 +23,10 @@ describe("synchronous meeting orchestration", () => {
     const agentInvoker: AgentInvoker = {
       invoke: vi.fn(async ({ agentId, prompt }) => {
         expect(agentId).toBe("eng-a");
-        expect(prompt).toContain("当前轮次 ID");
+        expect(prompt).toContain("你现在拥有发言权");
+        expect(prompt).not.toContain("当前轮次 ID");
+        expect(prompt).not.toContain("meetingId=");
+        expect(prompt).not.toContain("company_meeting_speak 成功后");
         const turnId = service.store.meetingView(meetingId, agentId).currentTurn.id;
         service.store.speakMeeting(agentId, meetingId, "通过工具提交的完整发言", turnId);
         return { ok: true, text: "已调用工具", raw: {}, attempts: 1 };
@@ -138,6 +142,124 @@ describe("synchronous meeting orchestration", () => {
     await service.stop();
   });
 
+  it("writes the host point to its session before a new host turn receives the participant answer", async () => {
+    let service: CompanyOsService;
+    let meetingId = "";
+    const appended: string[] = [];
+    const sessionContextAppender: SessionContextAppender = {
+      append: vi.fn(async (record) => {
+        appended.push(record.formattedText);
+        return { appended: true, messageId: `transcript-${record.id}` };
+      }),
+    };
+    const prompts: Array<{ agentId: string; prompt: string }> = [];
+    const agentInvoker: AgentInvoker = {
+      invoke: vi.fn(async ({ agentId, prompt }) => {
+        prompts.push({ agentId, prompt });
+        if (agentId === "eng-a") {
+          const turnId = service.store.meetingView(meetingId, agentId).currentTurn.id;
+          service.store.speakMeeting(agentId, meetingId, "参会者基于源码给出的回答", turnId);
+        } else if (agentId === "cto") {
+          service.store.speakMeeting("cto", meetingId, "主持人已收到回答并继续主持");
+        }
+        return { ok: true, text: "已推进", raw: {}, attempts: 1 };
+      }),
+    };
+    service = createService(agentInvoker, sessionContextAppender);
+    seedOrganization(service);
+    const requested = service.store.requestMeeting("cto", {
+      type: "discussion",
+      title: "跨 turn 主持恢复",
+      agenda: "参会者回答由编排器重新传给主持人",
+      participants: [{ agentId: "eng-a", role: "advisor" }],
+    });
+    meetingId = requested.meeting.id;
+
+    const hostSession = {
+      agentId: "cto",
+      sessionKey: "agent:cto:main",
+      sessionId: "session-cto-main",
+      toolCallId: "delegate-tool-call",
+    };
+    const delegated = await service.delegateMeeting("cto", meetingId, "eng-a", "请检查实现后回答", hostSession);
+
+    expect(delegated.hostDispatchId).toBeTruthy();
+    expect(service.store.claimNextHostDispatch()).toBeNull();
+    expect(prompts.map((item) => item.agentId)).toEqual(["eng-a"]);
+
+    await service.flushSessionContextAppends({
+      agentId: "cto",
+      sessionKey: "agent:cto:main",
+      sessionId: "session-cto-main",
+    });
+    await waitFor(() => expect(prompts.some((item) => item.agentId === "cto")).toBe(true));
+
+    expect(appended).toEqual([
+      "【消息 #000002｜第 1 轮｜点名】\n你（CTO） @高工 A：\n请检查实现后回答",
+    ]);
+    const resumed = prompts.find((item) => item.agentId === "cto")!.prompt;
+    expect(resumed).toContain("参会者基于源码给出的回答");
+    expect(resumed).not.toContain("请检查实现后回答");
+    await service.stop();
+  });
+
+  it("never appends a queued session record from the periodic timeout scan while an Agent turn may still be running", async () => {
+    const sessionContextAppender: SessionContextAppender = {
+      append: vi.fn(async (record) => ({ appended: true, messageId: `transcript-${record.id}` })),
+    };
+    const service = createService({ invoke: vi.fn() as any }, sessionContextAppender);
+    seedOrganization(service);
+    await service.start();
+    const meeting = service.store.requestMeeting("cto", {
+      type: "discussion",
+      title: "禁止扫描期抢写 transcript",
+      agenda: "回写只能发生在可信 agent_end 或启动恢复阶段",
+    }).meeting;
+    service.store.speakMeeting("cto", meeting.id, "当前 turn 已提交的主持人发言", undefined, {
+      agentId: "cto",
+      sessionKey: "agent:cto:main",
+      sessionId: "session-cto-main",
+      toolCallId: "speak-tool-call",
+    });
+
+    await (service as unknown as { scanTimeouts(): Promise<void> }).scanTimeouts();
+
+    expect(sessionContextAppender.append).not.toHaveBeenCalled();
+    expect(service.store.hasPendingSessionContextAppends()).toBe(true);
+    await service.stop();
+  });
+
+  it("waits for the official main-session activity probe before appending a terminated tool turn", async () => {
+    let active = true;
+    const sessionContextAppender: SessionContextAppender = {
+      append: vi.fn(async (record) => ({ appended: true, messageId: `transcript-${record.id}` })),
+    };
+    const service = createService({ invoke: vi.fn() as any }, sessionContextAppender, () => active);
+    seedOrganization(service);
+    await service.start();
+    const meeting = service.store.requestMeeting("cto", {
+      type: "discussion",
+      title: "等待 main session 空闲",
+      agenda: "terminate 后不抢写仍处于 active registry 的 transcript",
+    }).meeting;
+    const identity = {
+      agentId: "cto",
+      sessionKey: "agent:cto:main",
+      sessionId: "session-cto-main",
+      toolCallId: "host-speak-call",
+    };
+    service.store.speakMeeting("cto", meeting.id, "已经验收的主持人发言", undefined, identity);
+    service.scheduleSessionContextAppendAfterTurn(identity);
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(sessionContextAppender.append).not.toHaveBeenCalled();
+
+    active = false;
+    await waitFor(() => expect(sessionContextAppender.append).toHaveBeenCalledTimes(1));
+    expect(service.store.hasPendingSessionContextAppends()).toBe(false);
+    await service.stop();
+  });
+
   it("returns the Boss start API immediately while a durable host dispatch runs in the background", async () => {
     let release: ((value: { ok: true; text: string; raw: unknown; attempts: number }) => void) | undefined;
     const invocation = new Promise<{ ok: true; text: string; raw: unknown; attempts: number }>((resolve) => { release = resolve; });
@@ -190,7 +312,7 @@ describe("synchronous meeting orchestration", () => {
     await service.stop();
   });
 
-  it("records success when the dispatched host completes an ordinary meeting inside the invocation", async () => {
+  it("records success when the dispatched host requests the timed end of an ordinary meeting", async () => {
     let service: CompanyOsService;
     let meetingId = "";
     const agentInvoker: AgentInvoker = {
@@ -212,12 +334,50 @@ describe("synchronous meeting orchestration", () => {
     await service.dispatchAdvance(result.advance);
     await waitFor(() => expect(service.store.meetingView(meetingId).hostDispatchStatus?.status).toBe("succeeded"));
 
+    const pending = service.store.meetingView(meetingId);
+    expect(pending.status).toBe("active");
+    expect(pending.autoEndAt).toBeTruthy();
+    service.store.finalizeDueAutomaticMeetingEnd(Date.parse(pending.autoEndAt));
     expect(service.store.meetingView(meetingId).status).toBe("completed");
     await service.stop();
   });
+
+  it("automatically finalizes a non-Boss meeting when the persistent countdown expires", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-auto-end-"));
+    directories.push(directory);
+    const service = new CompanyOsService({
+      databasePath: path.join(directory, "company-os.sqlite"),
+      allowedAgentIds: ["main", "cto"],
+      config: resolveConfig({ meetingAutoEndDelaySeconds: 1, bossEmailNotifications: { enabled: false } }),
+      runtimeConfig: {},
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      meetingEmailSender: { send: vi.fn(async () => undefined) },
+      agentInvoker: { invoke: vi.fn() as any },
+    });
+    try {
+      service.store.addMember("main", { agentId: "cto", name: "CTO", title: "首席技术官", managerId: "boss" });
+      await service.start();
+      const meeting = service.store.requestMeeting("cto", {
+        type: "discussion",
+        title: "一秒自动结束",
+        agenda: "验证服务定时器",
+      }).meeting;
+      const requested = service.store.endMeeting("cto", meeting.id, "倒计时总结", false);
+      await service.dispatchAdvance(requested.advance);
+
+      expect(service.store.meetingView(meeting.id).status).toBe("active");
+      await waitFor(() => expect(service.store.meetingView(meeting.id).status).toBe("completed"), 2_000);
+    } finally {
+      await service.stop();
+    }
+  });
 });
 
-function createService(agentInvoker: AgentInvoker) {
+function createService(
+  agentInvoker: AgentInvoker,
+  sessionContextAppender?: SessionContextAppender,
+  isSessionActive?: (sessionKey: string) => boolean,
+) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-orchestration-"));
   directories.push(directory);
   return new CompanyOsService({
@@ -228,6 +388,8 @@ function createService(agentInvoker: AgentInvoker) {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
     meetingEmailSender: { send: vi.fn(async () => undefined) },
     agentInvoker,
+    ...(sessionContextAppender ? { sessionContextAppender } : {}),
+    ...(isSessionActive ? { isSessionActive } : {}),
   });
 }
 

@@ -16,8 +16,11 @@ export type Actor = "boss" | string;
 export type CompanyOsConfig = {
   participantTurnTimeoutSeconds?: number;
   hostIdleTimeoutSeconds?: number;
+  meetingAutoEndDelaySeconds?: number;
   taskStaleAfterHours?: number;
   databasePath?: string;
+  organizationAdminAgentId?: string;
+  bossAvatarPath?: string;
   bossEmailNotifications?: {
     enabled?: boolean;
     account?: string;
@@ -29,8 +32,11 @@ export type CompanyOsConfig = {
 export type ResolvedCompanyOsConfig = {
   participantTurnTimeoutSeconds: number;
   hostIdleTimeoutSeconds: number;
+  meetingAutoEndDelaySeconds: number;
   taskStaleAfterHours: number;
   databasePath?: string;
+  organizationAdminAgentId?: string;
+  bossAvatarPath: string;
   bossEmailNotifications: {
     enabled: boolean;
     account?: string;
@@ -77,6 +83,43 @@ export type MeetingTurnDispatch = MeetingContextEnvelope & {
   turnId: string;
   speakerId: string;
   agentId: string;
+  messageId?: string;
+  messageSequence?: number;
+  roundNumber?: number;
+  contextAppendId?: string;
+};
+
+export type MeetingToolSessionIdentity = {
+  agentId: string;
+  sessionKey: string;
+  sessionId: string;
+  toolCallId: string;
+};
+
+export type MeetingSessionContextAppend = {
+  id: string;
+  meetingId: string;
+  memberId: string;
+  runtimeAgentId: string;
+  sessionKey: string;
+  sessionId: string;
+  toolName: "company_meeting_speak" | "company_meeting_delegate";
+  toolCallId: string;
+  messageId: string;
+  messageSequence: number;
+  turnId: string | null;
+  roundNumber: number | null;
+  recordKind: "speech" | "delegate" | "host_speech";
+  targetId: string | null;
+  targetName: string | null;
+  memberName: string;
+  body: string;
+  formattedText: string;
+  status: "pending" | "appending" | "appended" | "failed";
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  appendedAt: string | null;
 };
 
 export type MeetingTurnDelivery = {
@@ -108,8 +151,11 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
   return {
     participantTurnTimeoutSeconds: clampInteger(config?.participantTurnTimeoutSeconds, 600, 60),
     hostIdleTimeoutSeconds: clampInteger(config?.hostIdleTimeoutSeconds, 1800, 60),
+    meetingAutoEndDelaySeconds: clampInteger(config?.meetingAutoEndDelaySeconds, 60, 1),
     taskStaleAfterHours: clampInteger(config?.taskStaleAfterHours, 72, 1),
     ...(config?.databasePath?.trim() ? { databasePath: config.databasePath.trim() } : {}),
+    ...(config?.organizationAdminAgentId?.trim() ? { organizationAdminAgentId: config.organizationAdminAgentId.trim() } : {}),
+    bossAvatarPath: config?.bossAvatarPath?.trim() || "~/.openclaw/workspace-boss/avatar.png",
     bossEmailNotifications: {
       enabled: email?.enabled !== false,
       ...(email?.account?.trim() ? { account: email.account.trim() } : {}),

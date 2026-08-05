@@ -72,7 +72,7 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 200, data };
   }
 
-  const meetingAction = route.match(/^\/meetings\/([^/]+)\/(interject|reorder|cancel|start|approve-end|reject-end)$/);
+  const meetingAction = route.match(/^\/meetings\/([^/]+)\/(interject|reorder|cancel|start|reject|approve-end|reject-end)$/);
   if (method === "POST" && meetingAction) {
     const meetingId = decodeURIComponent(meetingAction[1]!);
     const action = meetingAction[2]!;
@@ -88,6 +88,11 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
       const advance = store.startMeetingByBoss(meetingId);
       await service.dispatchAdvance(advance);
       return { status: 200, data: store.meetingView(meetingId) };
+    }
+    if (action === "reject") {
+      const result = store.rejectMeetingByBoss(meetingId, body.reason);
+      await service.dispatchAdvance(result.advance);
+      return { status: 200, data: result.meeting };
     }
     if (action === "approve-end") {
       const result = store.approveMeetingEndByBoss(meetingId);

@@ -12,8 +12,8 @@ export function useMemberIdentities(members: Member[]): MemberIdentityMap {
 
   useEffect(() => {
     let canceled = false;
-    const agentIds = members.filter((member) => member.kind === "agent").map((member) => member.id);
-    void Promise.all(agentIds.map(async (id) => {
+    const memberIds = members.map((member) => member.id);
+    void Promise.all(memberIds.map(async (id) => {
       try {
         return await getMemberIdentity(id);
       } catch {

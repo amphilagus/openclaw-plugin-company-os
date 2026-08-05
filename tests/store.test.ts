@@ -50,7 +50,7 @@ describe("organization", () => {
   it("seeds Boss and main, rejects unknown agents, non-main writes, and cycles", () => {
     expect(store.listMembers().map((member) => member.id)).toEqual(["boss", "main"]);
     expect(() => store.addMember("cto", { agentId: "cto", name: "CTO", title: "CTO", managerId: "boss" }))
-      .toThrow(/only agent main/);
+      .toThrow(/only organization admin main/);
     expect(() => store.addMember("main", { agentId: "ghost", name: "Ghost", title: "Ghost", managerId: "boss" }))
       .toThrow(/does not exist/);
     store.addMember("main", { agentId: "cto", name: "CTO", title: "CTO", managerId: "main" });
@@ -190,9 +190,62 @@ describe("meeting room", () => {
     store.speakMeeting("cto", meeting.id, "主持人追加问题背景");
     const second = store.delegateMeeting("cto", meeting.id, "eng-a", "给出第二轮判断");
     expect(second.fromSequence).toBeGreaterThan(0);
-    expect(second.prompt).toContain("CTO（cto）：主持人追加问题背景");
+    expect(second.prompt).toContain("CTO（cto）：\n主持人追加问题背景");
     expect(second.prompt).not.toContain("会议室已开放");
     expect(second.prompt).not.toContain("第一轮意见");
+  });
+
+  it("queues receiver-perspective session history with real message and round numbers", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "Session 会议记录回写",
+      agenda: "验证你视角和严格编号",
+      participants: [{ agentId: "eng-a", role: "advisor" }],
+    }).meeting;
+    const hostSession = {
+      agentId: "cto",
+      sessionKey: "agent:cto:main",
+      sessionId: "session-cto-main",
+      toolCallId: "delegate-call-1",
+    };
+    const turn = store.delegateMeeting("cto", meeting.id, "eng-a", "请检查源码后给出判断", hostSession);
+    const hostAppend = store.claimNextSessionContextAppend({
+      agentId: "cto",
+      sessionKey: "agent:cto:main",
+      sessionId: "session-cto-main",
+    });
+    expect(hostAppend).toMatchObject({
+      messageSequence: turn.messageSequence,
+      roundNumber: 1,
+      recordKind: "delegate",
+      formattedText: "【消息 #000002｜第 1 轮｜点名】\n你（CTO） @高工 A：\n请检查源码后给出判断",
+    });
+
+    const speakerSession = {
+      agentId: "eng-a",
+      sessionKey: "agent:eng-a:main",
+      sessionId: "session-eng-a-main",
+      toolCallId: "speak-call-1",
+    };
+    store.speakMeeting("eng-a", meeting.id, "我已实际检查源码并确认接口行为", turn.turnId, speakerSession);
+    expect(store.db.prepare(`
+      SELECT sequence FROM meeting_context_watermarks WHERE meeting_id = ? AND member_id = 'eng-a'
+    `).get(meeting.id)).toBeUndefined();
+    const speakerAppend = store.claimNextSessionContextAppend({
+      agentId: "eng-a",
+      sessionKey: "agent:eng-a:main",
+      sessionId: "session-eng-a-main",
+    });
+    expect(speakerAppend).toMatchObject({
+      roundNumber: 1,
+      recordKind: "speech",
+      formattedText: "【消息 #000003｜第 1 轮｜发言】\n你（高工 A）：\n我已实际检查源码并确认接口行为",
+    });
+    store.completeSessionContextAppend(speakerAppend!.id, "transcript-message-1");
+    expect(store.db.prepare(`
+      SELECT sequence FROM meeting_context_watermarks WHERE meeting_id = ? AND member_id = 'eng-a'
+    `).get(meeting.id)).toMatchObject({ sequence: 3 });
   });
 
   it("waits for Boss to start and requires Boss approval before a direct-participation meeting can end", () => {
@@ -223,8 +276,8 @@ describe("meeting room", () => {
     expect(store.meetingView(requested.meeting.id).hostDispatchStatus).toMatchObject({ targetAgentId: "cto", status: "pending" });
     expect(store.meetingView(requested.meeting.id).awaitingBossStart).toBe(false);
     const hostContext = store.buildMeetingContext(requested.meeting.id, "cto", { role: "host", instruction: "回应 Boss" });
-    expect(hostContext.prompt).toContain("[#1] 系统：会议已进入会议室");
-    expect(hostContext.prompt).toContain("[#2] Boss：我已进入会议室，现在开始会议。");
+    expect(hostContext.prompt).toContain("【消息 #000001｜系统穿插事件】\n系统：\n会议已进入会议室");
+    expect(hostContext.prompt).toContain("【消息 #000002｜Boss 穿插事件】\nBoss：\n我已进入会议室，现在开始会议。");
     store.setMeetingTaskDrafts("cto", requested.meeting.id, [{ ...taskFields("执行任务"), assigneeId: "eng-a" }]);
 
     const hostResult = store.endMeeting("cto", requested.meeting.id, "任务已经分配，请 Boss 批准结束", false);
@@ -239,6 +292,47 @@ describe("meeting room", () => {
     expect(approved.createdTasks).toHaveLength(1);
     expect(approved.notice?.kind).toBe("meeting_report");
     expect(approved.meeting.audit.some((event: any) => event.actorId === "boss" && event.action === "meeting.completed")).toBe(true);
+  });
+
+  it("lets Boss reject a waiting direct-participation meeting and advances the room queue", () => {
+    addOrg();
+    const waiting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "等待 Boss 决定是否召开",
+      agenda: "议题尚未成熟",
+      bossParticipates: true,
+    }).meeting;
+    const queued = store.requestMeeting("eng-a", {
+      type: "discussion",
+      title: "下一场会议",
+      agenda: "验证会议室推进",
+      bossParticipates: false,
+    }).meeting;
+
+    const rejected = store.rejectMeetingByBoss(waiting.id, "议题准备不充分");
+
+    expect(rejected.meeting.status).toBe("canceled");
+    expect(rejected.meeting.canceledReason).toBe("Boss 拒绝：议题准备不充分");
+    expect(rejected.meeting.messages.at(-1)?.body).toContain("Boss 已拒绝召开本次会议");
+    expect(rejected.meeting.audit).toEqual(expect.arrayContaining([
+      expect.objectContaining({ actorId: "boss", action: "meeting.rejected_by_boss", reason: "议题准备不充分" }),
+    ]));
+    expect(rejected.advance).toMatchObject({ activatedMeetingId: queued.id, hostDispatchId: expect.any(String) });
+    expect(store.meetingView(queued.id).status).toBe("active");
+    expect(() => store.startMeetingByBoss(waiting.id)).toThrow(/not active/);
+  });
+
+  it("does not let Boss reject a meeting after starting it", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "已经开始的会议",
+      agenda: "不能再按会前拒绝",
+      bossParticipates: true,
+    }).meeting;
+    store.startMeetingByBoss(meeting.id);
+
+    expect(() => store.rejectMeetingByBoss(meeting.id, "临时改变主意")).toThrow(/already started/);
   });
 
   it("recovers a running host dispatch with the same durable id and never reclaims a succeeded job", () => {
@@ -287,19 +381,18 @@ describe("meeting room", () => {
     expect(store.hostDispatchHasProgress(dispatch!.id)).toBe(true);
   });
 
-  it("resolves a host member key to its configured OpenClaw Agent ID before invocation", () => {
+  it("uses the same real Agent ID for organization members and dispatch targets", () => {
     addOrg();
-    store.db.prepare("UPDATE members SET agent_id = 'jia-goushi' WHERE id = 'main'").run();
     const meeting = store.requestMeeting("boss", {
       type: "discussion",
-      title: "成员与 Agent 映射",
+      title: "成员与 Agent 同一 ID",
       agenda: "调用真实 Agent",
-      hostId: "main",
+      hostId: "cto",
     }).meeting;
 
     const dispatch = store.claimNextHostDispatch();
-    expect(dispatch).toMatchObject({ meetingId: meeting.id, targetMemberId: "main", targetAgentId: "jia-goushi" });
-    expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ targetMemberId: "main", targetAgentId: "jia-goushi" });
+    expect(dispatch).toMatchObject({ meetingId: meeting.id, targetMemberId: "cto", targetAgentId: "cto" });
+    expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ targetMemberId: "cto", targetAgentId: "cto" });
   });
 
   it("lets Boss reject an end request and returns control to the host", () => {
@@ -370,7 +463,11 @@ describe("meeting room", () => {
       { ...taskFields("A 任务"), assigneeId: "eng-a" },
       { ...taskFields("B 任务"), assigneeId: "eng-b" },
     ]);
-    const result = store.endMeeting("cto", meeting.id, "确定两条执行路线", false);
+    const requestedEnd = store.endMeeting("cto", meeting.id, "确定两条执行路线", false);
+    expect(requestedEnd.meeting.status).toBe("active");
+    expect(requestedEnd.meeting.autoEndAt).toBeTruthy();
+    expect(requestedEnd.createdTasks).toHaveLength(0);
+    const result = store.finalizeDueAutomaticMeetingEnd(Date.parse(requestedEnd.meeting.autoEndAt))!;
     expect(result.createdTasks).toHaveLength(2);
     expect(result.notice?.kind).toBe("meeting_report");
     expect(result.meeting.status).toBe("completed");
@@ -417,6 +514,23 @@ describe("meeting room", () => {
     expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ targetAgentId: "cto", status: "pending" });
   });
 
+  it("persists a non-Boss end countdown across restart and closes only when due", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "普通会议倒计时",
+      agenda: "一分钟后自动结束",
+    }).meeting;
+    const requested = store.endMeeting("cto", meeting.id, "普通会议总结", false);
+    expect(Date.parse(requested.meeting.autoEndAt) - Date.parse(requested.meeting.endRequestedAt)).toBe(60_000);
+    store.close();
+    store = openStore();
+
+    expect(store.nextAutomaticMeetingEnd()).toEqual({ meetingId: meeting.id, autoEndAt: requested.meeting.autoEndAt });
+    expect(store.finalizeDueAutomaticMeetingEnd(Date.parse(requested.meeting.autoEndAt) - 1)).toBeNull();
+    expect(store.finalizeDueAutomaticMeetingEnd(Date.parse(requested.meeting.autoEndAt))?.meeting.status).toBe("completed");
+  });
+
   it("runs the complete Boss → CTO → senior → engineer → bottom-up closure rehearsal", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("交付 Company OS"), assigneeId: "cto" });
@@ -425,14 +539,16 @@ describe("meeting room", () => {
       participants: [{ agentId: "eng-a", role: "worker" }],
     }).meeting;
     store.setMeetingTaskDrafts("cto", strategy.id, [{ ...taskFields("任务引擎"), assigneeId: "eng-a" }]);
-    const strategyResult = store.endMeeting("cto", strategy.id, "由高工负责任务引擎", false);
+    const strategyEnd = store.endMeeting("cto", strategy.id, "由高工负责任务引擎", false);
+    const strategyResult = store.finalizeDueAutomaticMeetingEnd(Date.parse(strategyEnd.meeting.autoEndAt))!;
     const seniorTask = strategyResult.createdTasks[0]!;
     const workshop = store.requestMeeting("eng-a", {
       type: "task", title: "任务引擎小会", agenda: "分解实现", parentTaskId: seniorTask.id,
       participants: [{ agentId: "dev-a", role: "worker" }],
     }).meeting;
     store.setMeetingTaskDrafts("eng-a", workshop.id, [{ ...taskFields("状态机实现"), assigneeId: "dev-a" }]);
-    const workshopResult = store.endMeeting("eng-a", workshop.id, "工程师实现状态机", false);
+    const workshopEnd = store.endMeeting("eng-a", workshop.id, "工程师实现状态机", false);
+    const workshopResult = store.finalizeDueAutomaticMeetingEnd(Date.parse(workshopEnd.meeting.autoEndAt))!;
     const leaf = workshopResult.createdTasks[0]!;
 
     store.startTask("dev-a", leaf.id);

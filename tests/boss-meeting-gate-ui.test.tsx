@@ -22,6 +22,7 @@ const meeting: MeetingDetail = {
   endRequestedAt: null,
   endRequestedSummary: null,
   endRequestedPublishNotice: false,
+  autoEndAt: null,
   queuePosition: 0,
   participantCount: 0,
   currentTurnId: null,
@@ -41,12 +42,14 @@ describe("Boss direct meeting controls", () => {
       meeting={meeting}
       busy={false}
       start={vi.fn()}
+      rejectMeeting={vi.fn()}
       approveEnd={vi.fn()}
       rejectEnd={vi.fn()}
     />);
 
     expect(html).toContain("所有人正在等待你");
     expect(html).toContain("我已进入，开始会议");
+    expect(html).toContain("拒绝此次会议");
     expect(html).not.toContain("批准并结束");
   });
 
@@ -61,6 +64,7 @@ describe("Boss direct meeting controls", () => {
       }}
       busy={false}
       start={vi.fn()}
+      rejectMeeting={vi.fn()}
       approveEnd={vi.fn()}
       rejectEnd={vi.fn()}
     />);
@@ -68,5 +72,28 @@ describe("Boss direct meeting controls", () => {
     expect(html).toContain("主持人的最终总结");
     expect(html).toContain("批准并结束");
     expect(html).toContain("暂不结束");
+  });
+
+  it("shows a countdown instead of Boss approval for a meeting Boss did not join", () => {
+    const html = renderToStaticMarkup(<BossMeetingGate
+      meeting={{
+        ...meeting,
+        bossParticipates: false,
+        awaitingBossStart: false,
+        endRequestedAt: new Date().toISOString(),
+        endRequestedSummary: "普通会议总结",
+        autoEndAt: new Date(Date.now() + 60_000).toISOString(),
+      }}
+      busy={false}
+      start={vi.fn()}
+      rejectMeeting={vi.fn()}
+      approveEnd={vi.fn()}
+      rejectEnd={vi.fn()}
+    />);
+
+    expect(html).toContain("秒后自动结束");
+    expect(html).toContain("普通会议总结");
+    expect(html).not.toContain("批准并结束");
+    expect(html).not.toContain("暂不结束");
   });
 });

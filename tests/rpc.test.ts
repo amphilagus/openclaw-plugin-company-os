@@ -43,11 +43,13 @@ describe("Company OS Gateway bridge", () => {
     expect(respond).toHaveBeenCalledWith(true, identity);
   });
 
-  it("routes Boss start and final end approval through the authenticated API", async () => {
+  it("routes Boss start, meeting rejection, and final end approval through the authenticated API", async () => {
     const startAdvance = { schedule: { agentId: "cto" } };
+    const rejection = { meeting: { status: "canceled" }, advance: { activatedMeetingId: "next-after-rejection" } };
     const completion = { meeting: { status: "completed" }, advance: { activatedMeetingId: "next" } };
     const store = {
       startMeetingByBoss: vi.fn(() => startAdvance),
+      rejectMeetingByBoss: vi.fn(() => rejection),
       approveMeetingEndByBoss: vi.fn(() => completion),
       meetingView: vi.fn(() => ({ status: "active", awaitingBossStart: false })),
     };
@@ -55,11 +57,14 @@ describe("Company OS Gateway bridge", () => {
     const service = { store, dispatchAdvance } as any;
 
     const started = await executeBossApi(service, { method: "POST", path: "/meetings/meeting-1/start", body: {} });
+    const rejected = await executeBossApi(service, { method: "POST", path: "/meetings/meeting-2/reject", body: { reason: "议题不成熟" } });
     const ended = await executeBossApi(service, { method: "POST", path: "/meetings/meeting-1/approve-end", body: {} });
 
     expect(started.data).toMatchObject({ awaitingBossStart: false });
+    expect(rejected.data).toBe(rejection.meeting);
     expect(ended.data).toBe(completion);
     expect(dispatchAdvance).toHaveBeenNthCalledWith(1, startAdvance);
-    expect(dispatchAdvance).toHaveBeenNthCalledWith(2, completion.advance);
+    expect(dispatchAdvance).toHaveBeenNthCalledWith(2, rejection.advance);
+    expect(dispatchAdvance).toHaveBeenNthCalledWith(3, completion.advance);
   });
 });

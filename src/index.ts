@@ -14,6 +14,7 @@ import {
   createCompanyOsApiHttpHandler,
   createCompanyOsWebHttpHandler,
 } from "./http.js";
+import { COMPANY_RULES_PROMPT } from "./company-rules.js";
 import { COMPANY_OS_GATEWAY_METHOD, createCompanyOsGatewayHandler } from "./rpc.js";
 import { CompanyOsService } from "./service.js";
 import { COMPANY_TOOL_NAMES, createCompanyOsTools } from "./tools.js";
@@ -25,8 +26,11 @@ const SQLITE_FILE = "company-os.sqlite";
 const ConfigSchema = Type.Object({
   participantTurnTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 60, default: 600 })),
   hostIdleTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 60, default: 1800 })),
+  meetingAutoEndDelaySeconds: Type.Optional(Type.Integer({ minimum: 1, default: 60 })),
   taskStaleAfterHours: Type.Optional(Type.Integer({ minimum: 1, default: 72 })),
   databasePath: Type.Optional(Type.String({ minLength: 1 })),
+  organizationAdminAgentId: Type.Optional(Type.String({ minLength: 1 })),
+  bossAvatarPath: Type.Optional(Type.String({ minLength: 1, default: "~/.openclaw/workspace-boss/avatar.png" })),
   bossEmailNotifications: Type.Optional(Type.Object({
     enabled: Type.Optional(Type.Boolean({ default: true })),
     account: Type.Optional(Type.String({ minLength: 1, pattern: "^[A-Za-z0-9]+$" })),
@@ -71,6 +75,19 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
         { name },
       );
     }
+
+    api.on("before_prompt_build", async () => ({
+      prependSystemContext: COMPANY_RULES_PROMPT,
+    }));
+
+    api.on("agent_end", async (_event, context) => {
+      if (!service) return;
+      const agentId = context.agentId?.trim();
+      const sessionKey = context.sessionKey?.trim();
+      const sessionId = context.sessionId?.trim();
+      if (!agentId || !sessionKey || !sessionId) return;
+      service.scheduleSessionContextAppendAfterTurn({ agentId, sessionKey, sessionId });
+    });
 
     api.registerService({
       id: PLUGIN_ID,

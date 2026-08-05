@@ -8,7 +8,23 @@
 4. `openclaw gateway status` 应通过健康检查。
 5. Control UI 侧栏出现「公司」，打开后默认进入会议室。
 
-首次启动后，数据库应包含 `boss` 和 `main`。如果没有 `main`，先确认 OpenClaw `agents.list` 中存在 `id: "main"`，再重启 Gateway。
+`openclaw plugins inspect company-os --runtime --json` 的 diagnostics 不应出现 `agent_end` 被策略拦截。若出现，确认配置含有：
+
+```json5
+plugins: {
+  entries: {
+    "company-os": {
+      enabled: true,
+      hooks: {
+        allowConversationAccess: true,
+        allowPromptInjection: true,
+      },
+    },
+  },
+}
+```
+
+首次启动后，数据库应包含 `boss` 和组织架构师的真实 Agent ID。本机默认 Agent 是 `jia-goushi`，因此不应再出现作为别名的 `main`；可用 `organizationAdminAgentId` 显式覆盖架构师。
 
 ## 日常操作
 
@@ -18,7 +34,8 @@
 - 叶子负责人用 `company_task_submit` 提交摘要和 proof/artifact；派发者用 `company_task_review` 验收或驳回。
 - Agent 读取公告必须调用 `company_notice_read` 才会产生 read mark；读取 inbox 不会自动标记。
 - 后续可由架构师把 `company_inbox` 加入 Agent heartbeat；本插件本身不唤醒 Agent 处理任务或公告。
-- 需要 Boss 直接参加的会议在 `company_meeting_request` 中设置 `bossParticipates: true`。Boss 会收到创建和进入会议室两封邮件，并在会议室页面负责开始和最终结束审批。
+- 需要 Boss 直接参加的会议在 `company_meeting_request` 中设置 `bossParticipates: true`。Boss 会收到创建和进入会议室两封邮件，并在会议室页面负责开始、会前拒绝和最终结束审批。
+- 未邀请 Boss 的会议提交结束申请后默认倒计时 60 秒自动完成；这段时间会议仍占用唯一会议室。
 
 ## 会议恢复与超时
 
@@ -28,7 +45,8 @@
 - 普通参会者默认 10 分钟未发言：轮次标记失败，控制权回主持人。
 - 主持人默认 30 分钟无动作：会议变成 `timed_out`，不创建任务、不发布正常汇报，会议室推进到下一场。
 - 等待 Boss 开始或等待 Boss 审批结束时暂停主持人超时；Gateway 重启后仍保持等待，不会误唤醒主持人。
-- Boss 只能取消排队会议，不能从 WebUI 中断当前活动会议。
+- 普通会议的结束倒计时同样存放在 SQLite；Gateway 重启后按原 `end_requested_at` 继续，而不是重新计时。
+- Boss 可取消排队会议，也可在受邀会议尚未开始时填写原因并拒绝；会议开始后仍不能从 WebUI 强制中断当前活动会议。
 
 ## 数据与备份
 
@@ -47,7 +65,7 @@
 3. 将备份恢复到配置的 `databasePath`。
 4. 启动 Gateway，检查 `openclaw plugins doctor` 和会议室状态。
 
-Schema 版本保存在 `schema_meta`，当前版本为 v3，迁移在服务启动时执行。不要手工修改任务状态来绕过关单规则。
+Schema 版本保存在 `schema_meta`，当前版本为 v5，迁移在服务启动时执行。v4 会把旧成员别名规范成真实 Agent ID；v5 新增持久化 main-session 会议记录回写和主持人“等待回写完成”关联。不要手工修改任务状态或回写 outbox 来绕过状态机。
 
 ## 常见故障
 
@@ -75,7 +93,7 @@ openclaw config get gateway.controlUi.embedSandbox
 
 ### 新员工无法加入组织
 
-`company_org_add` 只接受已经存在于 OpenClaw `agents.list` 的 Agent ID。先创建 Agent，再由 `main` 加入组织。
+`company_org_add` 只接受已经存在于 OpenClaw `agents.list` 的 Agent ID。先创建 Agent，再由配置的组织架构师加入组织。
 
 ### 员工无法停用或换上级
 
@@ -91,11 +109,31 @@ openclaw config get gateway.controlUi.embedSandbox
 
 如果会议设置了 `bossParticipates: true`，满足上述条件后主持人的 `company_meeting_end` 只产生结束申请。Boss 需在「公司 → 会议室」中批准；选择「暂不结束」时必须填写反馈，系统随后重新唤醒主持人。
 
+如果会议没有邀请 Boss，同一个工具会产生 60 秒自动结束倒计时；倒计时结束时才原子创建任务/公告并释放会议室。默认值可通过 `meetingAutoEndDelaySeconds` 调整。
+
 ### 主持人一直显示“启动中”或“启动失败”
 
 先检查会议详情中的 `hostDispatchStatus` 和 Gateway 日志里的 `company-os host dispatch`。插件通过本机 `openclaw agent --agent <id> --message-file ... --json` 调用主持人的 main session；确认 `openclaw` 在 Gateway 进程的 `PATH` 中，并且目标 Agent ID 仍存在于配置和组织中。`in_flight` 会自动重试三次；其他失败最多领取三次，最终状态和错误会保留在数据库及 WebUI，不能用日志中的“queued”当作主持人已经收到消息。
 
-会议详情中的 `hostId` 是组织成员 ID，不一定等于 OpenClaw Agent ID；实际调用目标可在 `hostDispatchStatus.targetAgentId` 中确认。CLI 有时会在 Agent 已通过会议工具完成工作后返回空的最终文本；服务会用本次调用冻结上下文之后是否出现经过校验的消息进展作为成功证据，这种情况不应重试或标记失败。
+Schema v4 起 Agent 的 `hostId` 就是真实 OpenClaw Agent ID，实际调用目标也可在 `hostDispatchStatus.targetAgentId` 中确认。CLI 有时会在 Agent 已通过会议工具完成工作后返回空的最终文本；服务会用本次调用冻结上下文之后是否出现经过校验的消息进展作为成功证据，这种情况不应重试或标记失败。
+
+### 会议工具成功，但下一个主持人 turn 没有出现
+
+先检查 `openclaw plugins inspect company-os --runtime --json`，确认 typed hook `agent_end` 已注册且没有策略警告。再检查 `meeting_session_context_appends`：成功记录应为 `appended`，对应 `meeting_agent_dispatches.wait_for_context_append_id` 的 `host_resume` 才会被领取。工具成功和 `agent_end` 都只会触发空闲检查；服务通过 OpenClaw active-run registry 确认同一 main session 已退出后才追加，并在同一次安全刷新中重试临时失败。Gateway 重启会把遗留的 `appending` 恢复为 `pending`，在没有活动 run 的启动阶段补写。普通 30 秒扫描绝不会改写 transcript，以免与仍在执行的 main session 抢写。三次失败后记录保留为 `failed`，不会绕过回写顺序强行唤醒主持人。
+
+正常回写是追加到同一 `agent:<agentId>:main` transcript 的普通 `user` 消息，不会触发新回复。该 Agent 自己的历史记录应显示 `你（姓名）`，例如：
+
+```text
+【消息 #000014｜第 3 轮｜点名】
+你（架构师） @高级工程师：
+请检查相关源码后给出判断。
+```
+
+工具的直接结果只应是 `accepted=true` 和“成功，本轮会话结束”，参会者回答必须由后续 `host_resume` 交付，不能出现在 `delegate` toolResult 中。
+
+### Boss 头像没有显示
+
+Boss 不属于 `agents.list`，头像走独立逻辑。默认读取 `~/.openclaw/workspace-boss/avatar.png`，要求是 2 MiB 以内的 PNG/JPEG/WebP/GIF/ICO；可用 `bossAvatarPath` 指向其他本地文件。修改后重启 Gateway 并刷新公司页面。
 
 ### 参会者返回了文字但会议没有卡住
 

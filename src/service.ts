@@ -1,10 +1,19 @@
 import type { PluginLogger } from "openclaw/plugin-sdk/core";
+import { resolveActiveEmbeddedRunSessionId } from "openclaw/plugin-sdk/agent-harness-runtime";
 
 import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
-import { resolveAgentVisualIdentity, type AgentVisualIdentity } from "./identity.js";
+import { resolveAgentVisualIdentity, resolveStandaloneAvatar, type AgentVisualIdentity } from "./identity.js";
+import { OpenClawSessionContextAppender, type SessionContextAppender } from "./session-context.js";
 import { CompanyOsStore } from "./store.js";
-import type { MeetingAdvance, MeetingTurnDelivery, MeetingTurnDispatch, ResolvedCompanyOsConfig, ServiceEvent } from "./types.js";
+import type {
+  MeetingAdvance,
+  MeetingToolSessionIdentity,
+  MeetingTurnDelivery,
+  MeetingTurnDispatch,
+  ResolvedCompanyOsConfig,
+  ServiceEvent,
+} from "./types.js";
 
 export class CompanyOsService {
   readonly store: CompanyOsStore;
@@ -13,12 +22,18 @@ export class CompanyOsService {
   private readonly runtimeConfig: unknown;
   private readonly meetingEmailSender: MeetingEmailSender;
   private readonly agentInvoker: AgentInvoker;
+  private readonly sessionContextAppender: SessionContextAppender;
+  private readonly isSessionActive: (sessionKey: string) => boolean;
   private readonly identityCache = new Map<string, AgentVisualIdentity>();
   private readonly listeners = new Set<(event: ServiceEvent) => void>();
   private readonly eventHistory: ServiceEvent[] = [];
   private scanTimer?: NodeJS.Timeout;
+  private automaticEndTimer?: NodeJS.Timeout;
   private emailFlush?: Promise<void>;
   private dispatchFlush?: Promise<void>;
+  private contextAppendFlush?: Promise<void>;
+  private contextAppendIdleTimer?: NodeJS.Timeout;
+  private readonly contextAppendIdleQueue = new Map<string, { agentId: string; sessionKey: string; sessionId: string }>();
   private readonly activeTurnDeliveries = new Set<Promise<MeetingTurnDelivery>>();
   private readonly lifecycleAbort = new AbortController();
   private stopping = false;
@@ -31,25 +46,33 @@ export class CompanyOsService {
     logger: PluginLogger;
     meetingEmailSender?: MeetingEmailSender;
     agentInvoker?: AgentInvoker;
+    sessionContextAppender?: SessionContextAppender;
+    isSessionActive?: (sessionKey: string) => boolean;
   }) {
     this.config = options.config;
     this.runtimeConfig = options.runtimeConfig;
     this.logger = options.logger;
     this.meetingEmailSender = options.meetingEmailSender ?? new SmtpMeetingEmailSender(options.config.bossEmailNotifications);
     this.agentInvoker = options.agentInvoker ?? new OpenClawCliAgentInvoker();
+    this.sessionContextAppender = options.sessionContextAppender ?? new OpenClawSessionContextAppender(options.runtimeConfig);
+    this.isSessionActive = options.isSessionActive ?? ((sessionKey) => Boolean(resolveActiveEmbeddedRunSessionId(sessionKey)));
     this.store = new CompanyOsStore({
       databasePath: options.databasePath,
       allowedAgentIds: options.allowedAgentIds,
       config: options.config,
+      organizationAdminAgentId: resolveOrganizationAdminAgentId(options.runtimeConfig, options.config.organizationAdminAgentId),
       onEvent: (event) => this.emit(event),
     });
   }
 
   async start() {
     this.store.recoverAgentDispatches();
+    this.store.recoverSessionContextAppends();
     await this.recover();
+    await this.flushSessionContextAppends();
     await this.flushMeetingEmails();
     this.kickHostDispatches();
+    this.scheduleNextAutomaticEnd();
     this.scanTimer = setInterval(() => {
       void this.scanTimeouts().catch((error) => this.logger.error(`company-os timeout scan failed: ${formatError(error)}`));
     }, 30_000);
@@ -59,9 +82,12 @@ export class CompanyOsService {
   async stop() {
     this.stopping = true;
     if (this.scanTimer) clearInterval(this.scanTimer);
+    if (this.automaticEndTimer) clearTimeout(this.automaticEndTimer);
+    if (this.contextAppendIdleTimer) clearTimeout(this.contextAppendIdleTimer);
     this.lifecycleAbort.abort();
     await Promise.allSettled([
       ...(this.dispatchFlush ? [this.dispatchFlush] : []),
+      ...(this.contextAppendFlush ? [this.contextAppendFlush] : []),
       ...this.activeTurnDeliveries,
     ]);
     this.listeners.clear();
@@ -76,8 +102,14 @@ export class CompanyOsService {
   memberIdentity(memberId: string) {
     const member = this.store.listMembers(true).find((candidate) => candidate.id === memberId);
     if (!member) throw new Error(`member ${memberId} not found`);
-    const visual = this.identityCache.get(memberId)
-      ?? resolveAgentVisualIdentity(this.runtimeConfig, member.agentId ?? memberId);
+    const visual = this.identityCache.get(memberId) ?? (member.kind === "boss"
+      ? {
+          agentId: "boss",
+          configuredName: member.name,
+          emoji: null,
+          avatarUrl: resolveStandaloneAvatar(this.config.bossAvatarPath),
+        }
+      : resolveAgentVisualIdentity(this.runtimeConfig, member.agentId ?? memberId));
     this.identityCache.set(memberId, visual);
     return {
       id: member.id,
@@ -122,24 +154,45 @@ export class CompanyOsService {
   async dispatchAdvance(advance: MeetingAdvance | null | undefined) {
     await this.flushMeetingEmails();
     if (advance?.hostDispatchId) this.kickHostDispatches();
+    this.scheduleNextAutomaticEnd();
   }
 
-  async delegateMeeting(actorId: string, meetingId: string, speakerId: string, prompt: string) {
+  async delegateMeeting(
+    actorId: string,
+    meetingId: string,
+    speakerId: string,
+    prompt: string,
+    sessionIdentity?: MeetingToolSessionIdentity,
+  ) {
     const priorityDeliveries = await this.drainPendingInterventions(meetingId);
     if (priorityDeliveries.length > 0) {
-      this.store.acknowledgeHostContext(meetingId, actorId);
+      const hostDispatchId = this.store.queueHostResume(
+        meetingId,
+        "Boss 定向插话已优先处理。请阅读新增回答后继续主持；刚才尚未执行新的点名。",
+        `host-resume-after-priority-interventions:${meetingId}:${priorityDeliveries.map((item) => item.turnId).join(":")}`,
+      );
+      this.kickHostDispatches();
       return {
         meeting: this.store.meetingView(meetingId, actorId),
         turn: null,
         delivery: null,
         interventions: priorityDeliveries,
         deferred: true,
+        hostDispatchId,
       };
     }
-    const turn = this.store.delegateMeeting(actorId, meetingId, speakerId, prompt);
+    const turn = this.store.delegateMeeting(actorId, meetingId, speakerId, prompt, sessionIdentity);
     const delivery = await this.deliverTurn(turn);
     const interventions = await this.drainPendingInterventions(meetingId);
-    this.store.acknowledgeHostContext(meetingId, actorId);
+    const hostDispatchId = turn.contextAppendId
+      ? this.store.queueHostResumeAfterContextAppend(
+          meetingId,
+          turn.contextAppendId,
+          `第 ${turn.roundNumber} 轮参会者发言已经完成。请阅读新增会议记录并继续主持。`,
+          `host-resume-after-delegate:${meetingId}:${turn.turnId}`,
+        )
+      : undefined;
+    if (!turn.contextAppendId) this.store.acknowledgeHostContext(meetingId, actorId);
     return {
       meeting: this.store.meetingView(meetingId, actorId),
       turn: {
@@ -152,7 +205,69 @@ export class CompanyOsService {
       delivery,
       interventions,
       deferred: false,
+      hostDispatchId,
     };
+  }
+
+  async flushSessionContextAppends(identity?: { agentId: string; sessionKey: string; sessionId: string }): Promise<void> {
+    if (this.contextAppendFlush) {
+      await this.contextAppendFlush;
+      if (this.store.hasPendingSessionContextAppends(identity)) return this.flushSessionContextAppends(identity);
+      return;
+    }
+    this.contextAppendFlush = (async () => {
+      while (!this.stopping) {
+        const record = this.store.claimNextSessionContextAppend(identity);
+        if (!record) return;
+        try {
+          const result = await this.sessionContextAppender.append(record);
+          this.store.completeSessionContextAppend(record.id, result.messageId);
+          this.logger.info(`company-os appended meeting context ${record.id} to ${record.sessionKey}`);
+        } catch (error) {
+          const message = formatError(error);
+          const retry = this.store.failSessionContextAppend(record.id, message);
+          this.logger.error(`company-os failed to append meeting context ${record.id}: ${message}`);
+          if (!retry) continue;
+        }
+      }
+    })();
+    try {
+      await this.contextAppendFlush;
+    } finally {
+      this.contextAppendFlush = undefined;
+    }
+    this.kickHostDispatches();
+  }
+
+  scheduleSessionContextAppendAfterTurn(identity: { agentId: string; sessionKey: string; sessionId: string }) {
+    const normalized = {
+      agentId: requiredIdentity(identity.agentId, "agentId"),
+      sessionKey: requiredIdentity(identity.sessionKey, "sessionKey"),
+      sessionId: requiredIdentity(identity.sessionId, "sessionId"),
+    };
+    this.contextAppendIdleQueue.set(`${normalized.sessionKey}\0${normalized.sessionId}`, normalized);
+    this.scheduleIdleContextAppendCheck();
+  }
+
+  private scheduleIdleContextAppendCheck() {
+    if (this.stopping || this.contextAppendIdleTimer || this.contextAppendIdleQueue.size === 0) return;
+    this.contextAppendIdleTimer = setTimeout(() => {
+      this.contextAppendIdleTimer = undefined;
+      void this.flushIdleSessionContextAppends().catch((error) => {
+        this.logger.error(`company-os idle session context append failed: ${formatError(error)}`);
+        this.scheduleIdleContextAppendCheck();
+      });
+    }, 100);
+    this.contextAppendIdleTimer.unref();
+  }
+
+  private async flushIdleSessionContextAppends() {
+    for (const [key, identity] of this.contextAppendIdleQueue) {
+      if (this.isSessionActive(identity.sessionKey)) continue;
+      await this.flushSessionContextAppends(identity);
+      if (!this.store.hasPendingSessionContextAppends(identity)) this.contextAppendIdleQueue.delete(key);
+    }
+    this.scheduleIdleContextAppendCheck();
   }
 
   private emit(event: ServiceEvent) {
@@ -184,6 +299,38 @@ export class CompanyOsService {
     for (const advance of advances) await this.dispatchAdvance(advance);
     if (advances.length === 0) await this.flushMeetingEmails();
     this.kickHostDispatches();
+    this.scheduleNextAutomaticEnd();
+  }
+
+  private scheduleNextAutomaticEnd() {
+    if (this.automaticEndTimer) clearTimeout(this.automaticEndTimer);
+    this.automaticEndTimer = undefined;
+    if (this.stopping) return;
+    const pending = this.store.nextAutomaticMeetingEnd();
+    if (!pending) return;
+    const delay = Math.max(0, Date.parse(pending.autoEndAt) - Date.now());
+    this.automaticEndTimer = setTimeout(() => {
+      this.automaticEndTimer = undefined;
+      void this.finishAutomaticMeetingEnd().catch((error) => {
+        this.logger.error(`company-os automatic meeting end failed: ${formatError(error)}`);
+        if (this.stopping) return;
+        this.automaticEndTimer = setTimeout(() => {
+          this.automaticEndTimer = undefined;
+          void this.finishAutomaticMeetingEnd().catch((retryError) => {
+            this.logger.error(`company-os automatic meeting end retry failed: ${formatError(retryError)}`);
+            this.scheduleNextAutomaticEnd();
+          });
+        }, 30_000);
+        this.automaticEndTimer.unref();
+      });
+    }, delay);
+    this.automaticEndTimer.unref();
+  }
+
+  private async finishAutomaticMeetingEnd() {
+    const result = this.store.finalizeDueAutomaticMeetingEnd();
+    if (result) await this.dispatchAdvance(result.advance);
+    else this.scheduleNextAutomaticEnd();
   }
 
   private deliverTurn(turn: MeetingTurnDispatch): Promise<MeetingTurnDelivery> {
@@ -308,4 +455,18 @@ export class CompanyOsService {
 
 function formatError(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function requiredIdentity(value: string, field: string) {
+  const normalized = value.trim();
+  if (!normalized) throw new Error(`meeting session ${field} is required`);
+  return normalized;
+}
+
+function resolveOrganizationAdminAgentId(runtimeConfig: unknown, configured?: string) {
+  if (configured?.trim()) return configured.trim();
+  const agents = (runtimeConfig as { agents?: { list?: Array<{ id?: unknown; default?: unknown }> } } | undefined)?.agents?.list ?? [];
+  const ids = agents.flatMap((agent) => typeof agent.id === "string" && agent.id.trim() ? [agent.id.trim()] : []);
+  const selected = agents.find((agent) => agent.default === true && typeof agent.id === "string" && agent.id.trim());
+  return typeof selected?.id === "string" ? selected.id.trim() : ids.includes("main") ? "main" : ids[0] ?? "main";
 }

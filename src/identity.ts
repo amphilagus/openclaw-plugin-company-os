@@ -40,6 +40,14 @@ export function resolveAgentVisualIdentity(runtimeConfig: unknown, agentId: stri
   return { agentId, configuredName, emoji, avatarUrl };
 }
 
+export function resolveStandaloneAvatar(avatarPath: string) {
+  try {
+    return readAvatarFile(realpathSync(expandHome(avatarPath)));
+  } catch {
+    return null;
+  }
+}
+
 function readWorkspaceAvatar(workspace: string, avatar: string) {
   try {
     const workspaceRoot = realpathSync(expandHome(workspace));
@@ -48,14 +56,18 @@ function readWorkspaceAvatar(workspace: string, avatar: string) {
       : path.isAbsolute(avatar) ? avatar : path.resolve(workspaceRoot, avatar);
     const resolved = realpathSync(candidate);
     if (resolved !== workspaceRoot && !resolved.startsWith(`${workspaceRoot}${path.sep}`)) return null;
-    const mime = MIME_TYPES[path.extname(resolved).toLowerCase()];
-    if (!mime) return null;
-    const stat = statSync(resolved);
-    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_AVATAR_BYTES) return null;
-    return `data:${mime};base64,${readFileSync(resolved).toString("base64")}`;
+    return readAvatarFile(resolved);
   } catch {
     return null;
   }
+}
+
+function readAvatarFile(resolved: string) {
+  const mime = MIME_TYPES[path.extname(resolved).toLowerCase()];
+  if (!mime) return null;
+  const stat = statSync(resolved);
+  if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_AVATAR_BYTES) return null;
+  return `data:${mime};base64,${readFileSync(resolved).toString("base64")}`;
 }
 
 function expandHome(value: string) {

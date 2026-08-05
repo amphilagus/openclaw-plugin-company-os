@@ -158,6 +158,14 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
       await reload(true);
     } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
   };
+  const rejectMeeting = async (reason: string) => {
+    if (!meeting || !reason.trim()) return;
+    setBusy(true);
+    try {
+      await post(`/meetings/${meeting.id}/reject`, { reason });
+      await reload(true);
+    } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
+  };
   const approveEnd = async () => {
     if (!meeting) return;
     setBusy(true);
@@ -176,7 +184,7 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
   };
   return <>
     <PageHeader eyebrow="SINGLE WORLDLINE · ONE ROOM" title="公司会议室" summary="所有公司会议严格串行。主持人控制发言权，Boss 插话排在当前发言之后。">
-      <span className={`room-state ${meeting ? "occupied" : "free"}`}>{meeting?.awaitingBossStart ? "等待你开始" : meeting?.endRequestedAt ? "等待你决定结束" : meeting ? "会议进行中" : "会议室空闲"}</span>
+      <span className={`room-state ${meeting ? "occupied" : "free"}`}>{meeting?.awaitingBossStart ? "等待你开始" : meeting?.endRequestedAt ? meeting.bossParticipates ? "等待你决定结束" : "结束倒计时" : meeting ? "会议进行中" : "会议室空闲"}</span>
     </PageHeader>
     {!meeting ? <Empty title="会议室现在是空的" body={snapshot.meetings.queue.length ? "排队会议即将由系统启动。" : "员工可通过 company_meeting_request 申请会议。"} /> :
       <div className="meeting-grid">
@@ -191,7 +199,7 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
               ? <HostDispatchState dispatch={meeting.hostDispatchStatus} hostName={memberName(identities, meeting.hostId)} />
               : null}
             {meeting.awaitingBossStart || meeting.endRequestedAt
-              ? <BossMeetingGate meeting={meeting} busy={busy} start={() => void startMeeting()} approveEnd={() => void approveEnd()} rejectEnd={(fb) => void rejectEnd(fb)} />
+              ? <BossMeetingGate meeting={meeting} busy={busy} start={() => void startMeeting()} rejectMeeting={(reason) => void rejectMeeting(reason)} approveEnd={() => void approveEnd()} rejectEnd={(fb) => void rejectEnd(fb)} />
               : meeting.currentTurn ? <div className="speaking"><i />等待 <b>{memberName(identities, meeting.currentTurn.speakerId)}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {memberName(identities, meeting.hostId)}</div>}
           </div>
           {!meeting.awaitingBossStart && !meeting.endRequestedAt ? <form className="boss-composer" onSubmit={interject}>

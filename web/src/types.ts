@@ -69,6 +69,7 @@ export type MeetingSummary = {
   endRequestedAt: string | null;
   endRequestedSummary: string | null;
   endRequestedPublishNotice: boolean;
+  autoEndAt: string | null;
   queuePosition: number;
   participantCount: number;
   currentTurnId: string | null;

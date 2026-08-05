@@ -9,10 +9,22 @@
     entries: {
       "company-os": {
         enabled: true,
+        // Enables the trusted agent_end fast path. The tool path also waits for
+        // OpenClaw's active-run registry to report this main session as idle.
+        hooks: {
+          allowConversationAccess: true,
+          // Allows the plugin to prepend the shared company rules.
+          allowPromptInjection: true,
+        },
         config: {
           participantTurnTimeoutSeconds: 600,
           hostIdleTimeoutSeconds: 1800,
+          meetingAutoEndDelaySeconds: 60,
           taskStaleAfterHours: 72,
+          // Defaults to the OpenClaw Agent marked default: true.
+          // organizationAdminAgentId: "jia-goushi",
+          // Boss is a human member, so this avatar does not come from agents.list.
+          bossAvatarPath: "~/.openclaw/workspace-boss/avatar.png",
           bossEmailNotifications: {
             enabled: true,
             // Defaults to ~/.config/mail-skills/.env and sends to USERNAME.
