@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CompanyOsStore } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
 
-const AGENTS = ["main", "cto", "eng-a", "eng-b", "dev-a", "dev-b", "advisor", "new-hire"];
+const AGENTS = ["main", "jia-goushi", "cto", "eng-a", "eng-b", "dev-a", "dev-b", "advisor", "new-hire"];
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
 
 let tempDir: string;
@@ -171,6 +171,30 @@ describe("notices", () => {
 });
 
 describe("meeting room", () => {
+  it("builds named incremental context and advances a speaker watermark only after successful speech", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "增量上下文测试",
+      agenda: "验证水位",
+      participants: [{ agentId: "eng-a", role: "advisor" }],
+    }).meeting;
+
+    const first = store.delegateMeeting("cto", meeting.id, "eng-a", "给出第一轮判断");
+    expect(first.fromSequence).toBe(0);
+    expect(first.prompt).toContain("主持人：CTO（cto）");
+    expect(first.prompt).toContain("你的身份：高工 A（eng-a）");
+    expect(first.prompt).toContain("会议室已开放");
+    store.speakMeeting("eng-a", meeting.id, "第一轮意见", first.turnId);
+
+    store.speakMeeting("cto", meeting.id, "主持人追加问题背景");
+    const second = store.delegateMeeting("cto", meeting.id, "eng-a", "给出第二轮判断");
+    expect(second.fromSequence).toBeGreaterThan(0);
+    expect(second.prompt).toContain("CTO（cto）：主持人追加问题背景");
+    expect(second.prompt).not.toContain("会议室已开放");
+    expect(second.prompt).not.toContain("第一轮意见");
+  });
+
   it("waits for Boss to start and requires Boss approval before a direct-participation meeting can end", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("Boss 参会父任务"), assigneeId: "cto" });
@@ -185,7 +209,7 @@ describe("meeting room", () => {
 
     expect(requested.meeting.status).toBe("active");
     expect(requested.meeting.awaitingBossStart).toBe(true);
-    expect(requested.advance.schedule).toBeUndefined();
+    expect(requested.advance.hostDispatchId).toBeUndefined();
     expect(store.pendingMeetingEmailNotifications().map((item) => item.kind)).toEqual(["created", "room_entered"]);
     expect(() => store.speakMeeting("cto", requested.meeting.id, "提前开会")).toThrow(/waiting for Boss/);
 
@@ -195,8 +219,12 @@ describe("meeting room", () => {
     expect(store.meetingView(requested.meeting.id).status).toBe("active");
 
     const start = store.startMeetingByBoss(requested.meeting.id);
-    expect(start.schedule?.agentId).toBe("cto");
+    expect(start.hostDispatchId).toBeTruthy();
+    expect(store.meetingView(requested.meeting.id).hostDispatchStatus).toMatchObject({ targetAgentId: "cto", status: "pending" });
     expect(store.meetingView(requested.meeting.id).awaitingBossStart).toBe(false);
+    const hostContext = store.buildMeetingContext(requested.meeting.id, "cto", { role: "host", instruction: "回应 Boss" });
+    expect(hostContext.prompt).toContain("[#1] 系统：会议已进入会议室");
+    expect(hostContext.prompt).toContain("[#2] Boss：我已进入会议室，现在开始会议。");
     store.setMeetingTaskDrafts("cto", requested.meeting.id, [{ ...taskFields("执行任务"), assigneeId: "eng-a" }]);
 
     const hostResult = store.endMeeting("cto", requested.meeting.id, "任务已经分配，请 Boss 批准结束", false);
@@ -213,6 +241,67 @@ describe("meeting room", () => {
     expect(approved.meeting.audit.some((event: any) => event.actorId === "boss" && event.action === "meeting.completed")).toBe(true);
   });
 
+  it("recovers a running host dispatch with the same durable id and never reclaims a succeeded job", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "主持人任务恢复",
+      agenda: "验证租约恢复",
+      bossParticipates: true,
+    }).meeting;
+    const advance = store.startMeetingByBoss(meeting.id);
+    const first = store.claimNextHostDispatch();
+    expect(first).toMatchObject({ id: advance.hostDispatchId, targetAgentId: "cto", status: "running", attempts: 1 });
+
+    expect(store.recoverAgentDispatches()).toBe(1);
+    expect(store.recoveryAdvance()?.hostDispatchId).toBe(first?.id);
+    expect((store.db.prepare("SELECT COUNT(*) AS count FROM meeting_agent_dispatches WHERE meeting_id = ?").get(meeting.id) as any).count).toBe(1);
+    const recovered = store.claimNextHostDispatch();
+    expect(recovered).toMatchObject({ id: first?.id, status: "running", attempts: 2 });
+    const context = store.buildMeetingContext(meeting.id, "cto", { role: "host", instruction: "恢复主持" });
+    store.completeHostDispatch(recovered!.id, context.toSequence);
+
+    expect(store.claimNextHostDispatch()).toBeNull();
+    expect(store.recoverAgentDispatches()).toBe(0);
+    expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ id: first?.id, status: "succeeded", attempts: 2 });
+  });
+
+  it("does not mistake an unrelated Boss message for verified host dispatch progress", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "主持人进度证据",
+      agenda: "只接受主持人自己的工具操作",
+      bossParticipates: true,
+    }).meeting;
+    const advance = store.startMeetingByBoss(meeting.id);
+    const dispatch = store.claimNextHostDispatch();
+    expect(dispatch?.id).toBe(advance.hostDispatchId);
+    const context = store.buildMeetingContext(meeting.id, "cto", { role: "host", instruction: "开始主持" });
+    store.setHostDispatchContext(dispatch!.id, context);
+
+    store.bossInterject(meeting.id, "Boss 追加了一条消息");
+    expect(store.hostDispatchHasProgress(dispatch!.id)).toBe(false);
+
+    store.speakMeeting("cto", meeting.id, "主持人已回应 Boss");
+    expect(store.hostDispatchHasProgress(dispatch!.id)).toBe(true);
+  });
+
+  it("resolves a host member key to its configured OpenClaw Agent ID before invocation", () => {
+    addOrg();
+    store.db.prepare("UPDATE members SET agent_id = 'jia-goushi' WHERE id = 'main'").run();
+    const meeting = store.requestMeeting("boss", {
+      type: "discussion",
+      title: "成员与 Agent 映射",
+      agenda: "调用真实 Agent",
+      hostId: "main",
+    }).meeting;
+
+    const dispatch = store.claimNextHostDispatch();
+    expect(dispatch).toMatchObject({ meetingId: meeting.id, targetMemberId: "main", targetAgentId: "jia-goushi" });
+    expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ targetMemberId: "main", targetAgentId: "jia-goushi" });
+  });
+
   it("lets Boss reject an end request and returns control to the host", () => {
     addOrg();
     const meeting = store.requestMeeting("eng-a", {
@@ -226,7 +315,8 @@ describe("meeting room", () => {
     store.endMeeting("eng-a", meeting.id, "初步结论", false);
 
     const advance = store.rejectMeetingEndByBoss(meeting.id, "风险还没有讨论清楚");
-    expect(advance.schedule?.agentId).toBe("eng-a");
+    expect(advance.hostDispatchId).toBeTruthy();
+    expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ targetAgentId: "eng-a", status: "pending" });
     const resumed = store.meetingView(meeting.id);
     expect(resumed.endRequestedAt).toBeNull();
     expect(resumed.messages.at(-1)?.body).toContain("风险还没有讨论清楚");
@@ -247,13 +337,18 @@ describe("meeting room", () => {
     expect(store.listMeetings("boss").filter((meeting) => meeting.status === "active")).toHaveLength(1);
     expect(() => store.speakMeeting("advisor", first.meeting.id, "抢话")).toThrow(/current speaker/);
 
-    store.delegateMeeting("cto", first.meeting.id, "eng-a", "如何拆解？");
+    const workerTurn = store.delegateMeeting("cto", first.meeting.id, "eng-a", "如何拆解？");
     store.bossInterject(first.meeting.id, "请顾问先评价风险", "advisor");
-    const afterWorker = store.speakMeeting("eng-a", first.meeting.id, "先实现核心模块");
-    expect(afterWorker.schedule?.agentId).toBe("advisor");
+    expect(() => store.speakMeeting("eng-a", first.meeting.id, "错误轮次", "stale-turn")).toThrow(/does not match/);
+    expect(() => store.speakMeeting("advisor", first.meeting.id, "伪造身份", workerTurn.turnId)).toThrow(/current speaker/);
+    const afterWorker = store.speakMeeting("eng-a", first.meeting.id, "先实现核心模块", workerTurn.turnId);
+    expect(afterWorker?.completionSource).toBe("tool");
+    const bossTurn = store.nextPendingInterventionTurn(first.meeting.id);
+    expect(bossTurn?.speakerId).toBe("advisor");
     expect(store.meetingView(first.meeting.id).currentTurn?.speakerId).toBe("advisor");
-    const afterAdvisor = store.speakMeeting("advisor", first.meeting.id, "风险可控");
-    expect(afterAdvisor.schedule?.agentId).toBe("cto");
+    const afterAdvisor = store.speakMeeting("advisor", first.meeting.id, "风险可控", bossTurn!.turnId);
+    expect(afterAdvisor?.completionSource).toBe("tool");
+    expect(store.nextPendingInterventionTurn(first.meeting.id)).toBeNull();
     expect(store.meetingView(first.meeting.id).currentTurn).toBeNull();
   });
 
@@ -292,7 +387,8 @@ describe("meeting room", () => {
     store.db.prepare("UPDATE meeting_turns SET started_at = ? WHERE meeting_id = ?")
       .run(new Date(Date.now() - 20 * 60 * 1000).toISOString(), meeting.id);
     const participantAdvance = store.sweepMeetingTimeouts(10 * 60 * 1000, 30 * 60 * 1000);
-    expect(participantAdvance[0]?.schedule?.agentId).toBe("eng-a");
+    expect(participantAdvance[0]?.hostDispatchId).toBeTruthy();
+    expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ targetAgentId: "eng-a", status: "pending" });
     expect(store.meetingView(meeting.id).status).toBe("active");
     store.db.prepare("UPDATE meetings SET waiting_on_host_since = ? WHERE id = ?")
       .run(new Date(Date.now() - 40 * 60 * 1000).toISOString(), meeting.id);
@@ -316,7 +412,9 @@ describe("meeting room", () => {
     expect(recovered.status).toBe("active");
     expect(recovered.taskDrafts).toHaveLength(1);
     expect(recovered.currentTurn?.speakerId).toBe("eng-a");
-    expect(store.recoveryAdvance()?.schedule?.agentId).toBe("eng-a");
+    expect(store.recoveryAdvance()?.hostDispatchId).toBeTruthy();
+    expect(store.meetingView(meeting.id).currentTurn).toBeNull();
+    expect(store.meetingView(meeting.id).hostDispatchStatus).toMatchObject({ targetAgentId: "cto", status: "pending" });
   });
 
   it("runs the complete Boss → CTO → senior → engineer → bottom-up closure rehearsal", () => {

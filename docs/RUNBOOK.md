@@ -22,8 +22,9 @@
 
 ## 会议恢复与超时
 
-- Gateway 重启后，活动会议、当前轮次、队列和任务草案从 SQLite 恢复。
-- 恢复调度先按幂等 tag 删除同 tag 旧任务，再调度到 `agent:<agentId>:main`，避免重复点名。
+- Gateway 重启后，活动会议、队列、任务草案、上下文水位和持久主持人任务从 SQLite 恢复。
+- Boss 开始、排队会议激活和主持人恢复使用 `meeting_agent_dispatches`。遗留的 `running` 任务以原 ID 重新排队；`succeeded` 任务不会再次领取。
+- 重启时无法继续等待原调用者的同步参会者轮次会被审计标记失败，再由持久任务唤醒主持人检查记录并继续，系统不会伪造或重复参会者发言。
 - 普通参会者默认 10 分钟未发言：轮次标记失败，控制权回主持人。
 - 主持人默认 30 分钟无动作：会议变成 `timed_out`，不创建任务、不发布正常汇报，会议室推进到下一场。
 - 等待 Boss 开始或等待 Boss 审批结束时暂停主持人超时；Gateway 重启后仍保持等待，不会误唤醒主持人。
@@ -46,7 +47,7 @@
 3. 将备份恢复到配置的 `databasePath`。
 4. 启动 Gateway，检查 `openclaw plugins doctor` 和会议室状态。
 
-Schema 版本保存在 `schema_meta`，迁移在服务启动时执行。不要手工修改任务状态来绕过关单规则。
+Schema 版本保存在 `schema_meta`，当前版本为 v3，迁移在服务启动时执行。不要手工修改任务状态来绕过关单规则。
 
 ## 常见故障
 
@@ -89,6 +90,16 @@ openclaw config get gateway.controlUi.embedSandbox
 必须同时满足：无未完成发言轮次、无待处理 Boss 插话、总结非空、每个 worker 至少一份草案、全部草案负责人仍是主持人的直属下属、父任务仍由主持人负责且可继续拆分。
 
 如果会议设置了 `bossParticipates: true`，满足上述条件后主持人的 `company_meeting_end` 只产生结束申请。Boss 需在「公司 → 会议室」中批准；选择「暂不结束」时必须填写反馈，系统随后重新唤醒主持人。
+
+### 主持人一直显示“启动中”或“启动失败”
+
+先检查会议详情中的 `hostDispatchStatus` 和 Gateway 日志里的 `company-os host dispatch`。插件通过本机 `openclaw agent --agent <id> --message-file ... --json` 调用主持人的 main session；确认 `openclaw` 在 Gateway 进程的 `PATH` 中，并且目标 Agent ID 仍存在于配置和组织中。`in_flight` 会自动重试三次；其他失败最多领取三次，最终状态和错误会保留在数据库及 WebUI，不能用日志中的“queued”当作主持人已经收到消息。
+
+会议详情中的 `hostId` 是组织成员 ID，不一定等于 OpenClaw Agent ID；实际调用目标可在 `hostDispatchStatus.targetAgentId` 中确认。CLI 有时会在 Agent 已通过会议工具完成工作后返回空的最终文本；服务会用本次调用冻结上下文之后是否出现经过校验的消息进展作为成功证据，这种情况不应重试或标记失败。
+
+### 参会者返回了文字但会议没有卡住
+
+这是审计代录兜底：当被点名 Agent 没有调用 `company_meeting_speak`、但 CLI 返回了非空文本时，系统会把该文本记录为其发言，并将轮次标记为 `completionSource=fallback`。审计时间线中的 `meeting.spoke_fallback` 会记录被调用 Agent 和代录原因。正常路径应当显示 `completionSource=tool`。
 
 ### Boss 没有收到会议邮件
 

@@ -7,8 +7,11 @@ import type {
   Actor,
   EvidenceInput,
   MeetingAdvance,
+  MeetingContextEnvelope,
   MeetingParticipantInput,
   MeetingStatus,
+  MeetingTurnDelivery,
+  MeetingTurnDispatch,
   MeetingType,
   ResolvedCompanyOsConfig,
   ServiceEvent,
@@ -58,10 +61,15 @@ export class CompanyOsStore {
     const schemaRow = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as Row | undefined;
     const currentVersion = schemaRow ? Number(schemaRow.value) : 0;
     if (!Number.isInteger(currentVersion) || currentVersion < 0) throw new Error("company-os schema version is invalid");
-    if (currentVersion > 2) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
-    if (currentVersion === 2) return;
+    if (currentVersion > 3) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
+    if (currentVersion === 3) return;
     if (currentVersion === 1) {
       this.migrateSchemaV2();
+      this.migrateSchemaV3();
+      return;
+    }
+    if (currentVersion === 2) {
+      this.migrateSchemaV3();
       return;
     }
     this.db.exec("BEGIN IMMEDIATE");
@@ -233,6 +241,9 @@ export class CompanyOsStore {
         prompt TEXT NOT NULL,
         intervention_id TEXT,
         status TEXT NOT NULL CHECK (status IN ('waiting', 'completed', 'failed')),
+        completion_source TEXT CHECK (completion_source IN ('tool', 'fallback')),
+        context_from_sequence INTEGER NOT NULL DEFAULT 0,
+        context_to_sequence INTEGER NOT NULL DEFAULT 0,
         started_at TEXT NOT NULL,
         completed_at TEXT,
         error TEXT
@@ -271,6 +282,32 @@ export class CompanyOsStore {
         UNIQUE(meeting_id, kind)
       );
 
+      CREATE TABLE IF NOT EXISTS meeting_context_watermarks (
+        meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id),
+        sequence INTEGER NOT NULL DEFAULT 0 CHECK (sequence >= 0),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(meeting_id, member_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS meeting_agent_dispatches (
+        id TEXT PRIMARY KEY,
+        meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('host_start', 'host_resume', 'host_recovery')),
+        target_agent_id TEXT NOT NULL REFERENCES members(id),
+        reason TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        context_from_sequence INTEGER,
+        context_to_sequence INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee_id, status);
       CREATE INDEX IF NOT EXISTS idx_tasks_issuer_status ON tasks(issuer_id, status);
@@ -278,9 +315,10 @@ export class CompanyOsStore {
       CREATE INDEX IF NOT EXISTS idx_meetings_status_queue ON meetings(status, queue_position);
       CREATE INDEX IF NOT EXISTS idx_meeting_messages_sequence ON meeting_messages(meeting_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_meeting_email_pending ON meeting_email_notifications(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_meeting_dispatch_pending ON meeting_agent_dispatches(status, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meeting ON meetings(status) WHERE status = 'active';
       `);
-      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '2')").run();
+      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3')").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -317,6 +355,61 @@ export class CompanyOsStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  private migrateSchemaV3() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (this.tableExists("meeting_turns") && !this.columnExists("meeting_turns", "completion_source")) {
+        this.db.exec("ALTER TABLE meeting_turns ADD COLUMN completion_source TEXT CHECK (completion_source IN ('tool', 'fallback'))");
+      }
+      if (this.tableExists("meeting_turns") && !this.columnExists("meeting_turns", "context_from_sequence")) {
+        this.db.exec("ALTER TABLE meeting_turns ADD COLUMN context_from_sequence INTEGER NOT NULL DEFAULT 0");
+      }
+      if (this.tableExists("meeting_turns") && !this.columnExists("meeting_turns", "context_to_sequence")) {
+        this.db.exec("ALTER TABLE meeting_turns ADD COLUMN context_to_sequence INTEGER NOT NULL DEFAULT 0");
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS meeting_context_watermarks (
+          meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+          member_id TEXT NOT NULL REFERENCES members(id),
+          sequence INTEGER NOT NULL DEFAULT 0 CHECK (sequence >= 0),
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(meeting_id, member_id)
+        );
+        CREATE TABLE IF NOT EXISTS meeting_agent_dispatches (
+          id TEXT PRIMARY KEY,
+          meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('host_start', 'host_resume', 'host_recovery')),
+          target_agent_id TEXT NOT NULL REFERENCES members(id),
+          reason TEXT NOT NULL,
+          dedupe_key TEXT NOT NULL UNIQUE,
+          context_from_sequence INTEGER,
+          context_to_sequence INTEGER,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_meeting_dispatch_pending ON meeting_agent_dispatches(status, created_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private tableExists(table: string) {
+    return Boolean(this.db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+  }
+
+  private columnExists(table: string, column: string) {
+    return (this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).some((row) => row.name === column);
   }
 
   private seedOrganization() {
@@ -449,7 +542,8 @@ export class CompanyOsStore {
   }
 
   requireAgentMember(agentId: string) {
-    const row = this.db.prepare("SELECT * FROM members WHERE agent_id = ? AND active = 1").get(agentId) as Row | undefined;
+    const row = (this.db.prepare("SELECT * FROM members WHERE agent_id = ? AND active = 1").get(agentId)
+      ?? this.db.prepare("SELECT * FROM members WHERE id = ? AND kind = 'agent' AND active = 1").get(agentId)) as Row | undefined;
     if (!row) throw new Error(`agent is not an active company member: ${agentId}`);
     return row;
   }
@@ -1079,9 +1173,12 @@ export class CompanyOsStore {
         );
       }
       this.audit({ actorId, action: "meeting.requested", entityType: "meeting", entityId: meetingId, after: { ...input, hostId, status, bossParticipates } });
-      if (status !== "active") return {};
-      if (bossParticipates) return { activatedMeetingId: meetingId };
-      return { activatedMeetingId: meetingId, schedule: this.hostSchedule(meetingId, "会议已开始，请组织第一轮发言。") };
+      if (status !== "active" || bossParticipates) return status === "active" ? { activatedMeetingId: meetingId } : {};
+      if (actorId !== "boss") return { activatedMeetingId: meetingId };
+      return {
+        activatedMeetingId: meetingId,
+        hostDispatchId: this.enqueueHostDispatch(meetingId, "host_start", "Boss 创建的会议已开始，请组织第一轮发言。", `host-request:${meetingId}`),
+      };
     });
     return { meeting: this.meetingView(meetingId), advance };
   }
@@ -1159,6 +1256,12 @@ export class CompanyOsStore {
     const currentTurn = row.current_turn_id
       ? this.db.prepare("SELECT * FROM meeting_turns WHERE id = ?").get(row.current_turn_id) as Row | undefined
       : undefined;
+    const hostDispatch = this.db.prepare(`
+      SELECT d.*, target.agent_id AS target_runtime_agent_id
+      FROM meeting_agent_dispatches d
+      JOIN members target ON target.id = d.target_agent_id
+      WHERE d.meeting_id = ? ORDER BY d.created_at DESC, d.rowid DESC LIMIT 1
+    `).get(meetingId) as Row | undefined;
     return {
       ...this.mapMeetingSummary(row),
       participants: participants.map((participant) => ({
@@ -1170,6 +1273,7 @@ export class CompanyOsStore {
       messages: messages.map(mapMeetingMessage),
       taskDrafts: drafts.map(mapTaskDraft),
       currentTurn: currentTurn ? mapMeetingTurn(currentTurn) : null,
+      hostDispatchStatus: hostDispatch ? mapHostDispatch(hostDispatch) : null,
       audit: this.listAudit("meeting", meetingId),
     };
   }
@@ -1186,11 +1290,18 @@ export class CompanyOsStore {
         .run(startedAt, startedAt, meetingId);
       this.addMeetingMessage(meetingId, "boss", "boss", null, "我已进入会议室，现在开始会议。");
       this.audit({ actorId: "boss", action: "meeting.started_by_boss", entityType: "meeting", entityId: meetingId });
-      return { schedule: this.hostSchedule(meetingId, "Boss 已进入会议室并点击开始，请组织第一轮发言。") };
+      return {
+        hostDispatchId: this.enqueueHostDispatch(
+          meetingId,
+          "host_start",
+          "Boss 刚刚说：“我已进入会议室，现在开始会议。”\n请先回应 Boss，再按照会议议题主持讨论。",
+          `host-start:${meetingId}`,
+        ),
+      };
     });
   }
 
-  delegateMeeting(actorId: string, meetingId: string, speakerId: string, prompt: string): MeetingAdvance {
+  delegateMeeting(actorId: string, meetingId: string, speakerId: string, prompt: string): MeetingTurnDispatch {
     this.requireAgentMember(actorId);
     const meeting = this.requireActiveHostedMeeting(actorId, meetingId);
     if (meeting.current_turn_id) throw new Error("the current speaker has not finished");
@@ -1198,17 +1309,22 @@ export class CompanyOsStore {
       .get(meetingId, speakerId) as Row | undefined;
     if (!participant) throw new Error("the selected speaker is not a meeting participant");
     return this.transaction(() => {
-      const interventionAdvance = this.advancePendingInterventions(meetingId);
-      if (interventionAdvance.schedule?.turnId) return interventionAdvance;
       const turn = this.createMeetingTurn(meetingId, speakerId, actorId, "delegate", required(prompt, "prompt"));
       this.addMeetingMessage(meetingId, "member", actorId, speakerId, `点名 ${speakerId}：${prompt}`, turn.id);
       this.db.prepare("UPDATE meetings SET current_turn_id = ?, waiting_on_host_since = NULL WHERE id = ?").run(turn.id, meetingId);
+      const context = this.buildMeetingContext(meetingId, speakerId, {
+        turnId: turn.id,
+        instruction: required(prompt, "prompt"),
+        role: "speaker",
+      });
+      this.db.prepare("UPDATE meeting_turns SET context_from_sequence = ?, context_to_sequence = ? WHERE id = ?")
+        .run(context.fromSequence, context.toSequence, turn.id);
       this.audit({ actorId, action: "meeting.delegated", entityType: "meeting", entityId: meetingId, after: { turnId: turn.id, speakerId, prompt } });
-      return { schedule: this.turnSchedule(meetingId, turn.id, speakerId, prompt) };
+      return { ...context, turnId: turn.id, speakerId, agentId: this.runtimeAgentId(speakerId) };
     });
   }
 
-  speakMeeting(actorId: string, meetingId: string, body: string): MeetingAdvance {
+  speakMeeting(actorId: string, meetingId: string, body: string, turnId?: string): MeetingTurnDelivery | null {
     this.requireAgentMember(actorId);
     const meeting = this.getMeetingRow(meetingId);
     if (meeting.status !== "active") throw new Error("meeting is not active");
@@ -1218,23 +1334,26 @@ export class CompanyOsStore {
     return this.transaction(() => {
       if (!meeting.current_turn_id) {
         if (meeting.host_id !== actorId) throw new Error("only the current speaker can speak");
+        if (turnId) throw new Error("the supplied meeting turn is no longer current");
         this.addMeetingMessage(meetingId, "member", actorId, null, message);
         this.db.prepare("UPDATE meetings SET waiting_on_host_since = ? WHERE id = ?").run(nowIso(), meetingId);
         this.audit({ actorId, action: "meeting.host_spoke", entityType: "meeting", entityId: meetingId, after: { body: message } });
-        return this.advancePendingInterventions(meetingId);
+        return null;
       }
       const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ?").get(meeting.current_turn_id) as Row | undefined;
       if (!turn || turn.status !== "waiting" || turn.speaker_id !== actorId) throw new Error("only the current speaker can speak");
+      if (!turnId || turn.id !== turnId) throw new Error("meeting turn does not match the current speaking round");
       const completedAt = nowIso();
-      this.db.prepare("UPDATE meeting_turns SET status = 'completed', completed_at = ? WHERE id = ?").run(completedAt, turn.id);
+      this.db.prepare("UPDATE meeting_turns SET status = 'completed', completion_source = 'tool', completed_at = ? WHERE id = ?").run(completedAt, turn.id);
       this.addMeetingMessage(meetingId, "member", actorId, null, message, turn.id);
       if (turn.intervention_id) {
         this.db.prepare("UPDATE meeting_interventions SET status = 'delivered', delivered_at = ? WHERE id = ?")
           .run(completedAt, turn.intervention_id);
       }
       this.db.prepare("UPDATE meetings SET current_turn_id = NULL, waiting_on_host_since = ? WHERE id = ?").run(completedAt, meetingId);
+      this.advanceMeetingWatermark(meetingId, actorId, this.maxMeetingSequence(meetingId));
       this.audit({ actorId, action: "meeting.spoke", entityType: "meeting", entityId: meetingId, after: { turnId: turn.id, body: message } });
-      return this.advancePendingInterventions(meetingId);
+      return this.meetingTurnDelivery(turn.id);
     });
   }
 
@@ -1259,7 +1378,15 @@ export class CompanyOsStore {
       `).run(interventionId, meetingId, targetId ?? null, required(body, "body"), createdAt);
       this.addMeetingMessage(meetingId, "boss", "boss", targetId ?? null, body);
       this.audit({ actorId: "boss", action: "meeting.boss_interjected", entityType: "meeting", entityId: meetingId, after: { interventionId, targetId, body } });
-      return meeting.current_turn_id ? {} : this.advancePendingInterventions(meetingId);
+      if (meeting.current_turn_id) return {};
+      return {
+        hostDispatchId: this.enqueueHostDispatch(
+          meetingId,
+          "host_resume",
+          targetId ? `Boss @${targetId} 插话，请先处理定向插话再继续主持。` : "Boss 新增了会议发言，请先回应 Boss 再继续主持。",
+          `host-intervention:${meetingId}:${interventionId}`,
+        ),
+      };
     });
   }
 
@@ -1345,7 +1472,14 @@ export class CompanyOsStore {
       `).run(resumedAt, meetingId);
       this.addMeetingMessage(meetingId, "boss", "boss", meeting.host_id, `暂不结束会议：${reason}`);
       this.audit({ actorId: "boss", action: "meeting.end_rejected", entityType: "meeting", entityId: meetingId, reason });
-      return { schedule: this.hostSchedule(meetingId, `Boss 暂未批准结束会议：${reason}\n请继续主持。`) };
+      return {
+        hostDispatchId: this.enqueueHostDispatch(
+          meetingId,
+          "host_resume",
+          `Boss 暂未批准结束会议：${reason}\n请先回应 Boss 的反馈，再继续主持。`,
+          `host-end-rejected:${meetingId}:${resumedAt}`,
+        ),
+      };
     });
   }
 
@@ -1425,6 +1559,7 @@ export class CompanyOsStore {
           waiting_on_host_since = NULL, end_requested_at = NULL, end_requested_summary = NULL,
           end_requested_publish_notice = 0, ended_at = ? WHERE id = ?
       `).run(finalSummary, notice ? 1 : 0, endedAt, meeting.id);
+      this.cancelOpenHostDispatches(meeting.id);
       this.addMeetingMessage(meeting.id, "system", null, null, "会议已完成，会议室已释放。");
       this.audit({ actorId, action: "meeting.completed", entityType: "meeting", entityId: meeting.id, after: { summary: finalSummary, createdTaskIds: createdTasks.map((task) => task.id), noticeId: notice?.id } });
       advance = this.activateNextMeeting();
@@ -1442,6 +1577,7 @@ export class CompanyOsStore {
     this.transaction(() => {
       this.db.prepare("UPDATE meetings SET status = 'canceled', canceled_reason = ?, ended_at = ? WHERE id = ?")
         .run(required(reason, "reason"), nowIso(), meetingId);
+      this.cancelOpenHostDispatches(meetingId);
       this.audit({ actorId, action: "meeting.canceled", entityType: "meeting", entityId: meetingId, reason });
       this.normalizeMeetingQueue();
     });
@@ -1485,8 +1621,14 @@ export class CompanyOsStore {
           .run(failedAt, meeting.id);
         this.addMeetingMessage(meeting.id, "system", null, null, `${turn.speaker_id} 本轮发言超时，控制权返回主持人。`, turn.id);
         this.audit({ actorId: "system", action: "meeting.turn_timed_out", entityType: "meeting", entityId: meeting.id, after: { turnId: turn.id, speakerId: turn.speaker_id } });
-        const interventionAdvance = this.advancePendingInterventions(meeting.id);
-        return [interventionAdvance.schedule ? interventionAdvance : { schedule: this.hostSchedule(meeting.id, "参会者发言超时，请继续主持会议。") }];
+        return [{
+          hostDispatchId: this.enqueueHostDispatch(
+            meeting.id,
+            "host_resume",
+            "参会者发言超时，控制权已经返回，请继续主持会议。",
+            `host-turn-timeout:${meeting.id}:${turn.id}`,
+          ),
+        }];
       });
     }
     if (meeting.waiting_on_host_since && now - Date.parse(meeting.waiting_on_host_since) >= hostTimeoutMs) {
@@ -1499,11 +1641,26 @@ export class CompanyOsStore {
     const meeting = this.db.prepare("SELECT * FROM meetings WHERE status = 'active'").get() as Row | undefined;
     if (!meeting) return null;
     if (this.isAwaitingBossStart(meeting) || meeting.end_requested_at) return null;
-    if (meeting.current_turn_id) {
-      const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ? AND status = 'waiting'").get(meeting.current_turn_id) as Row | undefined;
-      if (turn) return { schedule: this.turnSchedule(meeting.id, turn.id, turn.speaker_id, turn.prompt) };
-    }
-    return { schedule: this.hostSchedule(meeting.id, "Gateway 已恢复，请根据当前会议记录继续主持。") };
+    return this.transaction(() => {
+      if (meeting.current_turn_id) {
+        const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ? AND status = 'waiting'").get(meeting.current_turn_id) as Row | undefined;
+        if (turn) this.failMeetingTurn(turn.id, "Gateway restarted during a synchronous speaking turn");
+      }
+      const existing = this.db.prepare(`
+        SELECT id FROM meeting_agent_dispatches
+        WHERE meeting_id = ? AND status IN ('pending', 'running')
+        ORDER BY created_at, rowid LIMIT 1
+      `).get(meeting.id) as Row | undefined;
+      if (existing) return { hostDispatchId: existing.id };
+      return {
+        hostDispatchId: this.enqueueHostDispatch(
+          meeting.id,
+          "host_recovery",
+          "Gateway 已恢复。请检查会议记录和失败轮次，然后从当前状态继续主持。",
+          `host-recovery:${meeting.id}:${this.maxMeetingSequence(meeting.id)}`,
+        ),
+      };
+    });
   }
 
   private requireActiveHostedMeeting(actorId: string, meetingId: string, allowExistingEndRequest = false) {
@@ -1590,7 +1747,7 @@ export class CompanyOsStore {
       INSERT INTO meeting_messages (id, meeting_id, sequence, author_kind, author_id, target_id, body, turn_id, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, meetingId, Number(row.sequence), authorKind, authorId, targetId, required(body, "body"), turnId ?? null, nowIso());
-    return id;
+    return { id, sequence: Number(row.sequence) };
   }
 
   private createMeetingTurn(
@@ -1610,52 +1767,374 @@ export class CompanyOsStore {
     return { id, startedAt };
   }
 
-  private advancePendingInterventions(meetingId: string): MeetingAdvance {
-    while (true) {
-      const intervention = this.db.prepare(`
-        SELECT * FROM meeting_interventions WHERE meeting_id = ? AND status = 'pending' ORDER BY created_at, rowid LIMIT 1
-      `).get(meetingId) as Row | undefined;
-      if (!intervention) return { schedule: this.hostSchedule(meetingId, "当前发言已结束，请根据会议记录继续主持。") };
-      if (!intervention.target_id) {
-        this.db.prepare("UPDATE meeting_interventions SET status = 'delivered', delivered_at = ? WHERE id = ?")
-          .run(nowIso(), intervention.id);
-        continue;
+  nextPendingInterventionTurn(meetingId: string): MeetingTurnDispatch | null {
+    return this.transaction(() => {
+      const meeting = this.getMeetingRow(meetingId);
+      if (meeting.status !== "active" || meeting.current_turn_id || this.isAwaitingBossStart(meeting) || meeting.end_requested_at) return null;
+      while (true) {
+        const intervention = this.db.prepare(`
+          SELECT * FROM meeting_interventions WHERE meeting_id = ? AND status = 'pending' ORDER BY created_at, rowid LIMIT 1
+        `).get(meetingId) as Row | undefined;
+        if (!intervention) {
+          this.db.prepare("UPDATE meetings SET waiting_on_host_since = ? WHERE id = ?").run(nowIso(), meetingId);
+          return null;
+        }
+        if (!intervention.target_id || intervention.target_id === meeting.host_id) {
+          this.db.prepare("UPDATE meeting_interventions SET status = 'delivered', delivered_at = ? WHERE id = ?")
+            .run(nowIso(), intervention.id);
+          continue;
+        }
+        const instruction = `Boss @你：${intervention.body}`;
+        const turn = this.createMeetingTurn(meetingId, intervention.target_id, "boss", "boss", instruction, intervention.id);
+        this.db.prepare("UPDATE meeting_interventions SET status = 'delivering' WHERE id = ?").run(intervention.id);
+        this.db.prepare("UPDATE meetings SET current_turn_id = ?, waiting_on_host_since = NULL WHERE id = ?").run(turn.id, meetingId);
+        const context = this.buildMeetingContext(meetingId, intervention.target_id, {
+          turnId: turn.id,
+          instruction,
+          role: "speaker",
+        });
+        this.db.prepare("UPDATE meeting_turns SET context_from_sequence = ?, context_to_sequence = ? WHERE id = ?")
+          .run(context.fromSequence, context.toSequence, turn.id);
+        this.audit({
+          actorId: "boss",
+          action: "meeting.boss_turn_started",
+          entityType: "meeting",
+          entityId: meetingId,
+          after: { interventionId: intervention.id, turnId: turn.id, speakerId: intervention.target_id },
+        });
+        return {
+          ...context,
+          turnId: turn.id,
+          speakerId: intervention.target_id,
+          agentId: this.runtimeAgentId(intervention.target_id),
+        };
       }
-      const turn = this.createMeetingTurn(
-        meetingId,
-        intervention.target_id,
-        "boss",
-        "boss",
-        `Boss @${intervention.target_id}：${intervention.body}`,
-        intervention.id,
-      );
-      this.db.prepare("UPDATE meeting_interventions SET status = 'delivering' WHERE id = ?").run(intervention.id);
-      this.db.prepare("UPDATE meetings SET current_turn_id = ?, waiting_on_host_since = NULL WHERE id = ?").run(turn.id, meetingId);
-      return { schedule: this.turnSchedule(meetingId, turn.id, intervention.target_id, `Boss @你：${intervention.body}`) };
-    }
+    });
   }
 
-  private hostSchedule(meetingId: string, context: string) {
+  buildMeetingContext(
+    meetingId: string,
+    memberId: string,
+    options: { role: "host" | "speaker"; instruction: string; turnId?: string },
+  ): MeetingContextEnvelope {
     const meeting = this.getMeetingRow(meetingId);
-    const endInstruction = meeting.boss_participates
-      ? "需要结束时请调用 company_meeting_end 提交总结并申请 Boss 批准；你不能直接关闭会议。"
-      : "需要结束时可调用 company_meeting_end。";
+    const member = this.getMember(memberId, { active: false });
+    const related = memberId === meeting.host_id || Boolean(this.db.prepare(
+      "SELECT 1 AS ok FROM meeting_participants WHERE meeting_id = ? AND member_id = ?",
+    ).get(meetingId, memberId));
+    if (!related) throw new Error("meeting context can only be delivered to its host or participants");
+    const watermark = this.db.prepare(
+      "SELECT sequence FROM meeting_context_watermarks WHERE meeting_id = ? AND member_id = ?",
+    ).get(meetingId, memberId) as Row | undefined;
+    const fromSequence = Number(watermark?.sequence ?? 0);
+    const toSequence = this.maxMeetingSequence(meetingId);
+    const rows = this.db.prepare(`
+      SELECT msg.*, author.name AS author_name, target.name AS target_name
+      FROM meeting_messages msg
+      LEFT JOIN members author ON author.id = msg.author_id
+      LEFT JOIN members target ON target.id = msg.target_id
+      WHERE msg.meeting_id = ? AND msg.sequence > ? AND msg.sequence <= ?
+      ORDER BY msg.sequence
+    `).all(meetingId, fromSequence, toSequence) as Row[];
+    const host = this.getMember(meeting.host_id, { active: false });
+    const lines = [
+      "【Company OS 公司会议】",
+      `会议 ID：${meetingId}`,
+      `主题：${meeting.title}`,
+      `类型：${meeting.type === "task" ? "任务会议" : "普通讨论会"}`,
+      `议程：${meeting.agenda}`,
+      `主持人：${host.name}（${meeting.host_id}）`,
+      `你的身份：${member.name}（${memberId}）`,
+      "",
+      rows.length
+        ? `以下是你自上次成功参与后新增的会议记录（#${fromSequence + 1}–#${toSequence}）：`
+        : "自你上次成功参与后没有新增会议消息。",
+      ...rows.map((row) => formatMeetingContextMessage(row)),
+      "",
+      `当前要求：${required(options.instruction, "instruction")}`,
+      "",
+    ];
+    if (options.role === "speaker") {
+      lines.push(
+        `当前轮次 ID：${required(options.turnId, "turnId")}`,
+        "你现在拥有发言权。请结合会议记录作出实质性回应，然后调用 company_meeting_speak 提交发言。",
+        `必须把 meetingId=${meetingId}、turnId=${required(options.turnId, "turnId")} 和正文一起传给 company_meeting_speak；不要只在普通回复中返回发言内容。`,
+      );
+    } else {
+      lines.push(
+        "你是本场主持人。请先回应新增内容，再使用 company_meeting_speak、company_meeting_delegate 或 company_meeting_set_task_drafts 推进会议。",
+        meeting.boss_participates
+          ? "需要结束时调用 company_meeting_end 提交总结并申请 Boss 批准；你不能直接关闭会议。"
+          : "需要结束时调用 company_meeting_end。",
+      );
+    }
+    return { meetingId, memberId, fromSequence, toSequence, prompt: lines.join("\n") };
+  }
+
+  advanceMeetingWatermark(meetingId: string, memberId: string, sequence: number) {
+    const bounded = Math.min(Math.max(Math.floor(sequence), 0), this.maxMeetingSequence(meetingId));
+    this.db.prepare(`
+      INSERT INTO meeting_context_watermarks (meeting_id, member_id, sequence, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(meeting_id, member_id) DO UPDATE SET
+        sequence = MAX(meeting_context_watermarks.sequence, excluded.sequence),
+        updated_at = excluded.updated_at
+    `).run(meetingId, memberId, bounded, nowIso());
+    return bounded;
+  }
+
+  acknowledgeHostContext(meetingId: string, actorId: string) {
+    const meeting = this.getMeetingRow(meetingId);
+    if (meeting.host_id !== actorId) return;
+    this.advanceMeetingWatermark(meetingId, actorId, this.maxMeetingSequence(meetingId));
+  }
+
+  meetingTurnDelivery(turnId: string): MeetingTurnDelivery {
+    const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ?").get(turnId) as Row | undefined;
+    if (!turn) throw new Error(`meeting turn not found: ${turnId}`);
+    const speech = this.db.prepare(`
+      SELECT body FROM meeting_messages
+      WHERE meeting_id = ? AND turn_id = ? AND author_kind = 'member' AND author_id = ?
+      ORDER BY sequence DESC LIMIT 1
+    `).get(turn.meeting_id, turn.id, turn.speaker_id) as Row | undefined;
     return {
-      meetingId,
-      agentId: meeting.host_id,
-      prompt: `${context}\n会议 ID：${meetingId}\n请先调用 company_meeting_status 读取会议记录，再使用 company_meeting_speak、company_meeting_delegate 或 company_meeting_set_task_drafts 推进会议。${endInstruction}`,
-      tag: `company-os-host-${meetingId}`,
+      turnId: turn.id,
+      speakerId: turn.speaker_id,
+      status: turn.status === "completed" ? "completed" : "failed",
+      body: speech?.body ?? null,
+      completionSource: turn.completion_source ?? null,
+      error: turn.error ?? null,
+      contextFromSequence: Number(turn.context_from_sequence ?? 0),
+      contextToSequence: Number(turn.context_to_sequence ?? 0),
     };
   }
 
-  private turnSchedule(meetingId: string, turnId: string, agentId: string, prompt: string) {
-    return {
-      meetingId,
-      agentId,
-      turnId,
-      prompt: `你是公司会议的当前发言人。\n会议 ID：${meetingId}\n问题：${prompt}\n请阅读 company_meeting_status 后，通过 company_meeting_speak 提交本轮发言。`,
-      tag: `company-os-turn-${turnId}`,
-    };
+  isMeetingTurnWaiting(turnId: string) {
+    const row = this.db.prepare("SELECT status FROM meeting_turns WHERE id = ?").get(turnId) as Row | undefined;
+    if (!row) throw new Error(`meeting turn not found: ${turnId}`);
+    return row.status === "waiting";
+  }
+
+  completeMeetingTurnFallback(turnId: string, speakerId: string, invokedAgentId: string, reply: string, rawReturn?: unknown): MeetingTurnDelivery {
+    return this.transaction(() => {
+      const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ?").get(turnId) as Row | undefined;
+      if (!turn) throw new Error(`meeting turn not found: ${turnId}`);
+      if (turn.status !== "waiting") return this.meetingTurnDelivery(turnId);
+      if (turn.speaker_id !== speakerId) throw new Error("fallback speaker does not match the invoked Agent");
+      if (this.getMember(speakerId, { active: false }).agent_id !== invokedAgentId) {
+        throw new Error("fallback Agent ID does not match the speaker's configured Agent");
+      }
+      const meeting = this.getMeetingRow(turn.meeting_id);
+      if (meeting.status !== "active" || meeting.current_turn_id !== turn.id) throw new Error("fallback turn is no longer active");
+      const body = required(reply, "fallback reply").slice(0, 100_000);
+      const completedAt = nowIso();
+      this.db.prepare("UPDATE meeting_turns SET status = 'completed', completion_source = 'fallback', completed_at = ? WHERE id = ?")
+        .run(completedAt, turn.id);
+      this.addMeetingMessage(turn.meeting_id, "member", speakerId, null, body, turn.id);
+      if (turn.intervention_id) {
+        this.db.prepare("UPDATE meeting_interventions SET status = 'delivered', delivered_at = ? WHERE id = ?")
+          .run(completedAt, turn.intervention_id);
+      }
+      this.db.prepare("UPDATE meetings SET current_turn_id = NULL, waiting_on_host_since = ? WHERE id = ?")
+        .run(completedAt, turn.meeting_id);
+      this.advanceMeetingWatermark(turn.meeting_id, speakerId, this.maxMeetingSequence(turn.meeting_id));
+      this.audit({
+        actorId: "system",
+        action: "meeting.spoke_fallback",
+        entityType: "meeting",
+        entityId: turn.meeting_id,
+        reason: "invoked Agent returned text without calling company_meeting_speak",
+        after: { turnId, speakerId, invokedAgentId, body, rawReturn: rawReturn ?? reply },
+      });
+      return this.meetingTurnDelivery(turnId);
+    });
+  }
+
+  failMeetingTurn(turnId: string, error: string): MeetingTurnDelivery {
+    return this.transaction(() => {
+      const turn = this.db.prepare("SELECT * FROM meeting_turns WHERE id = ?").get(turnId) as Row | undefined;
+      if (!turn) throw new Error(`meeting turn not found: ${turnId}`);
+      if (turn.status !== "waiting") return this.meetingTurnDelivery(turnId);
+      const failedAt = nowIso();
+      const reason = required(error, "error").slice(0, 1000);
+      this.db.prepare("UPDATE meeting_turns SET status = 'failed', completed_at = ?, error = ? WHERE id = ?")
+        .run(failedAt, reason, turnId);
+      if (turn.intervention_id) {
+        this.db.prepare("UPDATE meeting_interventions SET status = 'delivered', delivered_at = ? WHERE id = ?")
+          .run(failedAt, turn.intervention_id);
+      }
+      this.db.prepare("UPDATE meetings SET current_turn_id = NULL, waiting_on_host_since = ? WHERE id = ? AND current_turn_id = ?")
+        .run(failedAt, turn.meeting_id, turnId);
+      this.addMeetingMessage(turn.meeting_id, "system", null, null, `${turn.speaker_id} 本轮发言失败：${reason}`, turnId);
+      this.audit({
+        actorId: "system",
+        action: "meeting.turn_failed",
+        entityType: "meeting",
+        entityId: turn.meeting_id,
+        reason,
+        after: { turnId, speakerId: turn.speaker_id },
+      });
+      return this.meetingTurnDelivery(turnId);
+    });
+  }
+
+  recoverAgentDispatches() {
+    return this.transaction(() => {
+      const rows = this.db.prepare("SELECT * FROM meeting_agent_dispatches WHERE status = 'running'").all() as Row[];
+      for (const row of rows) {
+        this.db.prepare(`
+          UPDATE meeting_agent_dispatches SET status = 'pending', lease_expires_at = NULL,
+            last_error = 'Gateway restarted during host dispatch' WHERE id = ?
+        `).run(row.id);
+        this.audit({ actorId: "system", action: "meeting.host_dispatch_recovered", entityType: "meeting", entityId: row.meeting_id, after: { dispatchId: row.id } });
+      }
+      return rows.length;
+    });
+  }
+
+  claimNextHostDispatch(leaseMs = 35 * 60 * 1000) {
+    return this.transaction(() => {
+      while (true) {
+        const row = this.db.prepare(`
+          SELECT d.* FROM meeting_agent_dispatches d
+          WHERE d.status = 'pending' AND d.attempts < 3
+          ORDER BY d.created_at, d.rowid LIMIT 1
+        `).get() as Row | undefined;
+        if (!row) return null;
+        const meeting = this.getMeetingRow(row.meeting_id);
+        if (meeting.status !== "active" || this.isAwaitingBossStart(meeting) || meeting.end_requested_at) {
+          this.db.prepare("UPDATE meeting_agent_dispatches SET status = 'canceled', completed_at = ?, lease_expires_at = NULL WHERE id = ?")
+            .run(nowIso(), row.id);
+          continue;
+        }
+        const startedAt = nowIso();
+        this.db.prepare(`
+          UPDATE meeting_agent_dispatches SET status = 'running', attempts = attempts + 1,
+            started_at = ?, lease_expires_at = ?, last_error = NULL WHERE id = ?
+        `).run(startedAt, new Date(Date.now() + leaseMs).toISOString(), row.id);
+        const runtimeAgentId = this.runtimeAgentId(row.target_agent_id);
+        return mapHostDispatch({
+          ...row,
+          target_runtime_agent_id: runtimeAgentId,
+          status: "running",
+          attempts: Number(row.attempts) + 1,
+          started_at: startedAt,
+        });
+      }
+    });
+  }
+
+  hasPendingHostDispatches() {
+    return Boolean(this.db.prepare("SELECT 1 AS ok FROM meeting_agent_dispatches WHERE status = 'pending' AND attempts < 3 LIMIT 1").get());
+  }
+
+  setHostDispatchContext(dispatchId: string, context: MeetingContextEnvelope) {
+    this.db.prepare(`
+      UPDATE meeting_agent_dispatches SET context_from_sequence = ?, context_to_sequence = ? WHERE id = ? AND status = 'running'
+    `).run(context.fromSequence, context.toSequence, dispatchId);
+  }
+
+  hostDispatchHasProgress(dispatchId: string) {
+    const row = this.db.prepare(`
+      SELECT meeting_id, target_agent_id, context_to_sequence, started_at
+      FROM meeting_agent_dispatches WHERE id = ?
+    `).get(dispatchId) as Row | undefined;
+    if (!row || row.context_to_sequence === null || row.context_to_sequence === undefined || !row.started_at) return false;
+    const authoredMessage = this.db.prepare(`
+      SELECT 1 AS ok FROM meeting_messages
+      WHERE meeting_id = ? AND sequence > ? AND author_kind = 'member' AND author_id = ? LIMIT 1
+    `).get(row.meeting_id, Number(row.context_to_sequence), row.target_agent_id);
+    if (authoredMessage) return true;
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM audit_events
+      WHERE entity_type = 'meeting' AND entity_id = ? AND actor_id = ? AND created_at >= ?
+        AND action IN ('meeting.host_spoke', 'meeting.delegated', 'meeting.task_drafts_set', 'meeting.end_requested', 'meeting.completed')
+      LIMIT 1
+    `).get(row.meeting_id, row.target_agent_id, row.started_at));
+  }
+
+  completeHostDispatch(dispatchId: string, deliveredThroughSequence: number) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_agent_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row) return;
+      const completedByDispatchedHost = row.status === "canceled" && Boolean(this.db.prepare(`
+        SELECT 1 AS ok FROM audit_events
+        WHERE entity_type = 'meeting' AND entity_id = ? AND actor_id = ?
+          AND action = 'meeting.completed' AND created_at >= ? LIMIT 1
+      `).get(row.meeting_id, row.target_agent_id, row.started_at));
+      if (row.status !== "running" && !completedByDispatchedHost) return;
+      const completedAt = nowIso();
+      this.db.prepare(`
+        UPDATE meeting_agent_dispatches SET status = 'succeeded', completed_at = ?, lease_expires_at = NULL,
+          last_error = NULL WHERE id = ?
+      `).run(completedAt, dispatchId);
+      this.advanceMeetingWatermark(row.meeting_id, row.target_agent_id, deliveredThroughSequence);
+      this.audit({ actorId: "system", action: "meeting.host_dispatch_succeeded", entityType: "meeting", entityId: row.meeting_id, after: { dispatchId, attempts: row.attempts } });
+    });
+  }
+
+  failHostDispatch(dispatchId: string, error: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_agent_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return null;
+      const reason = required(error, "error").slice(0, 1000);
+      const retry = Number(row.attempts) < 3 && this.getMeetingRow(row.meeting_id).status === "active";
+      this.db.prepare(`
+        UPDATE meeting_agent_dispatches SET status = ?, last_error = ?, lease_expires_at = NULL,
+          completed_at = ? WHERE id = ?
+      `).run(retry ? "pending" : "failed", reason, retry ? null : nowIso(), dispatchId);
+      this.audit({
+        actorId: "system",
+        action: retry ? "meeting.host_dispatch_retry" : "meeting.host_dispatch_failed",
+        entityType: "meeting",
+        entityId: row.meeting_id,
+        reason,
+        after: { dispatchId, attempts: row.attempts },
+      });
+      return retry;
+    });
+  }
+
+  private enqueueHostDispatch(
+    meetingId: string,
+    kind: "host_start" | "host_resume" | "host_recovery",
+    reason: string,
+    dedupeKey: string,
+  ) {
+    const meeting = this.getMeetingRow(meetingId);
+    const id = randomUUID();
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO meeting_agent_dispatches (
+        id, meeting_id, kind, target_agent_id, reason, dedupe_key, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(id, meetingId, kind, meeting.host_id, required(reason, "dispatch reason"), dedupeKey, nowIso());
+    const dispatchId = Number(result.changes) > 0
+      ? id
+      : (this.db.prepare("SELECT id FROM meeting_agent_dispatches WHERE dedupe_key = ?").get(dedupeKey) as Row).id as string;
+    if (Number(result.changes) > 0) {
+      this.audit({ actorId: "system", action: "meeting.host_dispatch_queued", entityType: "meeting", entityId: meetingId, after: { dispatchId, kind, reason } });
+    }
+    return dispatchId;
+  }
+
+  private cancelOpenHostDispatches(meetingId: string) {
+    this.db.prepare(`
+      UPDATE meeting_agent_dispatches SET status = 'canceled', completed_at = ?, lease_expires_at = NULL
+      WHERE meeting_id = ? AND status IN ('pending', 'running')
+    `).run(nowIso(), meetingId);
+  }
+
+  private maxMeetingSequence(meetingId: string) {
+    const row = this.db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM meeting_messages WHERE meeting_id = ?")
+      .get(meetingId) as Row;
+    return Number(row.sequence);
+  }
+
+  private runtimeAgentId(memberId: string) {
+    const member = this.getMember(memberId);
+    const agentId = required(member.agent_id, `member ${memberId} agentId`);
+    if (!this.allowedAgentIds.has(agentId)) throw new Error(`OpenClaw agent does not exist: ${agentId}`);
+    return agentId;
   }
 
   private activateNextMeeting(): MeetingAdvance {
@@ -1679,7 +2158,15 @@ export class CompanyOsStore {
     this.normalizeMeetingQueue();
     this.audit({ actorId: "system", action: "meeting.activated", entityType: "meeting", entityId: next.id });
     if (bossParticipates) return { activatedMeetingId: next.id };
-    return { activatedMeetingId: next.id, schedule: this.hostSchedule(next.id, "排队会议现已开始，请组织第一轮发言。") };
+    return {
+      activatedMeetingId: next.id,
+      hostDispatchId: this.enqueueHostDispatch(
+        next.id,
+        "host_start",
+        "排队会议现已进入会议室，请组织第一轮发言。",
+        `host-activate:${next.id}`,
+      ),
+    };
   }
 
   private timeoutMeeting(meeting: Row, reason: string): MeetingAdvance {
@@ -1691,6 +2178,7 @@ export class CompanyOsStore {
     this.db.prepare(`
       UPDATE meetings SET status = 'timed_out', current_turn_id = NULL, waiting_on_host_since = NULL, ended_at = ? WHERE id = ?
     `).run(endedAt, meeting.id);
+    this.cancelOpenHostDispatches(meeting.id);
     this.addMeetingMessage(meeting.id, "system", null, null, `${reason}，会议已超时结束；未创建任务且未发布会议汇报。`);
     this.audit({ actorId: "system", action: "meeting.timed_out", entityType: "meeting", entityId: meeting.id, reason });
     return this.activateNextMeeting();
@@ -1924,10 +2412,46 @@ function mapMeetingTurn(row: Row) {
     kind: row.kind,
     prompt: row.prompt,
     status: row.status,
+    completionSource: row.completion_source ?? null,
+    contextFromSequence: Number(row.context_from_sequence ?? 0),
+    contextToSequence: Number(row.context_to_sequence ?? 0),
     startedAt: row.started_at,
     completedAt: row.completed_at,
     error: row.error,
   };
+}
+
+function mapHostDispatch(row: Row) {
+  return {
+    id: row.id,
+    meetingId: row.meeting_id,
+    kind: row.kind,
+    targetMemberId: row.target_agent_id,
+    targetAgentId: row.target_runtime_agent_id ?? row.target_agent_id,
+    reason: row.reason,
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error ?? null,
+    contextFromSequence: row.context_from_sequence === null || row.context_from_sequence === undefined
+      ? null
+      : Number(row.context_from_sequence),
+    contextToSequence: row.context_to_sequence === null || row.context_to_sequence === undefined
+      ? null
+      : Number(row.context_to_sequence),
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
+    completedAt: row.completed_at ?? null,
+  };
+}
+
+function formatMeetingContextMessage(row: Row) {
+  const author = row.author_kind === "system"
+    ? "系统"
+    : row.author_kind === "boss"
+      ? "Boss"
+      : `${row.author_name ?? row.author_id ?? "未知成员"}（${row.author_id ?? "unknown"}）`;
+  const target = row.target_id ? ` @${row.target_name ?? row.target_id}` : "";
+  return `[#${Number(row.sequence)}] ${author}${target}：${row.body}`;
 }
 
 function mapTaskDraft(row: Row) {

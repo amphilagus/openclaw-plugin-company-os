@@ -1,0 +1,47 @@
+.host-dispatch {
+  align-items: flex-start;
+  background: #f2f7f4;
+  border: 1px solid #c8d8cf;
+  border-radius: 9px;
+  display: flex;
+  gap: 10px;
+  margin: 16px 0 4px;
+  padding: 11px;
+}
+
+.host-dispatch > i {
+  animation: pulse 1.4s infinite;
+  background: var(--green);
+  border-radius: 50%;
+  height: 8px;
+  margin-top: 4px;
+  width: 8px;
+}
+
+.host-dispatch b,
+.host-dispatch span,
+.host-dispatch small {
+  display: block;
+}
+
+.host-dispatch span {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 3px;
+}
+
+.host-dispatch small {
+  color: var(--red);
+  font-size: 10px;
+  margin-top: 4px;
+}
+
+.host-dispatch.failed {
+  background: #fff4f3;
+  border-color: #e2aaa6;
+}
+
+.host-dispatch.failed > i {
+  animation: none;
+  background: var(--red);
+}

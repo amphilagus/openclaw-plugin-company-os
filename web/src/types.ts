@@ -91,6 +91,13 @@ export type MeetingDetail = MeetingSummary & {
   }>;
   taskDrafts: Array<{ id: string; position: number; title: string; description: string; acceptanceCriteria: string; assigneeId: string }>;
   currentTurn: { speakerId: string; prompt: string; startedAt: string } | null;
+  hostDispatchStatus: {
+    id: string;
+    status: "pending" | "running" | "succeeded" | "failed" | "canceled";
+    attempts: number;
+    lastError: string | null;
+    reason: string;
+  } | null;
 };
 
 export type TaskDetail = Task & {

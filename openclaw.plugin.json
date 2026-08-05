@@ -2,7 +2,7 @@
   "id": "company-os",
   "name": "Company OS",
   "description": "公司级会议、多级任务和告示板治理系统。",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "configSchema": {
     "type": "object",
     "properties": {

@@ -187,6 +187,9 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
           </div>
           <div className="transcript">
             {meeting.messages.map((message) => <MeetingMessageRow message={message} identities={identities} key={message.id} />)}
+            {!meeting.awaitingBossStart && meeting.hostDispatchStatus && ["pending", "running", "failed"].includes(meeting.hostDispatchStatus.status)
+              ? <HostDispatchState dispatch={meeting.hostDispatchStatus} hostName={memberName(identities, meeting.hostId)} />
+              : null}
             {meeting.awaitingBossStart || meeting.endRequestedAt
               ? <BossMeetingGate meeting={meeting} busy={busy} start={() => void startMeeting()} approveEnd={() => void approveEnd()} rejectEnd={(fb) => void rejectEnd(fb)} />
               : meeting.currentTurn ? <div className="speaking"><i />等待 <b>{memberName(identities, meeting.currentTurn.speakerId)}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {memberName(identities, meeting.hostId)}</div>}
@@ -205,6 +208,11 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
       </div>}
     <QueueSection queue={snapshot.meetings.queue} history={snapshot.meetings.history} reorder={reorder} cancel={cancel} identities={identities} />
   </>;
+}
+
+function HostDispatchState({ dispatch, hostName }: { dispatch: NonNullable<MeetingDetail["hostDispatchStatus"]>; hostName: string }) {
+  const label = dispatch.status === "pending" ? "主持人启动任务已排队" : dispatch.status === "running" ? "正在唤醒主持人" : "主持人启动失败";
+  return <div className={`host-dispatch ${dispatch.status}`}><i /><div><b>{label}</b><span>{hostName} · 第 {dispatch.attempts || 1} 次尝试</span>{dispatch.lastError ? <small>{dispatch.lastError}</small> : null}</div></div>;
 }
 
 function MeetingMessageRow({ message, identities }: { message: MeetingDetail["messages"][number]; identities: MemberIdentityMap }) {

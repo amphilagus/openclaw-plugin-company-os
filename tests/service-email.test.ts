@@ -16,10 +16,6 @@ describe("meeting email outbox", () => {
       allowedAgentIds: ["main", "cto"],
       config: resolveConfig(undefined),
       runtimeConfig: {},
-      workflow: {
-        scheduleSessionTurn: vi.fn(async () => undefined),
-        unscheduleSessionTurnsByTag: vi.fn(async () => undefined),
-      },
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       meetingEmailSender: { send },
     });

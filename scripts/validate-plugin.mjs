@@ -24,7 +24,6 @@ entry.register({
   rootDir: root,
   runtime: {},
   session: {
-    workflow: {},
     controls: { registerControlUiDescriptor: (descriptor) => registered.tabs.push(descriptor) },
   },
   registerTool: (_factory, options) => registered.tools.push(options?.name),

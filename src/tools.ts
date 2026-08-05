@@ -66,8 +66,8 @@ export function createCompanyOsTools(options: {
   toolContext: OpenClawPluginToolContext;
 }): AnyAgentTool[] {
   const service = lazyObject(options.getService);
-  const actorId = () => requireAgentId(options.toolContext);
   const store = lazyObject(() => service.store);
+  const actorId = () => store.requireAgentMember(requireAgentId(options.toolContext)).id as string;
   const tools: AnyAgentTool[] = [
     tool("company_inbox", "公司收件箱", "查看与你有关的新任务、验收、风险、未读公告和会议；读取不会自动标记已读。", Empty,
       async () => store.inbox(actorId())),
@@ -114,30 +114,40 @@ export function createCompanyOsTools(options: {
     tool("company_meeting_list", "会议列表", "查看与你有关的排队、活动和历史会议。", Empty,
       async () => store.listMeetings(actorId())),
     tool("company_meeting_status", "会议状态", "查看会议对话、当前发言者、参会角色和任务草案。", MeetingId,
-      async (p) => store.meetingView(p.meetingId, actorId())),
+      async (p) => {
+        const actor = actorId();
+        const meeting = store.meetingView(p.meetingId, actor);
+        store.acknowledgeHostContext(p.meetingId, actor);
+        return meeting;
+      }),
     tool("company_meeting_speak", "会议发言", "当前发言者提交本轮发言；主持人在没有活动轮次时也可发言。", Type.Object({
-      meetingId: Id, body: Id,
+      meetingId: Id, turnId: Type.Optional(Id), body: Id,
     }, { additionalProperties: false }), async (p) => {
-      const advance = store.speakMeeting(actorId(), p.meetingId, p.body);
-      await service.dispatchAdvance(advance);
-      return store.meetingView(p.meetingId, actorId());
+      const actor = actorId();
+      const delivery = store.speakMeeting(actor, p.meetingId, p.body, p.turnId);
+      const meeting = store.meetingView(p.meetingId, actor);
+      store.acknowledgeHostContext(p.meetingId, actor);
+      return { accepted: true, delivery, meeting };
     }),
     tool("company_meeting_delegate", "会议点名", "主持人选择下一位发言者并提出问题。", Type.Object({
       meetingId: Id, speakerId: Id, prompt: Id,
-    }, { additionalProperties: false }), async (p) => {
-      const advance = store.delegateMeeting(actorId(), p.meetingId, p.speakerId, p.prompt);
-      await service.dispatchAdvance(advance);
-      return store.meetingView(p.meetingId, actorId());
-    }),
+    }, { additionalProperties: false }), async (p) => service.delegateMeeting(actorId(), p.meetingId, p.speakerId, p.prompt)),
     tool("company_meeting_set_task_drafts", "会议任务草案", "任务会议主持人整体替换子任务草案；每个 worker 结束前必须至少得到一项。", Type.Object({
       meetingId: Id, drafts: Type.Array(TaskDraft),
-    }, { additionalProperties: false }), async (p) => store.setMeetingTaskDrafts(actorId(), p.meetingId, p.drafts)),
+    }, { additionalProperties: false }), async (p) => {
+      const actor = actorId();
+      const meeting = store.setMeetingTaskDrafts(actor, p.meetingId, p.drafts);
+      store.acknowledgeHostContext(p.meetingId, actor);
+      return meeting;
+    }),
     tool("company_meeting_end", "结束或申请结束会议", "普通会议由主持人结束；Boss 直接参会时只提交总结并申请结束，必须由 Boss 在 WebUI 批准。", Type.Object({
       meetingId: Id,
       summary: Id,
       publishNotice: Type.Optional(Type.Boolean()),
     }, { additionalProperties: false }), async (p) => {
-      const result = store.endMeeting(actorId(), p.meetingId, p.summary, Boolean(p.publishNotice));
+      const actor = actorId();
+      const result = store.endMeeting(actor, p.meetingId, p.summary, Boolean(p.publishNotice));
+      store.acknowledgeHostContext(p.meetingId, actor);
       await service.dispatchAdvance(result.advance);
       return result;
     }),

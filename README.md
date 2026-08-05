@@ -11,13 +11,13 @@
 - 会议可设置 `bossParticipates=true`：进入会议室后等待 Boss 手动开始，主持人只能申请结束，最终结束权固定属于 Boss。
 - 公告不可编辑；修正通过 `supersedesNoticeId` 发布新公告。Boss 还可在 WebUI 二次确认后审计删除公告。
 - Boss 写操作由服务端固定记录为 `actor=boss`；Agent 身份只读取可信的 `toolContext.agentId`。
-- 任务与公告不主动唤醒 Agent；会议点名会调度 `agent:<agentId>:main`。
+- 任务与公告不主动唤醒 Agent；会议点名由插件同步调用 `agent:<agentId>:main`，主持人的原工具调用会等待并校验实际发言。
 
 ## 技术结构
 
 ```text
 OpenClaw Gateway
-├── CompanyOsService（恢复、超时扫描、SSE、会议调度）
+├── CompanyOsService（同步会议编排、持久主持人队列、恢复、超时扫描、SSE）
 ├── 28 个 company_* Agent 工具
 ├── /plugins/company-os/api/v1/*（Gateway 鉴权，仅 API）
 ├── /plugins/company-os-ui/*（无敏感数据的 WebUI 静态壳）
@@ -26,7 +26,7 @@ OpenClaw Gateway
     ├── organization + audit
     ├── task tree + versions + proof
     ├── notices + read marks
-    └── meeting queue + transcript + turns + drafts + email outbox
+    └── meeting queue + transcript + turns + context watermarks + dispatch/email outbox
 ```
 
 前端是 React + Vite，包含三个真实路由：
@@ -75,6 +75,16 @@ Agent 申请会议时可传入 `bossParticipates: true`。该模式有三个额�
 2. 会议进入会议室后不会唤醒主持人，也不会触发主持人超时；Boss 必须在会议室页面点击「我已进入，开始会议」。
 3. 主持人调用 `company_meeting_end` 只会提交总结和结束申请。Boss 在 WebUI 批准后才会原子创建任务/公告并释放会议室，也可退回主持人继续讨论。
 
+Boss 点击开始后接口立即返回，会议室显示“主持人启动中”。Boss 开场原文和主持人启动任务在同一 SQLite 事务中持久化；Gateway 重启时会恢复未完成任务，但不会重复执行已经成功的任务。
+
+### 同步会议编排
+
+主持人调用 `company_meeting_delegate` 后，插件通过 `openclaw agent --agent <id> --message-file <private-file> --json` 直接调用目标 Agent 的 main session，并保持主持人工具调用等待。目标 Agent 必须把提示中的 `meetingId` 和 `turnId` 一起传给 `company_meeting_speak`；插件同时校验会议、当前轮次和可信的 `toolContext.agentId`，再把发言返回给主持人。若 Agent 只返回普通文本而没有调用发言工具，系统会审计代录并标记 `completionSource=fallback`；调用失败或超时则以结构化失败轮次把控制权交还主持人。
+
+每名主持人和参会者都有独立的增量上下文水位。只有成功发言、审计代录或成功交付给主持人后才推进水位；提示中使用组织成员姓名，并仍保留 Agent ID 供审计定位。Boss WebUI 始终展示完整会议记录。
+
+组织成员 ID 是 Company OS 内部稳定主键，可以与 OpenClaw 配置中的 Agent ID 不同。例如成员 `main` 可以绑定 Agent `jia-goushi`：会议记录和关系仍使用 `main`，实际 CLI 调用则始终解析为经过配置校验的 `jia-goushi`。若主持人的 CLI 最终结果为空，但本次调用期间已经产生经过工具校验的会议进展，持久调度会按成功处理，避免把已完成的主持过程误报为启动失败。
+
 邮件默认复用 `~/.config/mail-skills/.env` 的默认 SMTP 账号，并发送到该账号自身。本机已有的 QQ 邮箱配置无需复制授权码。可以通过 `bossEmailNotifications.account` 选择命名账号，或用 `recipient`、`configPath` 覆盖收件地址和配置路径。
 
 ## Agent 工具
@@ -91,7 +101,7 @@ Agent 申请会议时可传入 `bossParticipates: true`。该模式有三个额�
 
 ## 测试
 
-`npm test` 覆盖组织环、非法员工、跨级派发、proof、版本、阻塞/停滞风险、取消分支、逐层关单、统一 inbox、单会议室、Boss `@` 插话、Boss 参会开始/结束闸门、QQ SMTP 配置、持久邮件 outbox、数据库迁移、任务会议原子回滚、超时、重启恢复、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
+`npm test` 覆盖组织环、非法员工、跨级派发、proof、版本、阻塞/停滞风险、取消分支、逐层关单、统一 inbox、单会议室、同步点名、可信发言校验、审计代录、增量上下文、Boss `@` FIFO、Boss 参会开始/结束闸门、持久主持人任务恢复、QQ SMTP 配置、数据库迁移、任务会议原子回滚、超时、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
 
 `npm run plugin:validate` 还会验证构建产物、清单与 28 个工具契约、长驻服务、相互隔离的 WebUI/API 路由，以及 `operator.write` Control UI 标签页。
 
@@ -101,7 +111,7 @@ Agent 申请会议时可传入 `bossParticipates: true`。该模式有三个额�
 
 - [openclaw-plugin-company-board](https://github.com/LobsterFarmerAmp/openclaw-plugin-company-board)：参考 SQLite/WAL、迁移、`toolContext.agentId` 身份边界和 read mark 思路。
 - [company-board-viewer](https://github.com/LobsterFarmerAmp/company-board-viewer)：参考 React/TypeScript 的轻量卡片、徽章和排版基础；Python/FastAPI 后端未保留。
-- 本地 `openclaw-plugin-meeting-orchestrator`：参考主持人点名、发言权和总结概念；会议引擎已用 TypeScript 重写，不保留飞书、Tunnel 或外部 Python 编排。
+- [openclaw-plugin-meeting-orchestrator](https://github.com/LobsterFarmerAmp/openclaw-plugin-meeting-orchestrator)：以其 `meeting.py` 已验证的“主持人同步调用目标 Agent、等待并验证发言”闭环为编排基线；Company OS 用 TypeScript 原生重写，不保留飞书、Tunnel 或 Python 运行时。
 - OpenClaw Workboard：仅借鉴 proof、blocked、stale、review 语义，不复用其数据模型或 API。
 
 现有插件仓库保持不变；本项目只提供新的 `company_*` 接口，不提供旧工具兼容别名。

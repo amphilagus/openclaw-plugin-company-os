@@ -54,7 +54,6 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
           allowedAgentIds: resolveConfiguredAgentIds(runtimeConfig),
           config,
           runtimeConfig,
-          workflow: api.session.workflow,
           logger,
         });
       }

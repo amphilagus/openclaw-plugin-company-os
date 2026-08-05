@@ -1,50 +1,42 @@
 import type { PluginLogger } from "openclaw/plugin-sdk/core";
 
+import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
 import { resolveAgentVisualIdentity, type AgentVisualIdentity } from "./identity.js";
 import { CompanyOsStore } from "./store.js";
-import type { MeetingAdvance, ResolvedCompanyOsConfig, ServiceEvent } from "./types.js";
-
-type SessionWorkflow = {
-  scheduleSessionTurn(params: {
-    sessionKey: string;
-    agentId: string;
-    message: string;
-    delayMs: number;
-    deliveryMode: "announce";
-    deleteAfterRun: true;
-    tag: string;
-  }): Promise<unknown>;
-  unscheduleSessionTurnsByTag(params: { sessionKey: string; tag: string }): Promise<unknown>;
-};
+import type { MeetingAdvance, MeetingTurnDelivery, MeetingTurnDispatch, ResolvedCompanyOsConfig, ServiceEvent } from "./types.js";
 
 export class CompanyOsService {
   readonly store: CompanyOsStore;
   private readonly config: ResolvedCompanyOsConfig;
-  private readonly workflow: SessionWorkflow;
   private readonly logger: PluginLogger;
   private readonly runtimeConfig: unknown;
   private readonly meetingEmailSender: MeetingEmailSender;
+  private readonly agentInvoker: AgentInvoker;
   private readonly identityCache = new Map<string, AgentVisualIdentity>();
   private readonly listeners = new Set<(event: ServiceEvent) => void>();
   private readonly eventHistory: ServiceEvent[] = [];
   private scanTimer?: NodeJS.Timeout;
   private emailFlush?: Promise<void>;
+  private dispatchFlush?: Promise<void>;
+  private readonly activeTurnDeliveries = new Set<Promise<MeetingTurnDelivery>>();
+  private readonly lifecycleAbort = new AbortController();
+  private stopping = false;
 
   constructor(options: {
     databasePath: string;
     allowedAgentIds: Iterable<string>;
     config: ResolvedCompanyOsConfig;
     runtimeConfig: unknown;
-    workflow: SessionWorkflow;
     logger: PluginLogger;
     meetingEmailSender?: MeetingEmailSender;
+    agentInvoker?: AgentInvoker;
   }) {
     this.config = options.config;
     this.runtimeConfig = options.runtimeConfig;
-    this.workflow = options.workflow;
     this.logger = options.logger;
     this.meetingEmailSender = options.meetingEmailSender ?? new SmtpMeetingEmailSender(options.config.bossEmailNotifications);
+    this.agentInvoker = options.agentInvoker ?? new OpenClawCliAgentInvoker();
     this.store = new CompanyOsStore({
       databasePath: options.databasePath,
       allowedAgentIds: options.allowedAgentIds,
@@ -54,8 +46,10 @@ export class CompanyOsService {
   }
 
   async start() {
+    this.store.recoverAgentDispatches();
     await this.recover();
     await this.flushMeetingEmails();
+    this.kickHostDispatches();
     this.scanTimer = setInterval(() => {
       void this.scanTimeouts().catch((error) => this.logger.error(`company-os timeout scan failed: ${formatError(error)}`));
     }, 30_000);
@@ -63,7 +57,13 @@ export class CompanyOsService {
   }
 
   async stop() {
+    this.stopping = true;
     if (this.scanTimer) clearInterval(this.scanTimer);
+    this.lifecycleAbort.abort();
+    await Promise.allSettled([
+      ...(this.dispatchFlush ? [this.dispatchFlush] : []),
+      ...this.activeTurnDeliveries,
+    ]);
     this.listeners.clear();
     this.store.close();
   }
@@ -121,20 +121,38 @@ export class CompanyOsService {
 
   async dispatchAdvance(advance: MeetingAdvance | null | undefined) {
     await this.flushMeetingEmails();
-    if (!advance?.schedule) return;
-    const schedule = advance.schedule;
-    const sessionKey = `agent:${schedule.agentId}:main`;
-    await this.workflow.unscheduleSessionTurnsByTag({ sessionKey, tag: schedule.tag });
-    await this.workflow.scheduleSessionTurn({
-      sessionKey,
-      agentId: schedule.agentId,
-      message: schedule.prompt,
-      delayMs: 0,
-      deliveryMode: "announce",
-      deleteAfterRun: true,
-      tag: schedule.tag,
-    });
-    this.logger.info(`company-os scheduled meeting ${schedule.meetingId} for ${sessionKey}`);
+    if (advance?.hostDispatchId) this.kickHostDispatches();
+  }
+
+  async delegateMeeting(actorId: string, meetingId: string, speakerId: string, prompt: string) {
+    const priorityDeliveries = await this.drainPendingInterventions(meetingId);
+    if (priorityDeliveries.length > 0) {
+      this.store.acknowledgeHostContext(meetingId, actorId);
+      return {
+        meeting: this.store.meetingView(meetingId, actorId),
+        turn: null,
+        delivery: null,
+        interventions: priorityDeliveries,
+        deferred: true,
+      };
+    }
+    const turn = this.store.delegateMeeting(actorId, meetingId, speakerId, prompt);
+    const delivery = await this.deliverTurn(turn);
+    const interventions = await this.drainPendingInterventions(meetingId);
+    this.store.acknowledgeHostContext(meetingId, actorId);
+    return {
+      meeting: this.store.meetingView(meetingId, actorId),
+      turn: {
+        id: turn.turnId,
+        speakerId: turn.speakerId,
+        agentId: turn.agentId,
+        contextFromSequence: turn.fromSequence,
+        contextToSequence: turn.toSequence,
+      },
+      delivery,
+      interventions,
+      deferred: false,
+    };
   }
 
   private emit(event: ServiceEvent) {
@@ -165,6 +183,101 @@ export class CompanyOsService {
     );
     for (const advance of advances) await this.dispatchAdvance(advance);
     if (advances.length === 0) await this.flushMeetingEmails();
+    this.kickHostDispatches();
+  }
+
+  private deliverTurn(turn: MeetingTurnDispatch): Promise<MeetingTurnDelivery> {
+    const delivery = this.runTurnDelivery(turn);
+    this.activeTurnDeliveries.add(delivery);
+    void delivery.then(
+      () => this.activeTurnDeliveries.delete(delivery),
+      () => this.activeTurnDeliveries.delete(delivery),
+    );
+    return delivery;
+  }
+
+  private async runTurnDelivery(turn: MeetingTurnDispatch): Promise<MeetingTurnDelivery> {
+    let invoked;
+    try {
+      invoked = await this.agentInvoker.invoke({
+        agentId: turn.agentId,
+        prompt: turn.prompt,
+        timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+        signal: this.lifecycleAbort.signal,
+      });
+    } catch (error) {
+      const message = `agent invoker crashed: ${formatError(error)}`;
+      return this.store.isMeetingTurnWaiting(turn.turnId)
+        ? this.store.failMeetingTurn(turn.turnId, message)
+        : this.store.meetingTurnDelivery(turn.turnId);
+    }
+    if (!this.store.isMeetingTurnWaiting(turn.turnId)) {
+      const verified = this.store.meetingTurnDelivery(turn.turnId);
+      this.logger.info(`company-os verified meeting turn ${turn.turnId} from agent:${turn.agentId}:main via ${verified.completionSource}`);
+      return verified;
+    }
+    if (invoked.ok) {
+      const fallback = this.store.completeMeetingTurnFallback(turn.turnId, turn.speakerId, turn.agentId, invoked.text, invoked.raw);
+      this.logger.warn(`company-os auto-recorded fallback speech for meeting turn ${turn.turnId} from agent:${turn.agentId}:main`);
+      return fallback;
+    }
+    const failed = this.store.failMeetingTurn(turn.turnId, invoked.error);
+    this.logger.error(`company-os meeting turn ${turn.turnId} failed for agent:${turn.agentId}:main: ${invoked.error}`);
+    return failed;
+  }
+
+  private async drainPendingInterventions(meetingId: string) {
+    const deliveries: MeetingTurnDelivery[] = [];
+    for (let count = 0; count < 100; count += 1) {
+      const turn = this.store.nextPendingInterventionTurn(meetingId);
+      if (!turn) return deliveries;
+      deliveries.push(await this.deliverTurn(turn));
+    }
+    throw new Error("too many pending Boss interventions in one meeting advance");
+  }
+
+  private kickHostDispatches() {
+    if (this.stopping || this.dispatchFlush) return;
+    this.dispatchFlush = this.flushHostDispatches()
+      .catch((error) => this.logger.error(`company-os host dispatch loop failed: ${formatError(error)}`))
+      .finally(() => {
+        this.dispatchFlush = undefined;
+        if (!this.stopping && this.store.hasPendingHostDispatches()) this.kickHostDispatches();
+      });
+  }
+
+  private async flushHostDispatches() {
+    while (!this.stopping) {
+      const dispatch = this.store.claimNextHostDispatch();
+      if (!dispatch) return;
+      try {
+        await this.drainPendingInterventions(dispatch.meetingId);
+        const context = this.store.buildMeetingContext(dispatch.meetingId, dispatch.targetMemberId, {
+          role: "host",
+          instruction: dispatch.reason,
+        });
+        this.store.setHostDispatchContext(dispatch.id, context);
+        const result = await this.agentInvoker.invoke({
+          agentId: dispatch.targetAgentId,
+          prompt: context.prompt,
+          timeoutSeconds: this.config.hostIdleTimeoutSeconds,
+          signal: this.lifecycleAbort.signal,
+        });
+        if (result.ok || this.store.hostDispatchHasProgress(dispatch.id)) {
+          this.store.completeHostDispatch(dispatch.id, context.toSequence);
+          if (!result.ok) {
+            this.logger.warn(`company-os accepted host dispatch ${dispatch.id} after verified meeting progress despite CLI result: ${result.error}`);
+          }
+          this.logger.info(`company-os completed host dispatch ${dispatch.id} for agent:${dispatch.targetAgentId}:main`);
+        } else {
+          this.store.failHostDispatch(dispatch.id, result.error);
+          this.logger.error(`company-os host dispatch ${dispatch.id} failed for agent:${dispatch.targetAgentId}:main: ${result.error}`);
+        }
+      } catch (error) {
+        this.store.failHostDispatch(dispatch.id, formatError(error));
+        this.logger.error(`company-os host dispatch ${dispatch.id} crashed: ${formatError(error)}`);
+      }
+    }
   }
 
   private async flushMeetingEmails(): Promise<void> {

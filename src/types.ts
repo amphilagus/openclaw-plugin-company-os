@@ -60,17 +60,34 @@ export type MeetingParticipantInput = {
   role: ParticipantRole;
 };
 
-export type ScheduleMeetingTurn = {
-  meetingId: string;
-  agentId: string;
-  prompt: string;
-  turnId?: string;
-  tag: string;
+export type MeetingAdvance = {
+  hostDispatchId?: string;
+  activatedMeetingId?: string;
 };
 
-export type MeetingAdvance = {
-  schedule?: ScheduleMeetingTurn;
-  activatedMeetingId?: string;
+export type MeetingContextEnvelope = {
+  meetingId: string;
+  memberId: string;
+  fromSequence: number;
+  toSequence: number;
+  prompt: string;
+};
+
+export type MeetingTurnDispatch = MeetingContextEnvelope & {
+  turnId: string;
+  speakerId: string;
+  agentId: string;
+};
+
+export type MeetingTurnDelivery = {
+  turnId: string;
+  speakerId: string;
+  status: "completed" | "failed";
+  body: string | null;
+  completionSource: "tool" | "fallback" | null;
+  error: string | null;
+  contextFromSequence: number;
+  contextToSequence: number;
 };
 
 export type ServiceEvent = {
