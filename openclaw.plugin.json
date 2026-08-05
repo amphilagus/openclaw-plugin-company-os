@@ -1,0 +1,65 @@
+{
+  "id": "company-os",
+  "name": "Company OS",
+  "description": "公司级会议、多级任务和告示板治理系统。",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "participantTurnTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 60,
+        "default": 600
+      },
+      "hostIdleTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 60,
+        "default": 1800
+      },
+      "taskStaleAfterHours": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 72
+      },
+      "databasePath": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "company_inbox",
+      "company_org_list",
+      "company_org_add",
+      "company_org_update",
+      "company_org_deactivate",
+      "company_notice_list",
+      "company_notice_read",
+      "company_notice_publish",
+      "company_meeting_request",
+      "company_meeting_list",
+      "company_meeting_status",
+      "company_meeting_speak",
+      "company_meeting_delegate",
+      "company_meeting_set_task_drafts",
+      "company_meeting_end",
+      "company_meeting_cancel",
+      "company_task_list",
+      "company_task_read",
+      "company_task_create",
+      "company_task_start",
+      "company_task_progress",
+      "company_task_revise",
+      "company_task_block",
+      "company_task_unblock",
+      "company_task_submit",
+      "company_task_review",
+      "company_task_reassign",
+      "company_task_cancel"
+    ]
+  }
+}

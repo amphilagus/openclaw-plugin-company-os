@@ -1,0 +1,264 @@
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+
+import { getMeeting, getSnapshot, getTask, post, subscribeToChanges } from "./api";
+import type { MeetingDetail, MeetingSummary, Notice, Snapshot, Task, TaskDetail } from "./types";
+
+type Route = "notices" | "meeting-room" | "tasks";
+
+export default function App() {
+  const [route, setRoute] = useState<Route>(routeFromPath());
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [live, setLive] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    try {
+      setSnapshot(await getSnapshot());
+      setError(null);
+    } catch (reason) {
+      setError(messageOf(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    let timer = 0;
+    return subscribeToChanges(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => void load(true), 180);
+    }, setLive);
+  }, [load]);
+  useEffect(() => {
+    const onPop = () => setRoute(routeFromPath());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const navigate = (next: Route) => {
+    window.history.pushState({}, "", `/plugins/company-os/${next}`);
+    setRoute(next);
+  };
+
+  return <div className="app-shell">
+    <header className="topbar">
+      <div className="brand"><span className="brand-mark">司</span><div><strong>Company OS</strong><small>公司治理控制台</small></div></div>
+      <nav>
+        <Nav active={route === "meeting-room"} onClick={() => navigate("meeting-room")} icon="◉">会议室</Nav>
+        <Nav active={route === "tasks"} onClick={() => navigate("tasks")} icon="⌘">任务</Nav>
+        <Nav active={route === "notices"} onClick={() => navigate("notices")} icon="◇">告示板</Nav>
+      </nav>
+      <div className={`live ${live ? "online" : ""}`}><i />{live ? "实时连接" : "重连中"}</div>
+    </header>
+    {error ? <div className="global-error">{error}<button onClick={() => void load()}>重试</button></div> : null}
+    <main className="workspace">
+      {loading && !snapshot ? <Loading /> : null}
+      {snapshot && route === "notices" ? <NoticesPage snapshot={snapshot} reload={load} /> : null}
+      {snapshot && route === "meeting-room" ? <MeetingRoomPage snapshot={snapshot} reload={load} /> : null}
+      {snapshot && route === "tasks" ? <TasksPage snapshot={snapshot} reload={load} /> : null}
+    </main>
+  </div>;
+}
+
+function Nav({ active, icon, children, onClick }: { active: boolean; icon: string; children: string; onClick: () => void }) {
+  return <button className={active ? "active" : ""} onClick={onClick}><span>{icon}</span>{children}</button>;
+}
+
+function NoticesPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: boolean) => Promise<void> }) {
+  const [history, setHistory] = useState(false);
+  const [correcting, setCorrecting] = useState<Notice | null>(null);
+  const [busy, setBusy] = useState(false);
+  const notices = snapshot.notices.filter((notice) => history || notice.effective);
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      await post("/notices", { title: data.get("title"), body: data.get("body"), supersedesNoticeId: correcting?.id });
+      event.currentTarget.reset();
+      setCorrecting(null);
+      await reload(true);
+    } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
+  };
+  return <>
+    <PageHeader eyebrow="CORPORATE CONSENSUS" title="公司告示板" summary="公告构成全体员工共同遵循的底层共识。公告不可编辑，修正通过新公告替代。">
+      <button className="ghost" onClick={() => setHistory(!history)}>{history ? "只看当前共识" : "查看历史与更正"}</button>
+    </PageHeader>
+    <div className="notices-layout">
+      <section className="notice-feed">
+        {notices.length === 0 ? <Empty title="还没有公告" body="会议汇报与管理公告会出现在这里。" /> : notices.map((notice) =>
+          <article className={`notice-card ${notice.effective ? "" : "superseded"}`} key={notice.id}>
+            <div className="notice-meta"><Badge tone={notice.kind}>{noticeKind(notice.kind)}</Badge><time>{formatTime(notice.createdAt)}</time><span>发布者 {notice.authorId}</span></div>
+            <h2>{notice.title}</h2>
+            <div className="notice-body">{notice.body}</div>
+            <footer>
+              <span>阅读覆盖 <b>{notice.readCount}/{notice.activeEmployeeCount}</b></span>
+              <div className="coverage"><i style={{ width: `${notice.activeEmployeeCount ? notice.readCount / notice.activeEmployeeCount * 100 : 0}%` }} /></div>
+              {notice.supersededById ? <span className="danger-text">已被后续公告替代</span> : null}
+              {notice.effective ? <button className="text-button" onClick={() => setCorrecting(notice)}>发布更正</button> : null}
+            </footer>
+          </article>)}
+      </section>
+      <aside className="compose-panel panel">
+        <div className="panel-title"><span>{correcting ? "发布更正" : "发布公告"}</span>{correcting ? <button className="icon-button" onClick={() => setCorrecting(null)}>×</button> : null}</div>
+        {correcting ? <div className="correction-target">替代：{correcting.title}</div> : null}
+        <form onSubmit={submit}>
+          <label>标题<input name="title" required placeholder="一句话说明新的公司共识" /></label>
+          <label>正文<textarea name="body" required rows={10} placeholder="说明背景、决定、影响范围和执行要求……" /></label>
+          <button className="primary" disabled={busy}>{busy ? "发布中…" : correcting ? "发布并替代旧公告" : "发布不可变公告"}</button>
+        </form>
+      </aside>
+    </div>
+  </>;
+}
+
+function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: boolean) => Promise<void> }) {
+  const activeId = snapshot.meetings.active?.id;
+  const [meeting, setMeeting] = useState<MeetingDetail | null>(null);
+  const [target, setTarget] = useState("");
+  const [body, setBody] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!activeId) { setMeeting(null); return; }
+    void getMeeting(activeId).then(setMeeting).catch((error) => window.console.error(error));
+  }, [activeId, snapshot.generatedAt]);
+  const interject = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!meeting || !body.trim()) return;
+    setBusy(true);
+    try {
+      setMeeting(await post<MeetingDetail>(`/meetings/${meeting.id}/interject`, { body, targetId: target || undefined }));
+      setBody(""); setTarget(""); await reload(true);
+    } catch (error) { window.alert(messageOf(error)); } finally { setBusy(false); }
+  };
+  const reorder = async (item: MeetingSummary, delta: number) => {
+    await post(`/meetings/${item.id}/reorder`, { targetPosition: item.queuePosition + delta });
+    await reload(true);
+  };
+  const cancel = async (item: MeetingSummary) => {
+    const reason = window.prompt("取消这场排队会议的原因：");
+    if (!reason) return;
+    await post(`/meetings/${item.id}/cancel`, { reason });
+    await reload(true);
+  };
+  return <>
+    <PageHeader eyebrow="SINGLE WORLDLINE · ONE ROOM" title="公司会议室" summary="所有公司会议严格串行。主持人控制发言权，Boss 插话排在当前发言之后。">
+      <span className={`room-state ${meeting ? "occupied" : "free"}`}>{meeting ? "会议进行中" : "会议室空闲"}</span>
+    </PageHeader>
+    {!meeting ? <Empty title="会议室现在是空的" body={snapshot.meetings.queue.length ? "排队会议即将由系统启动。" : "员工可通过 company_meeting_request 申请会议。"} /> :
+      <div className="meeting-grid">
+        <section className="meeting-stage panel">
+          <div className="meeting-head">
+            <div><div className="eyebrow">{meeting.type === "task" ? "任务会议" : "普通讨论"}</div><h2>{meeting.title}</h2><p>{meeting.agenda}</p></div>
+            <div className="meeting-facts"><span>主持人 <b>{meeting.hostId}</b></span>{meeting.parentTaskId ? <span>父任务 <code>{shortId(meeting.parentTaskId)}</code></span> : null}</div>
+          </div>
+          <div className="transcript">
+            {meeting.messages.map((message) => <div className={`message ${message.authorKind}`} key={message.id}>
+              <div className="avatar">{message.authorKind === "boss" ? "B" : message.authorKind === "system" ? "·" : (message.authorId ?? "?").slice(0, 1).toUpperCase()}</div>
+              <div><div className="message-meta"><b>{message.authorKind === "boss" ? "Boss" : message.authorKind === "system" ? "系统" : message.authorId}</b>{message.targetId ? <span>@{message.targetId}</span> : null}<time>{formatTime(message.createdAt)}</time></div><p>{message.body}</p></div>
+            </div>)}
+            {meeting.currentTurn ? <div className="speaking"><i />等待 <b>{meeting.currentTurn.speakerId}</b> 发言：{meeting.currentTurn.prompt}</div> : <div className="host-control">控制权在主持人 {meeting.hostId}</div>}
+          </div>
+          <form className="boss-composer" onSubmit={interject}>
+            <div className="boss-label">BOSS 插话</div>
+            <select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">共享记录（交给主持人）</option><option value={meeting.hostId}>@{meeting.hostId} · 主持人</option>{meeting.participants.map((p) => <option value={p.agentId} key={p.agentId}>@{p.agentId} · {p.role}</option>)}</select>
+            <textarea value={body} onChange={(event) => setBody(event.target.value)} rows={3} placeholder="输入你的判断、追问或方向修正……" required />
+            <button className="primary" disabled={busy}>{busy ? "排队中…" : target ? `在当前发言后 @${target}` : "加入会议记录"}</button>
+          </form>
+        </section>
+        <aside className="meeting-side">
+          <section className="panel compact"><div className="panel-title">参会角色</div><div className="people-list"><Person id={meeting.hostId} role="主持人" />{meeting.participants.map((p) => <Person key={p.agentId} id={p.agentId} role={p.role === "worker" ? "执行者" : "顾问"} />)}</div></section>
+          <section className="panel compact"><div className="panel-title">任务草案 <span>{meeting.taskDrafts.length}</span></div>{meeting.type === "discussion" ? <p className="muted">普通讨论会不能生成任务。</p> : meeting.taskDrafts.length ? meeting.taskDrafts.map((draft) => <div className="draft" key={draft.id}><b>{draft.title}</b><span>→ {draft.assigneeId}</span><small>{draft.acceptanceCriteria}</small></div>) : <p className="muted">主持人尚未提交任务草案。</p>}</section>
+        </aside>
+      </div>}
+    <QueueSection queue={snapshot.meetings.queue} history={snapshot.meetings.history} reorder={reorder} cancel={cancel} />
+  </>;
+}
+
+function QueueSection({ queue, history, reorder, cancel }: { queue: MeetingSummary[]; history: MeetingSummary[]; reorder: (m: MeetingSummary, d: number) => void; cancel: (m: MeetingSummary) => void }) {
+  return <section className="queue-section"><div className="section-title"><div><span>WAITING LINE</span><h2>会议队列</h2></div><strong>{queue.length}</strong></div>
+    <div className="queue-list">{queue.length ? queue.map((item, index) => <div className="queue-item" key={item.id}><span className="queue-number">{index + 1}</span><div><b>{item.title}</b><small>{item.type === "task" ? "任务会议" : "普通讨论"} · 主持人 {item.hostId} · {formatTime(item.createdAt)}</small></div><div className="queue-actions"><button disabled={index === 0} onClick={() => void reorder(item, -1)}>↑</button><button disabled={index === queue.length - 1} onClick={() => void reorder(item, 1)}>↓</button><button className="danger" onClick={() => void cancel(item)}>取消</button></div></div>) : <p className="muted">当前没有排队会议。</p>}</div>
+    {history.length ? <details className="history"><summary>查看会议历史（{history.length}）</summary>{history.map((item) => <div className="history-row" key={item.id}><Badge tone={item.status}>{meetingStatus(item.status)}</Badge><b>{item.title}</b><span>{item.hostId}</span><time>{formatTime(item.endedAt ?? item.createdAt)}</time></div>)}</details> : null}
+  </section>;
+}
+
+function TasksPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: boolean) => Promise<void> }) {
+  const [selectedId, setSelectedId] = useState(() => new URLSearchParams(location.search).get("task") ?? snapshot.tasks[0]?.id ?? "");
+  const [detail, setDetail] = useState<TaskDetail | null>(null);
+  const [status, setStatus] = useState("all");
+  const [assignee, setAssignee] = useState("all");
+  const [search, setSearch] = useState("");
+  const roots = snapshot.tasks.filter((task) => !task.parentId);
+  useEffect(() => { if (selectedId) void getTask(selectedId).then(setDetail).catch((error) => window.alert(messageOf(error))); }, [selectedId, snapshot.generatedAt]);
+  const visible = (task: Task) => (status === "all" || task.status === status) && (assignee === "all" || task.assigneeId === assignee) && (!search || `${task.title} ${task.description}`.toLowerCase().includes(search.toLowerCase()));
+  const createRoot = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
+    try { const task = await post<Task>("/tasks", Object.fromEntries(data)); form.reset(); await reload(true); setSelectedId(task.id); } catch (error) { window.alert(messageOf(error)); }
+  };
+  return <>
+    <PageHeader eyebrow="STRICT HIERARCHY · BOTTOM-UP CLOSURE" title="多级任务系统" summary="每个任务只有一名负责人。子任务全部终结后，上一级才有资格提交验收。" />
+    <div className="task-toolbar panel"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索任务标题或说明" /><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="all">全部状态</option>{["assigned", "in_progress", "review", "blocked", "closed", "canceled"].map((value) => <option key={value}>{value}</option>)}</select><select value={assignee} onChange={(e) => setAssignee(e.target.value)}><option value="all">全部负责人</option>{snapshot.organization.filter((m) => m.active && m.kind === "agent").map((m) => <option value={m.id} key={m.id}>{m.name} · {m.id}</option>)}</select></div>
+    <div className="tasks-layout">
+      <section className="task-tree panel">
+        <div className="panel-title">任务树 <span>{snapshot.tasks.length}</span></div>
+        {roots.length ? roots.map((root) => <TaskNode key={root.id} task={root} all={snapshot.tasks} visible={visible} selectedId={selectedId} select={setSelectedId} depth={0} />) : <Empty title="还没有根任务" body="Boss 可在右侧创建第一个战略根任务。" />}
+      </section>
+      <aside className="task-detail panel">{detail ? <TaskDetailView detail={detail} members={snapshot.organization.filter((m) => m.active)} reload={reload} /> : <RootTaskForm members={snapshot.organization.filter((m) => m.active && m.managerId === "boss")} submit={createRoot} />}</aside>
+    </div>
+    <section className="new-root panel"><div><span className="eyebrow">BOSS ONLY</span><h3>创建新的战略根任务</h3><p>根任务只能派给 Boss 的一级直属员工。</p></div><RootTaskForm members={snapshot.organization.filter((m) => m.active && m.managerId === "boss")} submit={createRoot} compact /></section>
+  </>;
+}
+
+function TaskNode({ task, all, visible, selectedId, select, depth }: { task: Task; all: Task[]; visible: (t: Task) => boolean; selectedId: string; select: (id: string) => void; depth: number }) {
+  const children = all.filter((item) => item.parentId === task.id);
+  const subtreeVisible = visible(task) || children.some((child) => visible(child));
+  if (!subtreeVisible) return null;
+  return <div className="task-branch">
+    <button className={`task-row ${selectedId === task.id ? "selected" : ""}`} style={{ paddingLeft: 14 + depth * 22 }} onClick={() => select(task.id)}>
+      <span className="tree-joint">{depth ? "└" : "◆"}</span><span className="task-main"><b>{task.title}</b><small>{task.assigneeId} · v{task.revision} · {shortId(task.id)}</small></span><Badge tone={task.status}>{taskStatus(task.status)}</Badge>
+      {task.risks.blockedDescendants ? <span className="risk blocked">阻塞 {task.risks.blockedDescendants}</span> : null}{task.risks.stale || task.risks.staleDescendants ? <span className="risk stale">停滞 {Number(task.risks.stale) + task.risks.staleDescendants}</span> : null}{task.childCounts.canceled ? <span className="risk canceled">取消 {task.childCounts.canceled}</span> : null}
+    </button>
+    {children.map((child) => <TaskNode key={child.id} task={child} all={all} visible={visible} selectedId={selectedId} select={select} depth={depth + 1} />)}
+  </div>;
+}
+
+function TaskDetailView({ detail, members, reload }: { detail: TaskDetail; members: Snapshot["organization"]; reload: (quiet?: boolean) => Promise<void> }) {
+  const action = async (name: string, body: Record<string, unknown>) => {
+    try { await post(`/tasks/${detail.id}/${name}`, body); await reload(true); } catch (error) { window.alert(messageOf(error)); }
+  };
+  const review = detail.status === "review";
+  return <div>
+    <div className="detail-head"><Badge tone={detail.status}>{taskStatus(detail.status)}</Badge><code>{detail.id}</code></div>
+    <h2>{detail.title}</h2><div className="detail-meta"><span>负责人 <b>{detail.assigneeId}</b></span><span>派发者 <b>{detail.issuerId}</b></span><span>版本 <b>v{detail.revision}</b></span></div>
+    {detail.childCounts.canceled ? <div className="warning">该任务包含 {detail.childCounts.canceled} 个已取消直接子任务。验收前请检查取消原因。</div> : null}
+    <DetailBlock title="任务说明">{detail.description}</DetailBlock><DetailBlock title="验收标准">{detail.acceptanceCriteria}</DetailBlock>
+    {detail.blockedReason ? <DetailBlock title="阻塞原因">{detail.blockedReason}</DetailBlock> : null}
+    {detail.submissions[0] ? <DetailBlock title="最近提交"><b>{detail.submissions[0].summary}</b>{detail.submissions[0].evidence.map((item, i) => <div className="evidence" key={i}><Badge tone={item.type}>{item.type}</Badge><span>{item.label}</span><code>{item.path ?? item.url ?? item.command ?? item.note}</code></div>)}</DetailBlock> : null}
+    {detail.progress.length ? <DetailBlock title="进度记录">{detail.progress.map((item) => <div className="progress-entry" key={item.id}><span>{formatTime(item.createdAt)} · {item.authorId}</span><p>{item.body}</p></div>)}</DetailBlock> : null}
+    {detail.versions.length > 1 ? <DetailBlock title="版本历史">{detail.versions.map((version) => <div className="version-entry" key={version.revision}><b>v{version.revision}</b><span>{version.changedBy} · {version.reason}</span><time>{formatTime(version.createdAt)}</time></div>)}</DetailBlock> : null}
+    {review ? <div className="review-actions"><button className="primary" onClick={() => void action("review", { decision: "accept", feedback: window.prompt("验收意见（可选）：") ?? "" })}>验收并关闭</button><button className="danger-button" onClick={() => { const feedback = window.prompt("驳回原因："); if (feedback) void action("review", { decision: "reject", feedback }); }}>驳回</button></div> : null}
+    <details><summary>版本、进度与审计时间线</summary><div className="timeline">{detail.audit.map((item) => <div key={item.id}><i /><span>{formatTime(item.createdAt)}</span><b>{item.actorId}</b><code>{item.action}</code>{item.reason ? <small>{item.reason}</small> : null}</div>)}</div></details>
+    {!(["closed", "canceled"] as string[]).includes(detail.status) ? <div className="fallback-actions"><button onClick={() => { const reason = window.prompt("取消原因："); if (reason) void action("cancel", { reason }); }}>带审计取消</button><button onClick={() => { const assigneeId = window.prompt(`新负责人（必须是 ${detail.issuerId} 的直属下属）：`, detail.assigneeId); const reason = assigneeId && window.prompt("重派原因："); if (assigneeId && reason) void action("reassign", { assigneeId, reason }); }}>全局重派</button></div> : null}
+  </div>;
+}
+
+function RootTaskForm({ members, submit, compact = false }: { members: Snapshot["organization"]; submit: (e: FormEvent<HTMLFormElement>) => void; compact?: boolean }) {
+  return <form className={compact ? "root-form compact-form" : "root-form"} onSubmit={submit}><label>任务标题<input name="title" required placeholder="明确可验收的战略目标" /></label><label>负责人<select name="assigneeId" required><option value="">选择一级员工</option>{members.map((m) => <option value={m.id} key={m.id}>{m.name} · {m.title}</option>)}</select></label><label className="wide">任务说明<textarea name="description" rows={compact ? 2 : 5} required /></label><label className="wide">验收标准<textarea name="acceptanceCriteria" rows={compact ? 2 : 4} required /></label><button className="primary">创建根任务</button></form>;
+}
+
+function PageHeader({ eyebrow, title, summary, children }: { eyebrow: string; title: string; summary: string; children?: React.ReactNode }) { return <div className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{summary}</p></div><div>{children}</div></div>; }
+function Badge({ children, tone }: { children: React.ReactNode; tone: string }) { return <span className={`badge tone-${tone}`}>{children}</span>; }
+function Person({ id, role }: { id: string; role: string }) { return <div className="person"><span>{id.slice(0, 1).toUpperCase()}</span><div><b>{id}</b><small>{role}</small></div></div>; }
+function DetailBlock({ title, children }: { title: string; children: React.ReactNode }) { return <section className="detail-block"><h3>{title}</h3><div>{children}</div></section>; }
+function Empty({ title, body }: { title: string; body: string }) { return <div className="empty"><span>◎</span><h2>{title}</h2><p>{body}</p></div>; }
+function Loading() { return <div className="loading"><i /><span>正在载入公司运行状态…</span></div>; }
+function routeFromPath(): Route { const part = location.pathname.split("/").filter(Boolean).at(-1); return part === "notices" || part === "tasks" ? part : "meeting-room"; }
+function formatTime(value?: string | null) { if (!value) return "—"; return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
+function shortId(id: string) { return id.slice(0, 8); }
+function messageOf(error: unknown) { return error instanceof Error ? error.message : String(error); }
+function noticeKind(kind: Notice["kind"]) { return ({ manual: "管理公告", meeting_report: "会议汇报", correction: "更正公告" })[kind]; }
+function meetingStatus(status: MeetingSummary["status"]) { return ({ queued: "排队", active: "进行中", completed: "完成", canceled: "取消", timed_out: "超时" })[status]; }
+function taskStatus(status: Task["status"]) { return ({ assigned: "已派发", in_progress: "进行中", review: "待验收", blocked: "阻塞", closed: "已关闭", canceled: "已取消" })[status]; }

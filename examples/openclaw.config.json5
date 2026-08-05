@@ -1,0 +1,22 @@
+{
+  gateway: {
+    controlUi: {
+      // Required so the same-origin Company OS iframe can reuse Gateway login.
+      embedSandbox: "trusted",
+    },
+  },
+  plugins: {
+    entries: {
+      "company-os": {
+        enabled: true,
+        config: {
+          participantTurnTimeoutSeconds: 600,
+          hostIdleTimeoutSeconds: 1800,
+          taskStaleAfterHours: 72,
+          // Optional. Default: ~/.openclaw/plugins/company-os/company-os.sqlite
+          // databasePath: "/absolute/path/company-os.sqlite",
+        },
+      },
+    },
+  },
+}
