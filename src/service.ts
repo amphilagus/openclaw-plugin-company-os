@@ -5,7 +5,7 @@ import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
 import { resolveAgentVisualIdentity, resolveStandaloneAvatar, type AgentVisualIdentity } from "./identity.js";
 import { OpenClawSessionContextAppender, type SessionContextAppender } from "./session-context.js";
-import { CompanyOsStore, nextTaskCheckinRunAt } from "./store.js";
+import { CompanyOsStore, nextNoticeReminderRunAt, nextTaskCheckinRunAt } from "./store.js";
 import type {
   Actor,
   MeetingAdvance,
@@ -38,6 +38,8 @@ export class CompanyOsService {
   private taskCheckinFlush?: Promise<void>;
   private taskCheckinRunTimer?: NodeJS.Timeout;
   private taskCheckinDispatchTimer?: NodeJS.Timeout;
+  private noticeReminderFlush?: Promise<void>;
+  private noticeReminderRunTimer?: NodeJS.Timeout;
   private contextAppendFlush?: Promise<void>;
   private contextAppendIdleTimer?: NodeJS.Timeout;
   private readonly contextAppendIdleQueue = new Map<string, { agentId: string; sessionKey: string; sessionId: string }>();
@@ -77,6 +79,7 @@ export class CompanyOsService {
     this.store.recoverMeetingCloseoutDispatches();
     this.store.recoverTaskDispatches();
     this.store.recoverTaskCheckinDispatches();
+    this.store.recoverNoticeReminderDispatches();
     this.store.recoverSessionContextAppends();
     await this.recover();
     await this.flushSessionContextAppends();
@@ -85,7 +88,9 @@ export class CompanyOsService {
     this.kickMeetingCloseoutDispatches();
     this.kickTaskDispatches();
     this.kickTaskCheckinDispatches();
+    this.kickNoticeReminderDispatches();
     this.scheduleNextTaskCheckinRun();
+    this.scheduleNextNoticeReminderRun();
     this.scheduleNextAutomaticEnd();
     this.scanTimer = setInterval(() => {
       void this.scanTimeouts().catch((error) => this.logger.error(`company-os timeout scan failed: ${formatError(error)}`));
@@ -101,12 +106,14 @@ export class CompanyOsService {
     if (this.closeoutRetryTimer) clearTimeout(this.closeoutRetryTimer);
     if (this.taskCheckinRunTimer) clearTimeout(this.taskCheckinRunTimer);
     if (this.taskCheckinDispatchTimer) clearTimeout(this.taskCheckinDispatchTimer);
+    if (this.noticeReminderRunTimer) clearTimeout(this.noticeReminderRunTimer);
     this.lifecycleAbort.abort();
     await Promise.allSettled([
       ...(this.dispatchFlush ? [this.dispatchFlush] : []),
       ...(this.closeoutDispatchFlush ? [this.closeoutDispatchFlush] : []),
       ...(this.taskDispatchFlush ? [this.taskDispatchFlush] : []),
       ...(this.taskCheckinFlush ? [this.taskCheckinFlush] : []),
+      ...(this.noticeReminderFlush ? [this.noticeReminderFlush] : []),
       ...(this.contextAppendFlush ? [this.contextAppendFlush] : []),
       ...this.activeTurnDeliveries,
     ]);
@@ -196,6 +203,12 @@ export class CompanyOsService {
   dispatchTaskCheckinRun(scheduledAt: string | number | Date) {
     const run = this.store.queueTaskCheckinRun(scheduledAt);
     this.kickTaskCheckinDispatches();
+    return run;
+  }
+
+  dispatchNoticeReminderRun(scheduledAt: string | number | Date) {
+    const run = this.store.queueNoticeReminderRun(scheduledAt);
+    this.kickNoticeReminderDispatches();
     return run;
   }
 
@@ -552,18 +565,18 @@ export class CompanyOsService {
           timeoutSeconds: this.config.participantTurnTimeoutSeconds,
           signal: this.lifecycleAbort.signal,
         });
-        if (result.ok || this.store.taskDispatchHasProgress(dispatch.id)) {
+        if (result.ok || (result.code === "empty_reply" && result.completed) || this.store.taskDispatchHasProgress(dispatch.id)) {
           this.store.completeTaskDispatch(dispatch.id);
           if (!result.ok) {
-            this.logger.warn(`company-os accepted task dispatch ${dispatch.id} after verified task progress despite CLI result: ${result.error}`);
+            this.logger.warn(`company-os accepted task dispatch ${dispatch.id} after a completed turn or verified task progress despite CLI result: ${result.error}`);
           }
           this.logger.info(`company-os delivered task ${dispatch.kind} dispatch ${dispatch.id} to agent:${dispatch.targetAgentId}:main`);
         } else {
-          this.store.failTaskDispatch(dispatch.id, result.error);
+          this.store.failTaskDispatch(dispatch.id, result.error, definitelyUndelivered(result.code));
           this.logger.error(`company-os task ${dispatch.kind} dispatch ${dispatch.id} failed for agent:${dispatch.targetAgentId}:main: ${result.error}`);
         }
       } catch (error) {
-        this.store.failTaskDispatch(dispatch.id, formatError(error));
+        this.store.failTaskDispatch(dispatch.id, formatError(error), false);
         this.logger.error(`company-os task ${dispatch.kind} dispatch ${dispatch.id} crashed: ${formatError(error)}`);
       }
     }
@@ -640,21 +653,90 @@ export class CompanyOsService {
           agentId: dispatch.targetAgentId,
           prompt: dispatch.prompt,
           timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+          maxInFlightRetries: 0,
           signal: this.lifecycleAbort.signal,
         });
-        if (result.ok || this.store.taskCheckinDispatchHasProgress(dispatch.id)) {
+        if (result.ok || (result.code === "empty_reply" && result.completed) || this.store.taskCheckinDispatchHasProgress(dispatch.id)) {
           this.store.completeTaskCheckinDispatch(dispatch.id);
           if (!result.ok) {
-            this.logger.warn(`company-os accepted task check-in ${dispatch.id} after verified task action despite CLI result: ${result.error}`);
+            this.logger.warn(`company-os accepted task check-in ${dispatch.id} after a completed turn or verified task action despite CLI result: ${result.error}`);
           }
           this.logger.info(`company-os delivered task check-in ${dispatch.id} to agent:${dispatch.targetAgentId}:main`);
         } else {
-          this.store.failTaskCheckinDispatch(dispatch.id, result.error);
+          this.store.failTaskCheckinDispatch(dispatch.id, result.error, false);
           this.logger.error(`company-os task check-in ${dispatch.id} failed for agent:${dispatch.targetAgentId}:main: ${result.error}`);
         }
       } catch (error) {
-        this.store.failTaskCheckinDispatch(dispatch.id, formatError(error));
+        this.store.failTaskCheckinDispatch(dispatch.id, formatError(error), dispatch.channel === "boss_email");
         this.logger.error(`company-os task check-in ${dispatch.id} crashed: ${formatError(error)}`);
+      }
+    }
+  }
+
+  private scheduleNextNoticeReminderRun() {
+    if (this.noticeReminderRunTimer) clearTimeout(this.noticeReminderRunTimer);
+    this.noticeReminderRunTimer = undefined;
+    if (this.stopping || !this.config.noticeUnreadReminders.enabled) return;
+    const scheduledAt = nextNoticeReminderRunAt(
+      Date.now(),
+      this.config.noticeUnreadReminders.startHour,
+      this.config.noticeUnreadReminders.endHour,
+    );
+    const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
+    this.noticeReminderRunTimer = setTimeout(() => {
+      this.noticeReminderRunTimer = undefined;
+      try {
+        this.dispatchNoticeReminderRun(scheduledAt);
+      } catch (error) {
+        this.logger.error(`company-os notice reminder run ${scheduledAt} failed: ${formatError(error)}`);
+      } finally {
+        this.scheduleNextNoticeReminderRun();
+      }
+    }, delay);
+    this.noticeReminderRunTimer.unref();
+  }
+
+  private kickNoticeReminderDispatches() {
+    if (this.stopping || this.noticeReminderFlush || !this.store.hasDueNoticeReminderDispatches()) return;
+    this.noticeReminderFlush = this.flushNoticeReminderDispatches()
+      .catch((error) => this.logger.error(`company-os notice reminder dispatch loop failed: ${formatError(error)}`))
+      .finally(() => {
+        this.noticeReminderFlush = undefined;
+        if (!this.stopping && this.store.hasDueNoticeReminderDispatches()) this.kickNoticeReminderDispatches();
+      });
+  }
+
+  private async flushNoticeReminderDispatches() {
+    while (!this.stopping) {
+      const dispatch = this.store.claimNextNoticeReminderDispatch();
+      if (!dispatch) return;
+      try {
+        if (!dispatch.prompt) throw new Error("notice reminder dispatch prompt is missing");
+        const result = await this.agentInvoker.invoke({
+          agentId: dispatch.targetAgentId,
+          prompt: dispatch.prompt,
+          timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+          maxInFlightRetries: 0,
+          signal: this.lifecycleAbort.signal,
+        });
+        if (result.ok || (result.code === "empty_reply" && result.completed) || this.store.noticeReminderDispatchHasReadProgress(dispatch.id)) {
+          this.store.completeNoticeReminderDispatch(dispatch.id);
+          if (!result.ok) {
+            this.logger.warn(`company-os accepted notice reminder ${dispatch.id} after a completed turn or verified notice read despite CLI result: ${result.error}`);
+          }
+          this.logger.info(`company-os delivered notice reminder ${dispatch.id} to agent:${dispatch.targetAgentId}:main`);
+        } else {
+          this.store.failNoticeReminderDispatch(dispatch.id, result.error);
+          this.logger.error(`company-os notice reminder ${dispatch.id} failed for agent:${dispatch.targetAgentId}:main: ${result.error}`);
+        }
+      } catch (error) {
+        if (this.store.noticeReminderDispatchHasReadProgress(dispatch.id)) {
+          this.store.completeNoticeReminderDispatch(dispatch.id);
+          this.logger.warn(`company-os accepted notice reminder ${dispatch.id} after a verified notice read despite invocation error: ${formatError(error)}`);
+        } else {
+          this.store.failNoticeReminderDispatch(dispatch.id, formatError(error));
+          this.logger.error(`company-os notice reminder ${dispatch.id} crashed: ${formatError(error)}`);
+        }
       }
     }
   }
@@ -687,6 +769,10 @@ export class CompanyOsService {
 
 function formatError(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function definitelyUndelivered(code: string) {
+  return code === "launch_failed" || code === "in_flight";
 }
 
 function requiredIdentity(value: string, field: string) {

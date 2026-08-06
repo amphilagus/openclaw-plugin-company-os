@@ -8,5 +8,7 @@ import "./meeting-dispatch.css";
 import "./meeting-closeout.css";
 import "./task-reminder.css";
 import "./task-checkin.css";
+import "./task-review.css";
+import "./notice-reminder.css";
 
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);

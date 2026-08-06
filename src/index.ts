@@ -32,6 +32,11 @@ const ConfigSchema = Type.Object({
     startHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 8 })),
     endHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 17 })),
   }, { additionalProperties: false })),
+  noticeUnreadReminders: Type.Optional(Type.Object({
+    enabled: Type.Optional(Type.Boolean({ default: true })),
+    startHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 8 })),
+    endHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 17 })),
+  }, { additionalProperties: false })),
   databasePath: Type.Optional(Type.String({ minLength: 1 })),
   organizationAdminAgentId: Type.Optional(Type.String({ minLength: 1 })),
   bossAvatarPath: Type.Optional(Type.String({ minLength: 1, default: "~/.openclaw/workspace-boss/avatar.png" })),

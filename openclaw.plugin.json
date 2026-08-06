@@ -2,7 +2,7 @@
   "id": "company-os",
   "name": "Company OS",
   "description": "公司级会议、多级任务和告示板治理系统。",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -27,6 +27,28 @@
         "default": 72
       },
       "taskHourlyCheckins": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "startHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 8
+          },
+          "endHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 17
+          }
+        },
+        "additionalProperties": false
+      },
+      "noticeUnreadReminders": {
         "type": "object",
         "properties": {
           "enabled": {

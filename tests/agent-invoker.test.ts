@@ -61,6 +61,24 @@ describe("OpenClaw CLI agent invoker", () => {
     await expect(access(promptPath)).rejects.toThrow();
   });
 
+  it("supports disabling in_flight retries for single-injection patrol dispatches", async () => {
+    const execFile: AgentExecFile = vi.fn(async () => ({
+      stdout: JSON.stringify({ status: "in_flight" }),
+      stderr: "",
+    }));
+    const wait = vi.fn(async () => undefined);
+    const invoker = new OpenClawCliAgentInvoker({ execFile, wait });
+
+    await expect(invoker.invoke({
+      agentId: "engineer",
+      prompt: "single patrol prompt",
+      timeoutSeconds: 60,
+      maxInFlightRetries: 0,
+    })).resolves.toMatchObject({ ok: false, code: "in_flight", attempts: 1 });
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(wait).not.toHaveBeenCalled();
+  });
+
   it("distinguishes empty replies from abnormal CLI exits", async () => {
     const empty = new OpenClawCliAgentInvoker({
       execFile: async () => ({ stdout: JSON.stringify({ status: "ok", payloads: [] }), stderr: "" }),

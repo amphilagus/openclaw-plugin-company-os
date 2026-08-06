@@ -201,11 +201,38 @@ export type TaskHourlyCheckinSummary = {
   };
 };
 
+export type NoticeUnreadReminderSummary = {
+  enabled: boolean;
+  timeZone: "Asia/Shanghai";
+  startHour: number;
+  endHour: number;
+  nextRunAt: string | null;
+  backlog: number;
+  currentUnreadAgents: number;
+  currentUnreadEntries: number;
+  today: {
+    localDate: string;
+    latestRun: {
+      id: string;
+      scheduledAt: string;
+      candidateAgents: number;
+      candidateUnreadEntries: number;
+      pending: number;
+      running: number;
+      delivered: number;
+      failed: number;
+      skipped: number;
+      canceled: number;
+    } | null;
+  };
+};
+
 export type Snapshot = {
   organization: Member[];
   tasks: Task[];
   notices: Notice[];
   meetings: { active: MeetingSummary | null; closing: MeetingSummary | null; queue: MeetingSummary[]; history: MeetingSummary[] };
   taskHourlyCheckin: TaskHourlyCheckinSummary;
+  noticeUnreadReminder: NoticeUnreadReminderSummary;
   generatedAt: string;
 };

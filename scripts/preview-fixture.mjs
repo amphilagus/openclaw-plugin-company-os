@@ -14,6 +14,7 @@ const members = [
 ];
 const tasks = [
   task("root-001", null, "交付 Company OS v1", "boss", "cto", "in_progress", ["child-001", "child-002"]),
+  task("root-review", null, "等待 Boss 验收的根任务", "boss", "main", "review", []),
   { ...task("child-001", "root-001", "完成原生会议引擎", "cto", "eng-a", "blocked", []), blockedReason: "等待 Session 调度接口确认" },
   task("child-002", "root-001", "完成任务树与审计", "cto", "eng-b", "review", []),
 ];
@@ -47,6 +48,20 @@ const snapshot = {
     backlog: 1,
     today: { localDate: now.slice(0, 10), latestRun: { id: "checkin-001", scheduledAt: now, candidateEmployees: 2, plannedReminders: 5, pending: 1, running: 1, delivered: 3, failed: 0, skipped: 0, canceled: 0 } },
     boss: { reviewCount: 1, anomalyCount: 1, emailStatus: "succeeded", lastError: null },
+  },
+  noticeUnreadReminder: {
+    enabled: true,
+    timeZone: "Asia/Shanghai",
+    startHour: 8,
+    endHour: 17,
+    nextRunAt: now,
+    backlog: 1,
+    currentUnreadAgents: 1,
+    currentUnreadEntries: 1,
+    today: {
+      localDate: now.slice(0, 10),
+      latestRun: { id: "notice-reminder-001", scheduledAt: now, candidateAgents: 2, candidateUnreadEntries: 3, pending: 1, running: 0, delivered: 1, failed: 0, skipped: 0, canceled: 0 },
+    },
   },
   generatedAt: now,
 };

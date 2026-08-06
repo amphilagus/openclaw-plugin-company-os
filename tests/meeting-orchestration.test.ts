@@ -441,6 +441,75 @@ describe("synchronous meeting orchestration", () => {
     await service.stop();
   });
 
+  it("does not repeat review notifications after a completed empty reply or verified remediation action", async () => {
+    let service!: CompanyOsService;
+    let taskId = "";
+    const invoke = vi.fn(async ({ prompt }: { prompt: string }) => {
+      if (prompt.includes("驳回验收")) {
+        service.store.addTaskProgress("cto", taskId, "已读取驳回意见并开始整改");
+        return { ok: false as const, code: "exit" as const, error: "CLI lost its final response", attempts: 1 };
+      }
+      return {
+        ok: false as const,
+        code: "empty_reply" as const,
+        error: "agent returned no text payload",
+        attempts: 1,
+        completed: true,
+        raw: { status: "ok", payloads: [] },
+      };
+    });
+    service = createService({ invoke });
+    seedOrganization(service);
+    const task = service.store.createRootTask({
+      title: "验收通知幂等",
+      description: "通知不因空回复重复注入",
+      acceptanceCriteria: "每次验收事件只投递一次",
+      assigneeId: "cto",
+    });
+    taskId = task.id;
+    service.store.startTask("cto", task.id);
+    service.store.submitTask("cto", task.id, "首次提交", [{ type: "proof", label: "tests", command: "npm test" }]);
+
+    service.reviewTask("boss", task.id, "reject", "需要补充证据");
+    await waitFor(() => expect(service.store.readTask("boss", task.id, false).reviewNotificationDispatch)
+      .toMatchObject({ kind: "review_rejected", status: "succeeded", attempts: 1 }));
+
+    service.store.submitTask("cto", task.id, "整改后重新提交", [{ type: "proof", label: "tests", command: "npm test" }]);
+    service.reviewTask("boss", task.id, "accept", "验收通过");
+    await waitFor(() => expect(service.store.readTask("boss", task.id, false).reviewNotificationDispatch)
+      .toMatchObject({ kind: "review_accepted", status: "succeeded", attempts: 1 }));
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls.every(([input]) => input.prompt.includes("同一通知 ID 只处理一次"))).toBe(true);
+    await service.stop();
+  });
+
+  it("does not automatically replay an ambiguously aborted review notification", async () => {
+    const invoke = vi.fn(async () => ({
+      ok: false as const,
+      code: "aborted" as const,
+      error: "agent invocation aborted after launch",
+      attempts: 1,
+    }));
+    const service = createService({ invoke });
+    seedOrganization(service);
+    const task = service.store.createRootTask({
+      title: "模糊失败不重放",
+      description: "已启动的通知不能因结果未知而重复注入",
+      acceptanceCriteria: "只调用一次 Agent",
+      assigneeId: "cto",
+    });
+    service.store.startTask("cto", task.id);
+    service.store.submitTask("cto", task.id, "提交验收", [{ type: "proof", label: "tests", command: "npm test" }]);
+
+    service.reviewTask("boss", task.id, "reject", "需要整改");
+    await waitFor(() => expect(service.store.readTask("boss", task.id, false).reviewNotificationDispatch)
+      .toMatchObject({ status: "failed", attempts: 1, lastError: "agent invocation aborted after launch" }));
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    await service.stop();
+  });
+
   it("actively synchronizes every attendee before activating the next room meeting", async () => {
     const deliveries: Array<{ agentId: string; prompt: string }> = [];
     const agentInvoker: AgentInvoker = {

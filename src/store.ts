@@ -17,6 +17,8 @@ import type {
   MeetingTurnDelivery,
   MeetingTurnDispatch,
   MeetingType,
+  NoticeReminderCandidate,
+  NoticeReminderDispatch,
   ResolvedCompanyOsConfig,
   ServiceEvent,
   TaskAgentDispatchKind,
@@ -41,6 +43,7 @@ export class CompanyOsStore {
   private readonly staleAfterMs: number;
   private readonly automaticEndDelayMs: number;
   private readonly taskCheckinConfig: ResolvedCompanyOsConfig["taskHourlyCheckins"];
+  private readonly noticeReminderConfig: ResolvedCompanyOsConfig["noticeUnreadReminders"];
   private readonly bossEmailEnabled: boolean;
   private readonly organizationAdminAgentId: string;
   private readonly onEvent?: (event: ServiceEvent) => void;
@@ -60,6 +63,7 @@ export class CompanyOsStore {
     this.staleAfterMs = options.config.taskStaleAfterHours * 60 * 60 * 1000;
     this.automaticEndDelayMs = options.config.meetingAutoEndDelaySeconds * 1000;
     this.taskCheckinConfig = options.config.taskHourlyCheckins;
+    this.noticeReminderConfig = options.config.noticeUnreadReminders;
     this.bossEmailEnabled = options.config.bossEmailNotifications.enabled;
     this.onEvent = options.onEvent;
     this.initializeSchema();
@@ -79,10 +83,15 @@ export class CompanyOsStore {
     const schemaRow = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as Row | undefined;
     const currentVersion = schemaRow ? Number(schemaRow.value) : 0;
     if (!Number.isInteger(currentVersion) || currentVersion < 0) throw new Error("company-os schema version is invalid");
-    if (currentVersion > 9) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
-    if (currentVersion === 9) return;
+    if (currentVersion > 10) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
+    if (currentVersion === 10) return;
+    if (currentVersion === 9) {
+      this.migrateSchemaV10();
+      return;
+    }
     if (currentVersion === 8) {
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     if (currentVersion === 1) {
@@ -94,6 +103,7 @@ export class CompanyOsStore {
       this.migrateSchemaV7();
       this.migrateSchemaV8();
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     if (currentVersion === 2) {
@@ -104,6 +114,7 @@ export class CompanyOsStore {
       this.migrateSchemaV7();
       this.migrateSchemaV8();
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     if (currentVersion === 3) {
@@ -113,6 +124,7 @@ export class CompanyOsStore {
       this.migrateSchemaV7();
       this.migrateSchemaV8();
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     if (currentVersion === 4) {
@@ -121,6 +133,7 @@ export class CompanyOsStore {
       this.migrateSchemaV7();
       this.migrateSchemaV8();
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     if (currentVersion === 5) {
@@ -128,17 +141,20 @@ export class CompanyOsStore {
       this.migrateSchemaV7();
       this.migrateSchemaV8();
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     if (currentVersion === 6) {
       this.migrateSchemaV7();
       this.migrateSchemaV8();
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     if (currentVersion === 7) {
       this.migrateSchemaV8();
       this.migrateSchemaV9();
+      this.migrateSchemaV10();
       return;
     }
     this.db.exec("BEGIN IMMEDIATE");
@@ -310,6 +326,33 @@ export class CompanyOsStore {
         member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
         read_at TEXT NOT NULL,
         PRIMARY KEY(notice_id, member_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS notice_reminder_runs (
+        id TEXT PRIMARY KEY,
+        slot_key TEXT NOT NULL UNIQUE,
+        scheduled_at TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS notice_reminder_dispatches (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES notice_reminder_runs(id) ON DELETE CASCADE,
+        target_member_id TEXT NOT NULL REFERENCES members(id),
+        scheduled_at TEXT NOT NULL,
+        candidate_json TEXT NOT NULL,
+        candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+        prompt TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'canceled')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE(run_id, target_member_id)
       );
 
       CREATE TABLE IF NOT EXISTS meetings (
@@ -493,6 +536,8 @@ export class CompanyOsStore {
       CREATE INDEX IF NOT EXISTS idx_task_checkin_rotation
         ON task_checkin_dispatches(target_member_id, status, completed_at);
       CREATE INDEX IF NOT EXISTS idx_notices_created ON notices(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_notice_reminder_dispatch_due
+        ON notice_reminder_dispatches(status, scheduled_at, created_at);
       CREATE INDEX IF NOT EXISTS idx_meetings_status_queue ON meetings(status, queue_position);
       CREATE INDEX IF NOT EXISTS idx_meeting_messages_sequence ON meeting_messages(meeting_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_meeting_email_pending ON meeting_email_notifications(status, created_at);
@@ -502,7 +547,7 @@ export class CompanyOsStore {
         ON meeting_closeout_dispatches(status, blocks_room DESC, next_attempt_at, position);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meeting ON meetings(status) WHERE status = 'active';
       `);
-      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '9')").run();
+      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '10')").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -862,6 +907,46 @@ export class CompanyOsStore {
     }
   }
 
+  private migrateSchemaV10() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS notice_reminder_runs (
+          id TEXT PRIMARY KEY,
+          slot_key TEXT NOT NULL UNIQUE,
+          scheduled_at TEXT NOT NULL,
+          local_date TEXT NOT NULL,
+          local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notice_reminder_dispatches (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES notice_reminder_runs(id) ON DELETE CASCADE,
+          target_member_id TEXT NOT NULL REFERENCES members(id),
+          scheduled_at TEXT NOT NULL,
+          candidate_json TEXT NOT NULL,
+          candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+          prompt TEXT,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'canceled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT,
+          UNIQUE(run_id, target_member_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_notice_reminder_dispatch_due
+          ON notice_reminder_dispatches(status, scheduled_at, created_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '10' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private tableExists(table: string) {
     return Boolean(this.db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
   }
@@ -1192,7 +1277,7 @@ export class CompanyOsStore {
     if (inFlight) return mapTaskAgentDispatch({ ...inFlight, target_runtime_agent_id: targetAgentId });
     return this.transaction(() => {
       const id = randomUUID();
-      const prompt = buildTaskReminderPrompt(task);
+      const prompt = buildTaskReminderPrompt(task, id);
       const createdAt = nowIso();
       this.db.prepare(`
         INSERT INTO task_agent_dispatches (
@@ -1228,16 +1313,24 @@ export class CompanyOsStore {
     return this.transaction(() => {
       const rows = this.db.prepare("SELECT * FROM task_agent_dispatches WHERE status = 'running'").all() as Row[];
       for (const row of rows) {
+        const progressed = this.taskDispatchHasProgress(row.id);
+        const completedAt = nowIso();
         this.db.prepare(`
-          UPDATE task_agent_dispatches SET status = 'pending', lease_expires_at = NULL,
-            last_error = 'Gateway restarted during task dispatch' WHERE id = ?
-        `).run(row.id);
+          UPDATE task_agent_dispatches SET status = ?, lease_expires_at = NULL,
+            completed_at = ?, last_error = ? WHERE id = ?
+        `).run(
+          progressed ? "succeeded" : "failed",
+          completedAt,
+          progressed ? null : "Gateway restarted after dispatch started; automatic retry suppressed to avoid duplicate delivery",
+          row.id,
+        );
         this.audit({
           actorId: "system",
-          action: taskDispatchAuditAction(row.kind, "recovered"),
+          action: taskDispatchAuditAction(row.kind, progressed ? "delivered" : "failed"),
           entityType: "task",
           entityId: row.task_id,
-          after: { dispatchId: row.id, kind: row.kind },
+          reason: progressed ? "Gateway restart recovery found verified task progress" : "delivery outcome unknown after Gateway restart; duplicate retry suppressed",
+          after: { dispatchId: row.id, kind: row.kind, attempts: row.attempts },
         });
       }
       return rows.length;
@@ -1294,15 +1387,37 @@ export class CompanyOsStore {
 
   taskDispatchHasProgress(dispatchId: string) {
     const row = this.db.prepare(`
-      SELECT task_id, target_agent_id, kind, started_at FROM task_agent_dispatches WHERE id = ?
+      SELECT task_id, target_agent_id, kind, created_at, started_at FROM task_agent_dispatches WHERE id = ?
     `).get(dispatchId) as Row | undefined;
-    if (!row?.started_at || row.kind !== "boss_reminder") return false;
-    return Boolean(this.db.prepare(`
+    if (!row?.started_at || (row.kind !== "boss_reminder" && row.kind !== "review_rejected")) return false;
+    const activitySince = String(row.created_at) > String(row.started_at) ? row.created_at : row.started_at;
+    const queuedAudit = this.db.prepare(`
+      SELECT rowid AS audit_rowid FROM audit_events
+      WHERE entity_type = 'task' AND entity_id = ? AND action = ?
+        AND json_extract(after_json, '$.dispatchId') = ?
+      ORDER BY rowid DESC LIMIT 1
+    `).get(
+      row.task_id,
+      taskDispatchAuditAction(row.kind, "queued"),
+      dispatchId,
+    ) as Row | undefined;
+    const auditWatermark = queuedAudit ? Number(queuedAudit.audit_rowid) : null;
+    const taskProgress = this.db.prepare(`
       SELECT 1 AS ok FROM audit_events
-      WHERE entity_type = 'task' AND entity_id = ? AND actor_id = ? AND created_at >= ?
+      WHERE entity_type = 'task' AND entity_id = ? AND actor_id = ?
+        AND ((? IS NOT NULL AND rowid > ?) OR (? IS NULL AND created_at > ?))
         AND action IN ('task.started', 'task.progress', 'task.blocked', 'task.unblocked', 'task.submitted')
       LIMIT 1
-    `).get(row.task_id, row.target_agent_id, row.started_at));
+    `).get(row.task_id, row.target_agent_id, auditWatermark, auditWatermark, auditWatermark, activitySince);
+    if (taskProgress) return true;
+    if (row.kind !== "review_rejected") return false;
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM audit_events
+      WHERE entity_type = 'task' AND actor_id = ? AND action = 'task.created'
+        AND ((? IS NOT NULL AND rowid > ?) OR (? IS NULL AND created_at > ?))
+        AND json_extract(after_json, '$.parentId') = ?
+      LIMIT 1
+    `).get(row.target_agent_id, auditWatermark, auditWatermark, auditWatermark, activitySince, row.task_id));
   }
 
   completeTaskDispatch(dispatchId: string) {
@@ -1325,7 +1440,7 @@ export class CompanyOsStore {
     });
   }
 
-  failTaskDispatch(dispatchId: string, error: string) {
+  failTaskDispatch(dispatchId: string, error: string, allowRetry = true) {
     return this.transaction(() => {
       const row = this.db.prepare("SELECT * FROM task_agent_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
       if (!row || row.status !== "running") return false;
@@ -1333,7 +1448,7 @@ export class CompanyOsStore {
       const task = this.getTaskRow(row.task_id);
       const reminderStillRelevant = (["assigned", "in_progress", "blocked"] as string[]).includes(task.status)
         && task.assignee_id === row.target_agent_id;
-      const retry = Number(row.attempts) < 3 && (row.kind !== "boss_reminder" || reminderStillRelevant);
+      const retry = allowRetry && Number(row.attempts) < 3 && (row.kind !== "boss_reminder" || reminderStillRelevant);
       this.db.prepare(`
         UPDATE task_agent_dispatches SET status = ?, last_error = ?, lease_expires_at = NULL,
           completed_at = ? WHERE id = ?
@@ -1464,20 +1579,40 @@ export class CompanyOsStore {
 
   recoverTaskCheckinDispatches() {
     return this.transaction(() => {
-      const rows = this.db.prepare("SELECT * FROM task_checkin_dispatches WHERE status = 'running'").all() as Row[];
+      const rows = this.db.prepare(`
+        SELECT * FROM task_checkin_dispatches
+        WHERE status = 'running' OR (channel = 'agent' AND status = 'pending' AND attempts > 0)
+      `).all() as Row[];
       for (const row of rows) {
         const exhausted = Number(row.attempts) >= 3;
+        const progressed = row.channel === "agent" && this.taskCheckinDispatchHasProgress(row.id);
+        const singleInjectionAgentDispatch = row.channel === "agent";
+        const status = progressed ? "succeeded" : exhausted || singleInjectionAgentDispatch ? "failed" : "pending";
+        const completedAt = status === "pending" ? null : nowIso();
+        const lastError = progressed
+          ? null
+          : singleInjectionAgentDispatch
+            ? "Task patrol dispatch had already been attempted; automatic retry suppressed to avoid duplicate delivery"
+            : exhausted
+              ? "Gateway restarted during the final task check-in attempt"
+              : "Gateway restarted during task check-in dispatch";
         this.db.prepare(`
           UPDATE task_checkin_dispatches SET status = ?, lease_expires_at = NULL,
-            last_error = 'Gateway restarted during task check-in dispatch', completed_at = ? WHERE id = ?
-        `).run(exhausted ? "failed" : "pending", exhausted ? nowIso() : null, row.id);
+            last_error = ?, completed_at = ? WHERE id = ?
+        `).run(status, lastError, completedAt, row.id);
         this.audit({
           actorId: "system",
-          action: exhausted ? "task.checkin_dispatch_failed" : "task.checkin_dispatch_recovered",
+          action: progressed ? "task.checkin_dispatch_delivered" : status === "failed" ? "task.checkin_dispatch_failed" : "task.checkin_dispatch_recovered",
           entityType: "task_checkin",
           entityId: row.run_id,
-          reason: exhausted ? "Gateway restarted during the final task check-in attempt" : undefined,
-          after: { dispatchId: row.id, targetMemberId: row.target_member_id, taskId: row.task_id },
+          reason: progressed
+            ? "Gateway restart recovery found verified task progress"
+            : singleInjectionAgentDispatch
+              ? "task patrol dispatch is single-injection; duplicate retry suppressed"
+              : exhausted
+                ? "Gateway restarted during the final task check-in attempt"
+                : undefined,
+          after: { dispatchId: row.id, targetMemberId: row.target_member_id, taskId: row.task_id, attempts: row.attempts },
         });
       }
       return rows.length;
@@ -1492,7 +1627,9 @@ export class CompanyOsStore {
           FROM task_checkin_dispatches d
           JOIN task_checkin_batches b ON b.id = d.batch_id
           JOIN task_checkin_runs r ON r.id = d.run_id
-          WHERE d.status = 'pending' AND d.attempts < 3 AND d.scheduled_at <= ?
+          WHERE d.status = 'pending'
+            AND ((d.channel = 'agent' AND d.attempts = 0) OR (d.channel = 'boss_email' AND d.attempts < 3))
+            AND d.scheduled_at <= ?
           ORDER BY d.scheduled_at, d.created_at, d.rowid LIMIT 1
         `).get(new Date(now).toISOString()) as Row | undefined;
         if (!row) return null;
@@ -1522,7 +1659,7 @@ export class CompanyOsStore {
           const task = this.getTaskRow(selected.taskId);
           taskId = selected.taskId;
           actionKind = selected.actionKind;
-          prompt = buildTaskCheckinPrompt(task, selected.actionKind);
+          prompt = buildTaskCheckinPrompt(task, selected.actionKind, row.id);
         } else {
           const snapshot = parseJson<BossTaskCheckinCandidate[]>(row.candidate_json, []);
           emailNotification = this.buildBossTaskCheckinEmail(row.id, row.run_id, row.scheduled_at, snapshot);
@@ -1584,7 +1721,7 @@ export class CompanyOsStore {
     });
   }
 
-  failTaskCheckinDispatch(dispatchId: string, error: string) {
+  failTaskCheckinDispatch(dispatchId: string, error: string, allowRetry = true) {
     return this.transaction(() => {
       const row = this.db.prepare("SELECT * FROM task_checkin_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
       if (!row || row.status !== "running") return false;
@@ -1598,13 +1735,7 @@ export class CompanyOsStore {
             return notification.reviews.length > 0 || notification.anomalies.length > 0;
           })()
         : false;
-      const retry = Number(row.attempts) < 3 && (row.channel === "boss_email"
-        ? bossStillRelevant
-        : this.taskCheckinCandidateIsRelevant(row.target_member_id, {
-            taskId: row.task_id,
-            actionKind: row.action_kind,
-            actionAt: row.started_at,
-          }));
+      const retry = row.channel === "boss_email" && allowRetry && Number(row.attempts) < 3 && bossStillRelevant;
       this.db.prepare(`
         UPDATE task_checkin_dispatches SET status = ?, last_error = ?, lease_expires_at = NULL,
           completed_at = ? WHERE id = ?
@@ -1641,14 +1772,18 @@ export class CompanyOsStore {
   hasDueTaskCheckinDispatches(now = Date.now()) {
     return Boolean(this.db.prepare(`
       SELECT 1 AS ok FROM task_checkin_dispatches
-      WHERE status = 'pending' AND attempts < 3 AND scheduled_at <= ? LIMIT 1
+      WHERE status = 'pending'
+        AND ((channel = 'agent' AND attempts = 0) OR (channel = 'boss_email' AND attempts < 3))
+        AND scheduled_at <= ? LIMIT 1
     `).get(new Date(now).toISOString()));
   }
 
   nextPendingTaskCheckinDispatchAt() {
     const row = this.db.prepare(`
       SELECT scheduled_at FROM task_checkin_dispatches
-      WHERE status = 'pending' AND attempts < 3 ORDER BY scheduled_at, created_at LIMIT 1
+      WHERE status = 'pending'
+        AND ((channel = 'agent' AND attempts = 0) OR (channel = 'boss_email' AND attempts < 3))
+      ORDER BY scheduled_at, created_at LIMIT 1
     `).get() as Row | undefined;
     return row?.scheduled_at as string | undefined;
   }
@@ -1658,7 +1793,8 @@ export class CompanyOsStore {
       SELECT d.*, b.candidate_json
       FROM task_checkin_dispatches d
       JOIN task_checkin_batches b ON b.id = d.batch_id
-      WHERE d.status = 'pending' AND d.attempts < 3
+      WHERE d.status = 'pending'
+        AND ((d.channel = 'agent' AND d.attempts = 0) OR (d.channel = 'boss_email' AND d.attempts < 3))
       ORDER BY d.scheduled_at, d.created_at, d.rowid LIMIT 1
     `).get() as Row | undefined;
     if (!row) return null;
@@ -2090,7 +2226,7 @@ export class CompanyOsStore {
     createdAt: string,
   ) {
     const dispatchId = randomUUID();
-    const prompt = buildTaskReviewNotificationPrompt(task, reviewer, kind, feedback);
+    const prompt = buildTaskReviewNotificationPrompt(task, reviewer, kind, feedback, dispatchId);
     this.db.prepare(`
       INSERT INTO task_agent_dispatches (
         id, task_id, target_agent_id, kind, prompt, status, created_at
@@ -2326,6 +2462,370 @@ export class CompanyOsStore {
     `).run(id, input.authorId, createdAt);
     this.audit({ actorId: input.actorId, action: "notice.published", entityType: "notice", entityId: id, after: { ...input, id } });
     return this.listNotices("boss").find((notice) => notice.id === id)!;
+  }
+
+  // ── Unread notice reminders ──────────────────────────────
+
+  queueNoticeReminderRun(scheduledAtInput: string | number | Date) {
+    const scheduledAt = new Date(scheduledAtInput);
+    if (!Number.isFinite(scheduledAt.getTime())) throw new Error("notice reminder scheduledAt is invalid");
+    const slot = shanghaiSlot(scheduledAt.getTime());
+    if (slot.minute !== 30 || slot.second !== 0 || slot.millisecond !== 0) {
+      throw new Error("notice reminder runs must be scheduled on an exact half-hour");
+    }
+    if (slot.hour < this.noticeReminderConfig.startHour || slot.hour > this.noticeReminderConfig.endHour) {
+      throw new Error("notice reminder run is outside the configured schedule");
+    }
+    const slotKey = `${slot.localDate}T${String(slot.hour).padStart(2, "0")}:30`;
+    const existing = this.db.prepare("SELECT id FROM notice_reminder_runs WHERE slot_key = ?").get(slotKey) as Row | undefined;
+    if (existing) return this.noticeReminderRun(existing.id);
+
+    return this.transaction(() => {
+      const runId = randomUUID();
+      const createdAt = nowIso();
+      this.db.prepare(`
+        INSERT INTO notice_reminder_runs (id, slot_key, scheduled_at, local_date, local_hour, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(runId, slotKey, scheduledAt.toISOString(), slot.localDate, slot.hour, createdAt);
+
+      let candidateAgents = 0;
+      let candidateUnreadEntries = 0;
+      const employees = this.listMembers().filter((member) => member.kind === "agent" && member.active)
+        .sort((a, b) => a.level - b.level || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+      for (const employee of employees) {
+        const candidates = this.unreadNoticeReminderCandidates(employee.id);
+        if (candidates.length === 0) continue;
+        candidateAgents += 1;
+        candidateUnreadEntries += candidates.length;
+        const open = this.db.prepare(`
+          SELECT id FROM notice_reminder_dispatches
+          WHERE target_member_id = ? AND status IN ('pending', 'running')
+          ORDER BY created_at, rowid LIMIT 1
+        `).get(employee.id) as Row | undefined;
+        const id = randomUUID();
+        const status = open ? "skipped" : "pending";
+        const lastError = open ? `earlier notice reminder is still open: ${open.id}` : null;
+        this.db.prepare(`
+          INSERT INTO notice_reminder_dispatches (
+            id, run_id, target_member_id, scheduled_at, candidate_json, candidate_count,
+            status, last_error, created_at, completed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          id,
+          runId,
+          employee.id,
+          scheduledAt.toISOString(),
+          JSON.stringify(candidates),
+          candidates.length,
+          status,
+          lastError,
+          createdAt,
+          open ? createdAt : null,
+        );
+        this.audit({
+          actorId: "system",
+          action: open ? "notice.reminder_dispatch_skipped" : "notice.reminder_dispatch_queued",
+          entityType: "notice_reminder",
+          entityId: runId,
+          reason: lastError ?? undefined,
+          after: { dispatchId: id, targetMemberId: employee.id, candidateCount: candidates.length },
+        });
+      }
+
+      this.audit({
+        actorId: "system",
+        action: candidateAgents === 0 ? "notice.reminder_empty" : "notice.reminder_created",
+        entityType: "notice_reminder",
+        entityId: runId,
+        after: {
+          scheduledAt: scheduledAt.toISOString(),
+          localDate: slot.localDate,
+          localHour: slot.hour,
+          candidateAgents,
+          candidateUnreadEntries,
+        },
+      });
+      return this.noticeReminderRun(runId);
+    });
+  }
+
+  recoverNoticeReminderDispatches() {
+    return this.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT * FROM notice_reminder_dispatches
+        WHERE status = 'running' OR (status = 'pending' AND attempts > 0)
+      `).all() as Row[];
+      for (const row of rows) {
+        const progressed = this.noticeReminderDispatchHasReadProgress(row.id);
+        const status = progressed ? "succeeded" : "failed";
+        const error = progressed
+          ? null
+          : "Notice patrol dispatch had already been attempted; automatic retry suppressed to avoid duplicate delivery";
+        this.db.prepare(`
+          UPDATE notice_reminder_dispatches SET status = ?, lease_expires_at = NULL,
+            last_error = ?, completed_at = ? WHERE id = ?
+        `).run(
+          status,
+          error,
+          nowIso(),
+          row.id,
+        );
+        this.audit({
+          actorId: "system",
+          action: progressed ? "notice.reminder_dispatch_delivered" : "notice.reminder_dispatch_failed",
+          entityType: "notice_reminder",
+          entityId: row.run_id,
+          reason: progressed
+            ? "Gateway restart recovery found verified notice read progress"
+            : "notice patrol dispatch is single-injection; duplicate retry suppressed",
+          after: { dispatchId: row.id, targetMemberId: row.target_member_id, attempts: row.attempts },
+        });
+      }
+      return rows.length;
+    });
+  }
+
+  claimNextNoticeReminderDispatch(now = Date.now(), leaseMs = 15 * 60 * 1000): NoticeReminderDispatch | null {
+    return this.transaction(() => {
+      while (true) {
+        const row = this.db.prepare(`
+          SELECT * FROM notice_reminder_dispatches
+          WHERE status = 'pending' AND attempts = 0 AND scheduled_at <= ?
+          ORDER BY scheduled_at, created_at, rowid LIMIT 1
+        `).get(new Date(now).toISOString()) as Row | undefined;
+        if (!row) return null;
+        const member = this.getMember(row.target_member_id, { active: false });
+        if (!member.active) {
+          this.finishNoticeReminderWithoutDelivery(row, "canceled", "target member is inactive");
+          continue;
+        }
+        const candidates = this.relevantNoticeReminderCandidates(row.target_member_id, parseJson(row.candidate_json, []));
+        if (candidates.length === 0) {
+          this.finishNoticeReminderWithoutDelivery(row, "skipped", "all candidate notices are already read or no longer effective");
+          continue;
+        }
+        const targetAgentId = this.runtimeAgentId(row.target_member_id);
+        const prompt = buildNoticeReminderPrompt(candidates, row.scheduled_at, row.id);
+        const startedAt = nowIso();
+        this.db.prepare(`
+          UPDATE notice_reminder_dispatches SET prompt = ?, status = 'running', attempts = attempts + 1,
+            started_at = ?, lease_expires_at = ?, last_error = NULL WHERE id = ?
+        `).run(prompt, startedAt, new Date(now + leaseMs).toISOString(), row.id);
+        this.audit({
+          actorId: "system",
+          action: "notice.reminder_dispatch_started",
+          entityType: "notice_reminder",
+          entityId: row.run_id,
+          after: { dispatchId: row.id, targetMemberId: row.target_member_id, candidateCount: candidates.length, attempts: Number(row.attempts) + 1 },
+        });
+        return mapNoticeReminderDispatch({
+          ...row,
+          candidate_json: JSON.stringify(candidates),
+          target_runtime_agent_id: targetAgentId,
+          prompt,
+          status: "running",
+          attempts: Number(row.attempts) + 1,
+          started_at: startedAt,
+        });
+      }
+    });
+  }
+
+  hasDueNoticeReminderDispatches(now = Date.now()) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM notice_reminder_dispatches
+      WHERE status = 'pending' AND attempts = 0 AND scheduled_at <= ? LIMIT 1
+    `).get(new Date(now).toISOString()));
+  }
+
+  noticeReminderDispatchHasReadProgress(dispatchId: string) {
+    const row = this.db.prepare(`
+      SELECT target_member_id, candidate_json, started_at FROM notice_reminder_dispatches WHERE id = ?
+    `).get(dispatchId) as Row | undefined;
+    if (!row?.started_at) return false;
+    const candidates = parseJson<NoticeReminderCandidate[]>(row.candidate_json, []);
+    if (candidates.length === 0) return false;
+    const placeholders = candidates.map(() => "?").join(", ");
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM notice_reads
+      WHERE member_id = ? AND read_at >= ? AND notice_id IN (${placeholders}) LIMIT 1
+    `).get(row.target_member_id, row.started_at, ...candidates.map((candidate) => candidate.noticeId)));
+  }
+
+  completeNoticeReminderDispatch(dispatchId: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM notice_reminder_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const completedAt = nowIso();
+      this.db.prepare(`
+        UPDATE notice_reminder_dispatches SET status = 'succeeded', completed_at = ?,
+          lease_expires_at = NULL, last_error = NULL WHERE id = ?
+      `).run(completedAt, dispatchId);
+      this.audit({
+        actorId: "system",
+        action: "notice.reminder_dispatch_delivered",
+        entityType: "notice_reminder",
+        entityId: row.run_id,
+        after: { dispatchId, targetMemberId: row.target_member_id, attempts: row.attempts },
+      });
+      return true;
+    });
+  }
+
+  failNoticeReminderDispatch(dispatchId: string, error: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM notice_reminder_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const reason = required(error, "notice reminder dispatch error").slice(0, 1000);
+      const member = this.getMember(row.target_member_id, { active: false });
+      if (!member.active) {
+        this.finishNoticeReminderWithoutDelivery(row, "canceled", "target member is inactive");
+        return false;
+      }
+      const candidates = this.relevantNoticeReminderCandidates(row.target_member_id, parseJson(row.candidate_json, []));
+      if (candidates.length === 0) {
+        this.finishNoticeReminderWithoutDelivery(row, "skipped", "all candidate notices are already read or no longer effective");
+        return false;
+      }
+      this.db.prepare(`
+        UPDATE notice_reminder_dispatches SET status = ?, last_error = ?, lease_expires_at = NULL,
+          completed_at = ? WHERE id = ?
+      `).run("failed", reason, nowIso(), dispatchId);
+      this.audit({
+        actorId: "system",
+        action: "notice.reminder_dispatch_failed",
+        entityType: "notice_reminder",
+        entityId: row.run_id,
+        reason,
+        after: { dispatchId, targetMemberId: row.target_member_id, attempts: row.attempts },
+      });
+      return false;
+    });
+  }
+
+  noticeReminderSummary(now = Date.now()) {
+    const localDate = shanghaiSlot(now).localDate;
+    const latestRun = this.db.prepare(`
+      SELECT * FROM notice_reminder_runs WHERE local_date = ? ORDER BY scheduled_at DESC LIMIT 1
+    `).get(localDate) as Row | undefined;
+    const nextRunAt = this.noticeReminderConfig.enabled
+      ? nextNoticeReminderRunAt(now, this.noticeReminderConfig.startHour, this.noticeReminderConfig.endHour)
+      : null;
+    const backlog = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM notice_reminder_dispatches
+      WHERE status = 'pending' AND scheduled_at <= ?
+    `).get(new Date(now).toISOString()) as Row;
+    const current = this.currentNoticeReminderCounts();
+    const base = {
+      enabled: this.noticeReminderConfig.enabled,
+      timeZone: this.noticeReminderConfig.timeZone,
+      startHour: this.noticeReminderConfig.startHour,
+      endHour: this.noticeReminderConfig.endHour,
+      nextRunAt,
+      backlog: Number(backlog.count),
+      currentUnreadAgents: current.agents,
+      currentUnreadEntries: current.entries,
+      today: { localDate, latestRun: null },
+    };
+    if (!latestRun) return base;
+    const statusRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM notice_reminder_dispatches WHERE run_id = ? GROUP BY status
+    `).all(latestRun.id) as Row[];
+    const counts = Object.fromEntries(statusRows.map((row) => [row.status, Number(row.count)]));
+    const totals = this.db.prepare(`
+      SELECT COUNT(*) AS candidate_agents, COALESCE(SUM(candidate_count), 0) AS candidate_unread_entries
+      FROM notice_reminder_dispatches WHERE run_id = ?
+    `).get(latestRun.id) as Row;
+    return {
+      ...base,
+      today: {
+        localDate,
+        latestRun: {
+          id: latestRun.id,
+          scheduledAt: latestRun.scheduled_at,
+          candidateAgents: Number(totals.candidate_agents),
+          candidateUnreadEntries: Number(totals.candidate_unread_entries),
+          pending: counts.pending ?? 0,
+          running: counts.running ?? 0,
+          delivered: counts.succeeded ?? 0,
+          failed: counts.failed ?? 0,
+          skipped: counts.skipped ?? 0,
+          canceled: counts.canceled ?? 0,
+        },
+      },
+    };
+  }
+
+  private noticeReminderRun(runId: string) {
+    const run = this.db.prepare("SELECT * FROM notice_reminder_runs WHERE id = ?").get(runId) as Row;
+    const dispatches = this.db.prepare(`
+      SELECT * FROM notice_reminder_dispatches WHERE run_id = ? ORDER BY created_at, rowid
+    `).all(runId) as Row[];
+    return {
+      id: run.id,
+      slotKey: run.slot_key,
+      scheduledAt: run.scheduled_at,
+      localDate: run.local_date,
+      localHour: Number(run.local_hour),
+      dispatches: dispatches.map((row) => mapNoticeReminderDispatch({ ...row, target_runtime_agent_id: row.target_member_id })),
+    };
+  }
+
+  private unreadNoticeReminderCandidates(memberId: string): NoticeReminderCandidate[] {
+    const rows = this.db.prepare(`
+      SELECT n.* FROM notices n
+      LEFT JOIN notices replacement ON replacement.supersedes_notice_id = n.id
+      LEFT JOIN notice_reads reads ON reads.notice_id = n.id AND reads.member_id = ?
+      WHERE replacement.id IS NULL AND reads.notice_id IS NULL
+      ORDER BY n.created_at, n.rowid
+    `).all(memberId) as Row[];
+    return rows.map(mapNoticeReminderCandidate);
+  }
+
+  private relevantNoticeReminderCandidates(memberId: string, candidates: NoticeReminderCandidate[]) {
+    if (candidates.length === 0) return [];
+    const placeholders = candidates.map(() => "?").join(", ");
+    const rows = this.db.prepare(`
+      SELECT n.id FROM notices n
+      LEFT JOIN notices replacement ON replacement.supersedes_notice_id = n.id
+      LEFT JOIN notice_reads reads ON reads.notice_id = n.id AND reads.member_id = ?
+      WHERE n.id IN (${placeholders}) AND replacement.id IS NULL AND reads.notice_id IS NULL
+    `).all(memberId, ...candidates.map((candidate) => candidate.noticeId)) as Row[];
+    const relevant = new Set(rows.map((row) => row.id as string));
+    return candidates.filter((candidate) => relevant.has(candidate.noticeId));
+  }
+
+  private currentNoticeReminderCounts() {
+    const rows = this.db.prepare(`
+      SELECT member.id AS member_id, COUNT(n.id) AS unread_count
+      FROM members member
+      JOIN notices n
+      LEFT JOIN notices replacement ON replacement.supersedes_notice_id = n.id
+      LEFT JOIN notice_reads reads ON reads.notice_id = n.id AND reads.member_id = member.id
+      WHERE member.kind = 'agent' AND member.active = 1
+        AND replacement.id IS NULL AND reads.notice_id IS NULL
+      GROUP BY member.id
+    `).all() as Row[];
+    return {
+      agents: rows.length,
+      entries: rows.reduce((total, row) => total + Number(row.unread_count), 0),
+    };
+  }
+
+  private finishNoticeReminderWithoutDelivery(row: Row, status: "skipped" | "canceled", reason: string) {
+    const completedAt = nowIso();
+    this.db.prepare(`
+      UPDATE notice_reminder_dispatches SET status = ?, last_error = ?, completed_at = ?,
+        lease_expires_at = NULL WHERE id = ?
+    `).run(status, reason, completedAt, row.id);
+    this.audit({
+      actorId: "system",
+      action: `notice.reminder_dispatch_${status}`,
+      entityType: "notice_reminder",
+      entityId: row.run_id,
+      reason,
+      after: { dispatchId: row.id, targetMemberId: row.target_member_id },
+    });
   }
 
   // ── Meetings ──────────────────────────────────────────────
@@ -2942,6 +3442,7 @@ export class CompanyOsStore {
           sourceMeetingId: meeting.id,
         });
       }
+      if (notice) this.markMeetingNoticeRead(meeting.id, notice.id);
       const endedAt = nowIso();
       this.addMeetingMessage(meeting.id, "member", hostId, null, `【主持人最终总结】\n${finalSummary}`);
       this.db.prepare(`
@@ -3184,16 +3685,7 @@ export class CompanyOsStore {
     blocksRoom: boolean,
   ) {
     const meeting = this.getMeetingRow(meetingId);
-    const participantRows = this.db.prepare(`
-      SELECT p.member_id FROM meeting_participants p
-      JOIN members member ON member.id = p.member_id
-      WHERE p.meeting_id = ?
-      ORDER BY CASE p.role WHEN 'worker' THEN 0 ELSE 1 END, member.created_at, p.rowid
-    `).all(meetingId) as Row[];
-    const memberIds = [...new Set([
-      ...participantRows.map((row) => row.member_id as string),
-      meeting.host_id as string,
-    ])];
+    const memberIds = this.meetingAgentMemberIds(meetingId);
     const toSequence = this.maxMeetingSequence(meetingId);
     const createdAt = nowIso();
     memberIds.forEach((memberId, position) => {
@@ -3239,6 +3731,39 @@ export class CompanyOsStore {
       }
     });
     return memberIds.length;
+  }
+
+  private meetingAgentMemberIds(meetingId: string) {
+    const meeting = this.getMeetingRow(meetingId);
+    const participantRows = this.db.prepare(`
+      SELECT p.member_id FROM meeting_participants p
+      JOIN members member ON member.id = p.member_id
+      WHERE p.meeting_id = ?
+      ORDER BY CASE p.role WHEN 'worker' THEN 0 ELSE 1 END, member.created_at, p.rowid
+    `).all(meetingId) as Row[];
+    return [...new Set([
+      ...participantRows.map((row) => row.member_id as string),
+      meeting.host_id as string,
+    ])];
+  }
+
+  private markMeetingNoticeRead(meetingId: string, noticeId: string) {
+    const memberIds = this.meetingAgentMemberIds(meetingId);
+    const readAt = nowIso();
+    const newlyMarkedMemberIds: string[] = [];
+    for (const memberId of memberIds) {
+      const result = this.db.prepare(`
+        INSERT OR IGNORE INTO notice_reads (notice_id, member_id, read_at) VALUES (?, ?, ?)
+      `).run(noticeId, memberId, readAt);
+      if (Number(result.changes) > 0) newlyMarkedMemberIds.push(memberId);
+    }
+    this.audit({
+      actorId: "system",
+      action: "notice.meeting_participants_marked_read",
+      entityType: "notice",
+      entityId: noticeId,
+      after: { meetingId, memberIds, newlyMarkedMemberIds },
+    });
   }
 
   private buildMeetingCloseoutPrompt(
@@ -4187,6 +4712,7 @@ export class CompanyOsStore {
         history: meetings.filter((meeting) => !OPEN_MEETING_STATUSES.has(meeting.status) && meeting.id !== closing?.id),
       },
       taskHourlyCheckin: this.taskCheckinSummary(),
+      noticeUnreadReminder: this.noticeReminderSummary(),
       generatedAt: nowIso(),
     };
   }
@@ -4341,9 +4867,24 @@ function taskDispatchAuditAction(kind: TaskAgentDispatchKind, phase: "queued" | 
   return kind === "boss_reminder" ? `task.reminder_${phase}` : `task.review_notification_${phase}`;
 }
 
-function buildTaskReminderPrompt(task: Row) {
+function buildNoticeReminderPrompt(candidates: NoticeReminderCandidate[], scheduledAt: string, dispatchId: string) {
+  const kindLabels = { manual: "管理公告", meeting_report: "会议汇报", correction: "更正公告" } as const;
+  return [
+    "【Company OS 公告半点提醒】",
+    `提醒调度 ID：${dispatchId}（同一调度 ID 只处理一次）`,
+    `检查时间：${scheduledAt}`,
+    `你有 ${candidates.length} 条当前有效且未读的公司公告：`,
+    ...candidates.map((candidate) => `- [${kindLabels[candidate.kind]}] ${candidate.title}（公告 ID：${candidate.noticeId}，发布于 ${candidate.createdAt}）`),
+    "请调用 company_notice_list，并设置 effectiveOnly=true，阅读以上公告的完整正文和更正关系。",
+    "确认理解后，逐条调用 company_notice_read 写入对应公告的 read mark。",
+    "请实际完成公告工具操作，不要只回复已收到。",
+  ].join("\n");
+}
+
+function buildTaskReminderPrompt(task: Row, dispatchId: string) {
   return [
     "【Company OS 任务催办】",
+    `通知 ID：${dispatchId}（同一通知 ID 只处理一次）`,
     `Boss 正在跟进任务「${task.title}」（任务 ID：${task.id}）。`,
     "请先调用 company_task_read 读取任务的最新版本、验收标准、子任务状态和已有进度，再根据实际情况执行下一步：",
     "- 若仍在执行，调用 company_task_progress 记录最新进展和下一步计划；",
@@ -4353,10 +4894,11 @@ function buildTaskReminderPrompt(task: Row) {
   ].join("\n");
 }
 
-function buildTaskCheckinPrompt(task: Row, actionKind: "review" | "execute") {
+function buildTaskCheckinPrompt(task: Row, actionKind: "review" | "execute", dispatchId: string) {
   if (actionKind === "review") {
     return [
       "【Company OS 任务整点巡检 · 待验收】",
+      `巡检调度 ID：${dispatchId}（同一调度 ID 只处理一次）`,
       "本次只处理下面这一项任务验收，不要扩展到其他任务。",
       `任务：${task.title}`,
       `任务 ID：${task.id}`,
@@ -4369,6 +4911,7 @@ function buildTaskCheckinPrompt(task: Row, actionKind: "review" | "execute") {
   }
   return [
     "【Company OS 任务整点巡检 · 执行提醒】",
+    `巡检调度 ID：${dispatchId}（同一调度 ID 只处理一次）`,
     "本次只推进下面这一项任务，不要扩展到其他任务。",
     `任务：${task.title}`,
     `任务 ID：${task.id}`,
@@ -4388,10 +4931,12 @@ function buildTaskReviewNotificationPrompt(
   reviewer: Row,
   kind: "review_accepted" | "review_rejected",
   feedback: string | null,
+  dispatchId: string,
 ) {
   const reviewerLabel = reviewer.kind === "boss" ? "Boss" : `${reviewer.name}（${reviewer.title}）`;
   const header = [
     "【Company OS 任务验收通知】",
+    `通知 ID：${dispatchId}（同一通知 ID 只处理一次）`,
     `任务「${task.title}」（任务 ID：${task.id}）已由 ${reviewerLabel} ${kind === "review_accepted" ? "验收通过" : "驳回验收"}。`,
   ];
   if (feedback) header.push(`验收意见：${feedback}`);
@@ -4459,6 +5004,21 @@ export function nextTaskCheckinRunAt(now: number, startHour: number, endHour: nu
   throw new Error("unable to calculate next task check-in run");
 }
 
+export function nextNoticeReminderRunAt(now: number, startHour: number, endHour: number) {
+  const local = new Date(now + SHANGHAI_OFFSET_MS);
+  const baseYear = local.getUTCFullYear();
+  const baseMonth = local.getUTCMonth();
+  const baseDate = local.getUTCDate();
+  for (let dayOffset = 0; dayOffset < 3; dayOffset += 1) {
+    for (let hour = startHour; hour <= endHour; hour += 1) {
+      const localCandidate = Date.UTC(baseYear, baseMonth, baseDate + dayOffset, hour, 30);
+      const candidate = localCandidate - SHANGHAI_OFFSET_MS;
+      if (candidate > now) return new Date(candidate).toISOString();
+    }
+  }
+  throw new Error("unable to calculate next notice reminder run");
+}
+
 function mapNotice(row: Row) {
   return {
     id: row.id,
@@ -4474,6 +5034,34 @@ function mapNotice(row: Row) {
     readCount: row.read_count === undefined ? undefined : Number(row.read_count),
     readAt: row.read_at ?? null,
     createdAt: row.created_at,
+  };
+}
+
+function mapNoticeReminderCandidate(row: Row): NoticeReminderCandidate {
+  return {
+    noticeId: row.id,
+    kind: row.kind,
+    title: row.title,
+    createdAt: row.created_at,
+  };
+}
+
+function mapNoticeReminderDispatch(row: Row): NoticeReminderDispatch {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    targetMemberId: row.target_member_id,
+    targetAgentId: row.target_runtime_agent_id ?? row.target_member_id,
+    scheduledAt: row.scheduled_at,
+    candidates: parseJson(row.candidate_json, []),
+    candidateCount: Number(row.candidate_count),
+    prompt: row.prompt ?? null,
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error ?? null,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
+    completedAt: row.completed_at ?? null,
   };
 }
 

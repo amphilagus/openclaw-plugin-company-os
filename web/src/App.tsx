@@ -91,6 +91,7 @@ function NoticesPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?
     <PageHeader eyebrow="CORPORATE CONSENSUS" title="公司告示板" summary="公告构成全体员工共同遵循的底层共识。公告不可编辑，修正通过新公告替代。">
       <button className="ghost" onClick={() => setHistory(!history)}>{history ? "只看当前共识" : "查看历史与更正"}</button>
     </PageHeader>
+    <NoticeReminderPanel summary={snapshot.noticeUnreadReminder} />
     <div className="notices-layout">
       <section className="notice-feed">
         {notices.length === 0 ? <Empty title="还没有公告" body="会议汇报与管理公告会出现在这里。" /> : notices.map((notice) =>
@@ -118,6 +119,33 @@ function NoticesPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?
       </aside>
     </div>
   </>;
+}
+
+export function NoticeReminderPanel({ summary }: { summary: Snapshot["noticeUnreadReminder"] }) {
+  const run = summary.today.latestRun;
+  return <section className="notice-reminder-panel panel">
+    <div className="notice-reminder-heading">
+      <div><span className="eyebrow">HALF-PAST NOTICE CHECK</span><h2>公告半点提醒</h2></div>
+      <Badge tone={summary.enabled ? "completed" : "canceled"}>{summary.enabled ? `半点 ${String(summary.startHour).padStart(2, "0")}:30–${String(summary.endHour).padStart(2, "0")}:30` : "已关闭"}</Badge>
+    </div>
+    <div className="notice-reminder-stats">
+      <NoticeReminderMetric label="最新一轮" value={run ? formatTime(run.scheduledAt) : "今日尚未运行"} />
+      <NoticeReminderMetric label="当前未读 Agent" value={String(summary.currentUnreadAgents)} />
+      <NoticeReminderMetric label="当前未读人次" value={String(summary.currentUnreadEntries)} />
+      <NoticeReminderMetric label="已送达" value={String(run?.delivered ?? 0)} />
+      <NoticeReminderMetric label="失败 / 跳过" value={`${run?.failed ?? 0} / ${run?.skipped ?? 0}`} tone={(run?.failed ?? 0) > 0 ? "danger" : undefined} />
+      <NoticeReminderMetric label="当前积压" value={String(summary.backlog)} tone={summary.backlog > 0 ? "warning" : undefined} />
+    </div>
+    <div className="notice-reminder-footer">
+      <span>下一轮：{formatTime(summary.nextRunAt)}</span>
+      <span>本轮候选：Agent {run?.candidateAgents ?? 0} · 未读人次 {run?.candidateUnreadEntries ?? 0}</span>
+      <span>发送中：{run?.running ?? 0} · 等待：{run?.pending ?? 0} · 取消：{run?.canceled ?? 0}</span>
+    </div>
+  </section>;
+}
+
+function NoticeReminderMetric({ label, value, tone }: { label: string; value: string; tone?: "danger" | "warning" }) {
+  return <div className={tone ? `notice-reminder-metric is-${tone}` : "notice-reminder-metric"}><small>{label}</small><strong>{value}</strong></div>;
 }
 
 function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: boolean) => Promise<void> }) {
@@ -325,6 +353,9 @@ function TaskNode({ task, all, visible, selectedId, select, depth }: { task: Tas
 
 export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail; members: Snapshot["organization"]; reload: (quiet?: boolean) => Promise<void> }) {
   const [reminding, setReminding] = useState(false);
+  const [reviewMode, setReviewMode] = useState<"accept" | "reject" | null>(null);
+  const [reviewFeedback, setReviewFeedback] = useState("");
+  const [reviewing, setReviewing] = useState(false);
   const action = async (name: string, body: Record<string, unknown>) => {
     try { await post(`/tasks/${detail.id}/${name}`, body); await reload(true); } catch (error) { window.alert(messageOf(error)); }
   };
@@ -339,6 +370,20 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
       setReminding(false);
     }
   };
+  const submitReview = async () => {
+    if (!reviewMode || (reviewMode === "reject" && !reviewFeedback.trim())) return;
+    setReviewing(true);
+    try {
+      await post(`/tasks/${detail.id}/review`, { decision: reviewMode, feedback: reviewFeedback.trim() });
+      setReviewMode(null);
+      setReviewFeedback("");
+      await reload(true);
+    } catch (error) {
+      window.alert(messageOf(error));
+    } finally {
+      setReviewing(false);
+    }
+  };
   const review = detail.status === "review" && detail.parentId === null;
   const canRemind = (["assigned", "in_progress", "blocked"] as string[]).includes(detail.status);
   const reminderActive = detail.reminderDispatch?.status === "pending" || detail.reminderDispatch?.status === "running";
@@ -351,11 +396,62 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
     {detail.submissions[0] ? <DetailBlock title="最近提交"><b>{detail.submissions[0].summary}</b>{detail.submissions[0].evidence.map((item, i) => <div className="evidence" key={i}><Badge tone={item.type}>{item.type}</Badge><span>{item.label}</span><code>{item.path ?? item.url ?? item.command ?? item.note}</code></div>)}</DetailBlock> : null}
     {detail.progress.length ? <DetailBlock title="进度记录">{detail.progress.map((item) => <div className="progress-entry" key={item.id}><span>{formatTime(item.createdAt)} · {item.authorId}</span><p>{item.body}</p></div>)}</DetailBlock> : null}
     {detail.versions.length > 1 ? <DetailBlock title="版本历史">{detail.versions.map((version) => <div className="version-entry" key={version.revision}><b>v{version.revision}</b><span>{version.changedBy} · {version.reason}</span><time>{formatTime(version.createdAt)}</time></div>)}</DetailBlock> : null}
-    {review ? <div className="review-actions"><button className="primary" onClick={() => void action("review", { decision: "accept", feedback: window.prompt("验收意见（可选）：") ?? "" })}>验收并关闭</button><button className="danger-button" onClick={() => { const feedback = window.prompt("驳回原因："); if (feedback) void action("review", { decision: "reject", feedback }); }}>驳回</button></div> : null}
+    {review ? <TaskReviewActions
+      mode={reviewMode}
+      feedback={reviewFeedback}
+      busy={reviewing}
+      choose={(mode) => { setReviewMode(mode); setReviewFeedback(""); }}
+      changeFeedback={setReviewFeedback}
+      submit={() => void submitReview()}
+      cancel={() => { setReviewMode(null); setReviewFeedback(""); }}
+    /> : null}
     {detail.reminderDispatch ? <div className={`reminder-status ${detail.reminderDispatch.status}`}><span>最近催办：{taskReminderStatus(detail.reminderDispatch.status)}</span><time>{formatTime(detail.reminderDispatch.completedAt ?? detail.reminderDispatch.startedAt ?? detail.reminderDispatch.createdAt)}</time>{detail.reminderDispatch.lastError ? <small>{detail.reminderDispatch.lastError}</small> : null}</div> : null}
     {detail.reviewNotificationDispatch ? <div className={`reminder-status review-notification ${detail.reviewNotificationDispatch.status}`}><span>最近验收通知：{taskReviewNotificationKind(detail.reviewNotificationDispatch.kind)} · {taskReminderStatus(detail.reviewNotificationDispatch.status)}</span><time>{formatTime(detail.reviewNotificationDispatch.completedAt ?? detail.reviewNotificationDispatch.startedAt ?? detail.reviewNotificationDispatch.createdAt)}</time>{detail.reviewNotificationDispatch.lastError ? <small>{detail.reviewNotificationDispatch.lastError}</small> : null}</div> : null}
     <details><summary>版本、进度与审计时间线</summary><div className="timeline">{detail.audit.map((item) => <div key={item.id}><i /><span>{formatTime(item.createdAt)}</span><b>{item.actorId}</b><code>{item.action}</code>{item.reason ? <small>{item.reason}</small> : null}</div>)}</div></details>
     {!(["closed", "canceled"] as string[]).includes(detail.status) ? <div className="fallback-actions">{canRemind ? <button className="remind-button" disabled={reminding || reminderActive} onClick={() => void remind()}>{reminding || reminderActive ? "正在通知负责人…" : "催促负责人"}</button> : null}<button onClick={() => { const reason = window.prompt("取消原因："); if (reason) void action("cancel", { reason }); }}>带审计取消</button><button onClick={() => { const assigneeId = window.prompt(`新负责人（必须是 ${detail.issuerId} 的直属下属）：`, detail.assigneeId); const reason = assigneeId && window.prompt("重派原因："); if (assigneeId && reason) void action("reassign", { assigneeId, reason }); }}>全局重派</button></div> : null}
+  </div>;
+}
+
+export function TaskReviewActions({
+  mode,
+  feedback,
+  busy,
+  choose,
+  changeFeedback,
+  submit,
+  cancel,
+}: {
+  mode: "accept" | "reject" | null;
+  feedback: string;
+  busy: boolean;
+  choose: (mode: "accept" | "reject") => void;
+  changeFeedback: (feedback: string) => void;
+  submit: () => void;
+  cancel: () => void;
+}) {
+  if (!mode) {
+    return <div className="review-actions">
+      <button type="button" className="primary" disabled={busy} onClick={() => choose("accept")}>验收并关闭</button>
+      <button type="button" className="danger-button" disabled={busy} onClick={() => choose("reject")}>驳回</button>
+    </div>;
+  }
+  const rejecting = mode === "reject";
+  return <div className={`task-review-form ${rejecting ? "is-reject" : "is-accept"}`}>
+    <span>{rejecting ? "驳回任务" : "完成验收"}</span>
+    <h3>{rejecting ? "说明需要负责人整改的内容" : "确认任务已经达到验收标准"}</h3>
+    <label>{rejecting ? "驳回原因（必填）" : "验收意见（可选）"}
+      <textarea
+        rows={3}
+        value={feedback}
+        disabled={busy}
+        placeholder={rejecting ? "具体说明未通过项和整改方向……" : "可以补充验收结论……"}
+        onChange={(event) => changeFeedback(event.target.value)}
+      />
+    </label>
+    <div className="task-review-form-actions">
+      <button type="button" className={rejecting ? "danger-button" : "primary"} disabled={busy || (rejecting && !feedback.trim())} onClick={submit}>{busy ? "提交中…" : rejecting ? "确认驳回" : "确认验收并关闭"}</button>
+      <button type="button" className="ghost" disabled={busy} onClick={cancel}>取消</button>
+    </div>
   </div>;
 }
 

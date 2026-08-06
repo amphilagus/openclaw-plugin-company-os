@@ -1,0 +1,34 @@
+.task-review-form {
+  display: grid;
+  gap: 11px;
+  margin-top: 20px;
+  padding: 15px;
+  border: 1px solid #b9d2c4;
+  border-radius: 10px;
+  background: #f4f9f6;
+}
+
+.task-review-form.is-reject {
+  border-color: #e2aaa6;
+  background: #fff5f4;
+}
+
+.task-review-form > span {
+  color: var(--green);
+  font: 800 10px var(--mono);
+  letter-spacing: .1em;
+}
+
+.task-review-form.is-reject > span {
+  color: var(--red);
+}
+
+.task-review-form h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.task-review-form-actions {
+  display: flex;
+  gap: 8px;
+}

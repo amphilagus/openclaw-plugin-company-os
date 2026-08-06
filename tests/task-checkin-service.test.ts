@@ -70,6 +70,41 @@ describe("task check-in service delivery", () => {
     }
   });
 
+  it("does not reinject a check-in after any Agent result", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-checkin-ambiguous-"));
+    const invoke = vi.fn(async () => ({
+      ok: false as const,
+      code: "aborted" as const,
+      error: "agent invocation aborted after launch",
+      attempts: 1,
+    }));
+    const service = new CompanyOsService({
+      databasePath: path.join(directory, "company-os.sqlite"),
+      allowedAgentIds: ["main"],
+      config: resolveConfig({ bossEmailNotifications: { enabled: false } }),
+      runtimeConfig: {},
+      logger: logger(),
+      agentInvoker: { invoke },
+    });
+    try {
+      service.store.createRootTask({
+        title: "巡检模糊失败",
+        description: "不重复注入",
+        acceptanceCriteria: "Agent 只调用一次",
+        assigneeId: "main",
+      });
+      const run = service.dispatchTaskCheckinRun(pastShanghaiTen());
+
+      await waitFor(() => expect(service.store.db.prepare("SELECT status, attempts FROM task_checkin_dispatches WHERE run_id = ? AND channel = 'agent'").get(run.id))
+        .toMatchObject({ status: "failed", attempts: 1 }));
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ maxInFlightRetries: 0 }));
+    } finally {
+      await service.stop();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("sends one unlimited Boss digest through the existing SMTP sender", async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-checkin-boss-service-"));
     const send = vi.fn(async () => undefined);
@@ -106,6 +141,42 @@ describe("task check-in service delivery", () => {
         reviews: expect.arrayContaining(roots.map((task) => expect.objectContaining({ taskId: task.id }))),
       }));
       expect((send.mock.calls[0]![0] as any).reviews).toHaveLength(4);
+    } finally {
+      await service.stop();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps retrying the separate Boss SMTP digest without reinjecting an Agent patrol", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-checkin-boss-retry-"));
+    const send = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary SMTP failure"))
+      .mockResolvedValueOnce(undefined);
+    const invoke = vi.fn(async () => ({ ok: true as const, text: "handled" }));
+    const service = new CompanyOsService({
+      databasePath: path.join(directory, "company-os.sqlite"),
+      allowedAgentIds: ["main"],
+      config: resolveConfig(undefined),
+      runtimeConfig: {},
+      logger: logger(),
+      meetingEmailSender: { send },
+      agentInvoker: { invoke },
+    });
+    try {
+      const task = service.store.createRootTask({
+        title: "Boss 邮件重试",
+        description: "SMTP 可重试",
+        acceptanceCriteria: "完成",
+        assigneeId: "main",
+      });
+      service.store.startTask("main", task.id);
+      service.store.submitTask("main", task.id, "完成", PROOF);
+      const run = service.dispatchTaskCheckinRun(pastShanghaiTen());
+
+      await waitFor(() => expect(service.store.db.prepare("SELECT status, attempts FROM task_checkin_dispatches WHERE run_id = ? AND channel = 'boss_email'").get(run.id))
+        .toMatchObject({ status: "succeeded", attempts: 2 }));
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(invoke).not.toHaveBeenCalled();
     } finally {
       await service.stop();
       rmSync(directory, { recursive: true, force: true });

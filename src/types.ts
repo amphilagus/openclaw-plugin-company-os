@@ -12,6 +12,7 @@ export type TaskAgentDispatchKind = "boss_reminder" | "review_accepted" | "revie
 export type TaskCheckinActionKind = "review" | "execute" | "boss_digest";
 export type TaskCheckinChannel = "agent" | "boss_email";
 export type TaskCheckinDispatchStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "canceled";
+export type NoticeReminderDispatchStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "canceled";
 export type MeetingType = "task" | "discussion";
 export type MeetingStatus = "queued" | "active" | "completed" | "canceled" | "timed_out";
 export type MeetingCloseoutOutcome = "completed" | "canceled" | "timed_out";
@@ -24,6 +25,11 @@ export type CompanyOsConfig = {
   meetingAutoEndDelaySeconds?: number;
   taskStaleAfterHours?: number;
   taskHourlyCheckins?: {
+    enabled?: boolean;
+    startHour?: number;
+    endHour?: number;
+  };
+  noticeUnreadReminders?: {
     enabled?: boolean;
     startHour?: number;
     endHour?: number;
@@ -45,6 +51,12 @@ export type ResolvedCompanyOsConfig = {
   meetingAutoEndDelaySeconds: number;
   taskStaleAfterHours: number;
   taskHourlyCheckins: {
+    enabled: boolean;
+    startHour: number;
+    endHour: number;
+    timeZone: "Asia/Shanghai";
+  };
+  noticeUnreadReminders: {
     enabled: boolean;
     startHour: number;
     endHour: number;
@@ -179,6 +191,30 @@ export type TaskCheckinDispatch = {
   completedAt: string | null;
 };
 
+export type NoticeReminderCandidate = {
+  noticeId: string;
+  kind: "manual" | "meeting_report" | "correction";
+  title: string;
+  createdAt: string;
+};
+
+export type NoticeReminderDispatch = {
+  id: string;
+  runId: string;
+  targetMemberId: string;
+  targetAgentId: string;
+  scheduledAt: string;
+  candidates: NoticeReminderCandidate[];
+  candidateCount: number;
+  prompt: string | null;
+  status: NoticeReminderDispatchStatus;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
 export type MeetingTurnDelivery = {
   turnId: string;
   speakerId: string;
@@ -206,10 +242,16 @@ export type HttpMutationActor = {
 export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedCompanyOsConfig {
   const email = config?.bossEmailNotifications;
   const taskCheckins = config?.taskHourlyCheckins;
+  const noticeReminders = config?.noticeUnreadReminders;
   const taskCheckinStartHour = boundedInteger(taskCheckins?.startHour, 8, 0, 23);
   const taskCheckinEndHour = boundedInteger(taskCheckins?.endHour, 17, 0, 23);
+  const noticeReminderStartHour = boundedInteger(noticeReminders?.startHour, 8, 0, 23);
+  const noticeReminderEndHour = boundedInteger(noticeReminders?.endHour, 17, 0, 23);
   if (taskCheckinStartHour > taskCheckinEndHour) {
     throw new Error("taskHourlyCheckins.startHour must not be later than endHour");
+  }
+  if (noticeReminderStartHour > noticeReminderEndHour) {
+    throw new Error("noticeUnreadReminders.startHour must not be later than endHour");
   }
   return {
     participantTurnTimeoutSeconds: clampInteger(config?.participantTurnTimeoutSeconds, 600, 60),
@@ -220,6 +262,12 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
       enabled: taskCheckins?.enabled !== false,
       startHour: taskCheckinStartHour,
       endHour: taskCheckinEndHour,
+      timeZone: "Asia/Shanghai",
+    },
+    noticeUnreadReminders: {
+      enabled: noticeReminders?.enabled !== false,
+      startHour: noticeReminderStartHour,
+      endHour: noticeReminderEndHour,
       timeZone: "Asia/Shanghai",
     },
     ...(config?.databasePath?.trim() ? { databasePath: config.databasePath.trim() } : {}),

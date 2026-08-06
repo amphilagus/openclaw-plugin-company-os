@@ -24,6 +24,12 @@
             startHour: 8,
             endHour: 17,
           },
+          noticeUnreadReminders: {
+            enabled: true,
+            // Runs at :30 for each hour in this inclusive window.
+            startHour: 8,
+            endHour: 17,
+          },
           // Defaults to the OpenClaw Agent marked default: true.
           // organizationAdminAgentId: "jia-goushi",
           // Boss is a human member, so this avatar does not come from agents.list.

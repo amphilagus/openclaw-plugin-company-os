@@ -32,15 +32,15 @@ plugins: {
 - 负责人持续调用 `company_task_progress`，避免 72 小时后出现 stale 告警。
 - Boss 可在活动任务详情点击「催促负责人」，主动唤醒负责人 main session 核对任务并推进实际状态；重复点击会在发送完成前自动去重。
 - 叶子负责人用 `company_task_submit` 提交摘要和 proof/artifact；派发者用 `company_task_review` 验收或驳回。
-- Agent 读取公告必须调用 `company_notice_read` 才会产生 read mark；读取 inbox 不会自动标记。
-- 后续可由架构师把 `company_inbox` 加入 Agent heartbeat；普通派发和公告不会主动唤醒 Agent，Boss 明确点击任务催办时除外。
+- Agent 读取普通公告必须调用 `company_notice_read` 才会产生 read mark；读取 inbox 或收到半点提醒不会自动标记。会议完成时产生的 `meeting_report` 是例外：主持人与全部 worker/advisor 因已经接收终局同步而由系统原子写入 read mark。
+- 后续可由架构师把 `company_inbox` 加入 Agent heartbeat；普通任务派发不会主动唤醒 Agent，公告发布后统一在北京时间半点汇总提醒，Boss 任务催办则立即进入持久队列。
 - 需要 Boss 直接参加的会议在 `company_meeting_request` 中设置 `bossParticipates: true`。Boss 会收到创建和进入会议室两封邮件，并在会议室页面负责开始、会前拒绝和最终结束审批。
 - 未邀请 Boss 的会议提交结束申请后默认倒计时 60 秒自动完成；这段时间会议仍占用唯一会议室。
 - 会议完成、取消或超时后先进入 WebUI 的“散会同步中”。主持人和全部参会 Agent 收到各自水位之后的最终时间线并确认送达后，会议才进入历史并让出下一场；Boss 不接收 Agent 调度。
 
 ## 会议恢复与超时
 
-- Gateway 重启后，活动会议、队列、任务草案、上下文水位、持久主持人任务和未完成终局同步从 SQLite 恢复。
+- Gateway 重启后，活动会议、队列、任务草案、上下文水位、持久主持人任务和未完成终局同步从 SQLite 恢复。任务巡检和公告提醒都只恢复从未尝试过的 dispatch；已经调用过 Agent 的巡检不会重新注入。
 - Boss 开始、排队会议激活和主持人恢复使用 `meeting_agent_dispatches`。遗留的 `running` 任务以原 ID 重新排队；`succeeded` 任务不会再次领取。
 - 重启时无法继续等待原调用者的同步参会者轮次会被审计标记失败，再由持久任务唤醒主持人检查记录并继续，系统不会伪造或重复参会者发言。
 - 普通参会者默认 10 分钟未发言：轮次标记失败，控制权回主持人。
@@ -66,7 +66,7 @@ plugins: {
 3. 将备份恢复到配置的 `databasePath`。
 4. 启动 Gateway，检查 `openclaw plugins doctor` 和会议室状态。
 
-Schema 版本保存在 `schema_meta`，当前版本为 v8，迁移在服务启动时执行。v4 会把旧成员别名规范成真实 Agent ID；v5 新增持久化 main-session 会议记录回写和主持人“等待回写完成”关联；v6 新增 Boss 任务催办持久调度表；v7 新增会议终局同步 outbox 和严格房间屏障；v8 扩展任务调度表以发送验收通过/驳回结果。v7 不回溯处理已存在的历史终态会议。不要手工修改任务状态、调度状态、水位或任何 outbox 来绕过状态机。
+Schema 版本保存在 `schema_meta`，当前版本为 v10，迁移在服务启动时执行。v4 会把旧成员别名规范成真实 Agent ID；v5 新增持久化 main-session 会议记录回写和主持人“等待回写完成”关联；v6 新增 Boss 任务催办持久调度表；v7 新增会议终局同步 outbox 和严格房间屏障；v8 扩展任务调度表以发送验收通过/驳回结果；v9 新增任务整点巡检；v10 新增公告半点提醒运行与 dispatch 表。迁移不会为历史公告补建提醒，首个正常半点才扫描现有未读。v7 不回溯处理已存在的历史终态会议。不要手工修改任务状态、调度状态、水位、read mark 或任何 outbox 来绕过状态机。
 
 ## 常见故障
 
@@ -106,11 +106,11 @@ openclaw config get gateway.controlUi.embedSandbox
 
 ### 任务催办一直显示“正在通知”或“发送失败”
 
-检查任务详情中的最近催办状态和 Gateway 日志里的 `company-os task reminder`。催办通过本机 `openclaw agent --agent <id> --message-file ... --json` 调用当前负责人的 main session，要求 `openclaw` 在 Gateway 进程的 `PATH` 中，且负责人仍是在职、可解析的真实 Agent ID。发送失败最多重新领取三次；Gateway 重启会恢复遗留的 `running` 记录。任务已进入 `review` / 终态或已经重派时，待发催办会自动取消并保留审计。
+检查任务详情中的最近催办状态和 Gateway 日志里的 `company-os task reminder`。催办通过本机 `openclaw agent --agent <id> --message-file ... --json` 调用当前负责人的 main session，要求 `openclaw` 在 Gateway 进程的 `PATH` 中，且负责人仍是在职、可解析的真实 Agent ID。`launch_failed` / `in_flight` 这类明确未注入的失败最多重新领取三次；超时、异常退出、无效 JSON、未确认完成的空响应或 Gateway 在调用中重启都属于结果不确定，系统会停止自动重放并保留失败记录，避免重复注入。任务已进入 `review` / 终态或已经重派时，待发催办会自动取消并保留审计。
 
 ### 任务验收通知一直显示“正在通知”或“发送失败”
 
-先确认验收人就是任务的 `issuerId`；根任务只能由 Boss 验收，子任务只能由实际派发者验收。验收结果与任务状态在同一事务内进入任务调度队列，再通过负责人的 main session 发送。检查任务详情中的“最近验收通知”、审计事件 `task.review_notification_*` 以及 Gateway 日志里的 `company-os task review_* dispatch`。通知失败最多重试三次，Gateway 重启会恢复发送；与催办不同，验收通知记录的是已经发生的历史结果，不会因任务随后重新提交或关闭而取消。
+先确认验收人就是任务的 `issuerId`；根任务只能由 Boss 验收，子任务只能由实际派发者验收。验收结果与任务状态在同一事务内进入任务调度队列，再通过负责人的 main session 发送。检查任务详情中的“最近验收通知”、审计事件 `task.review_notification_*` 以及 Gateway 日志里的 `company-os task review_* dispatch`。完成但没有正文的 CLI turn 会直接记为送达；驳回通知若已经产生负责人记录进度、阻塞处理、重提验收或创建整改子任务等审计操作，也会视为成功。只有明确未注入 main session 的失败才重试；结果不确定或 Gateway 中断会停止自动重放并留下失败原因。与催办不同，验收通知记录的是已经发生的历史结果，不会因任务随后重新提交或关闭而取消。
 
 ### 任务会议无法结束
 
@@ -164,8 +164,16 @@ Boss 不属于 `agents.list`，头像走独立逻辑。默认读取 `~/.openclaw
 
 ### 员工没有收到分时任务巡检
 
-先在“公司 → 任务”的“今日任务整点巡检”面板确认功能已开启、下一轮和下一提醒时间。默认只在北京时间 08:00–17:00 的整点建立新一轮，员工提示安排在 `:00`、`:15`、`:30`；Gateway 在整点之后才启动不会补建该小时，但数据库里已存在的历史槽位会继续发送。
+先在“公司 → 任务”的“今日任务整点巡检”面板确认功能已开启、下一轮和下一提醒时间。默认只在北京时间 08:00–17:00 的整点建立新一轮，员工提示安排在 `:00`、`:15`、`:30`；Gateway 在整点之后才启动不会补建该小时。数据库中从未启动的历史槽位会继续发送；一旦 Agent dispatch 已经领取并调用过，无论 Agent 是否回复、CLI 返回何种错误或 Gateway 是否中断，都不会自动重放。
 
-检查 `task_checkin_runs`、`task_checkin_batches` 和 `task_checkin_dispatches`。`skipped` 表示整点候选快照中的任务在实际发送前已经失效且没有可递补项；`failed` 表示三次 Agent 调用均失败。日志关键字为 `company-os task check-in`。每个提示只包含一个任务，成功送达只代表 Agent turn 完成，实际审批或推进结果应继续检查任务状态及审计。
+检查 `task_checkin_runs`、`task_checkin_batches` 和 `task_checkin_dispatches`。`skipped` 表示整点候选快照中的任务在实际发送前已经失效且没有可递补项；`failed` 表示唯一一次 Agent 调用未确认成功。日志关键字为 `company-os task check-in`。每个提示只包含一个任务，成功送达只代表 Agent turn 完成，实际审批或推进结果应继续检查任务状态及审计。Boss SMTP 汇总邮件与 Agent 巡检不同，临时失败仍最多重试三次。
 
 Boss 巡检邮件与会议邮件共用 `bossEmailNotifications`。任务页会显示 Boss 当前待验收数、异常数、邮件状态和最后错误；检查日志中的 `company-os sent Boss task check-in email`。显式关闭 Boss 邮件时，Boss 调度记为 `skipped`，任务页仍保留当前待办数量。
+
+### 员工没有收到公告半点提醒
+
+先在“公司 → 告示板”的“公告半点提醒”面板确认功能已开启、北京时间窗口、下一轮、当前未读 Agent/人次和积压。默认只在 08:30–17:30 的半点建立新一轮；Gateway 离线期间错过的半点不会补建，已经写入数据库但从未尝试的 dispatch 会在启动时恢复，已经尝试过的 dispatch 不会重发。配置项为 `noticeUnreadReminders.enabled/startHour/endHour`，起止小时都包含在窗口内，时区固定为 `Asia/Shanghai`。
+
+检查 `notice_reminder_runs`、`notice_reminder_dispatches`，以及 `entity_type=notice_reminder` 的审计。日志关键字为 `company-os notice reminder`。每名 Agent 每轮只有一条汇总：`pending` 等待唯一一次调用，`running` 已领取，`succeeded` 已进入 main session 或本轮已产生可信 `notice.read`，`failed` 表示唯一一次调用未确认成功且不会重试，`skipped` 表示候选在发送前已全部阅读/删除/被更正，或旧轮提醒仍未结束，`canceled` 表示目标员工已经停用。成功送达不会替普通公告写 read mark，因此员工未实际调用 `company_notice_read` 时下个半点会由新一轮、新 dispatch 再提醒。
+
+会议汇报少于预期未读人数时，先检查公告审计 `notice.meeting_participants_marked_read`：正常情况下主持人和 `meeting_participants` 中所有 worker/advisor 都会自动已读，并与 `meeting_closeout_dispatches` 的 Agent 成员集合一致；Boss 不在 read mark 中，未参会员工仍未读。取消、超时、未发布公告的讨论会不会产生这条审计。人工更正公告是新 ID，原参会者必须重新阅读。

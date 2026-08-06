@@ -238,6 +238,31 @@ describe("hierarchical tasks", () => {
     ]));
   });
 
+  it("reconciles review notification progress on restart without reinjecting an ambiguous delivery", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("重启恢复验收通知"), assigneeId: "cto" });
+    store.startTask("cto", root.id);
+    store.submitTask("cto", root.id, "首次提交", PROOF);
+    store.reviewTask("boss", root.id, "reject", "需要整改");
+
+    const progressedDispatch = store.claimNextTaskDispatch();
+    expect(progressedDispatch).toMatchObject({ kind: "review_rejected", attempts: 1 });
+    store.addTaskProgress("cto", root.id, "已开始整改");
+    expect(store.recoverTaskDispatches()).toBe(1);
+    expect(store.readTask("boss", root.id, false).reviewNotificationDispatch)
+      .toMatchObject({ id: progressedDispatch!.id, status: "succeeded", attempts: 1 });
+    expect(store.claimNextTaskDispatch()).toBeNull();
+
+    store.submitTask("cto", root.id, "再次提交", PROOF);
+    store.reviewTask("boss", root.id, "reject", "仍需整改");
+    const ambiguousDispatch = store.claimNextTaskDispatch();
+    expect(ambiguousDispatch).toMatchObject({ kind: "review_rejected", attempts: 1 });
+    expect(store.recoverTaskDispatches()).toBe(1);
+    expect(store.readTask("boss", root.id, false).reviewNotificationDispatch)
+      .toMatchObject({ id: ambiguousDispatch!.id, status: "failed", attempts: 1, lastError: expect.stringContaining("duplicate delivery") });
+    expect(store.claimNextTaskDispatch()).toBeNull();
+  });
+
   it("surfaces inbox changes without marking them read and supports reject/resubmit", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("Inbox 任务"), assigneeId: "cto" });

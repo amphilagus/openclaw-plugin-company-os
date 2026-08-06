@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { TaskDetailView } from "../web/src/App.js";
+import { TaskDetailView, TaskReviewActions } from "../web/src/App.js";
 import type { TaskDetail } from "../web/src/types.js";
 
 const task: TaskDetail = {
@@ -105,5 +105,38 @@ describe("Boss task reminder control", () => {
 
     expect(html).toContain("验收并关闭");
     expect(html).toContain("驳回");
+  });
+
+  it("renders an inline required rejection form without relying on browser prompts", () => {
+    const html = renderToStaticMarkup(<TaskReviewActions
+      mode="reject"
+      feedback=""
+      busy={false}
+      choose={vi.fn()}
+      changeFeedback={vi.fn()}
+      submit={vi.fn()}
+      cancel={vi.fn()}
+    />);
+
+    expect(html).toContain("驳回原因（必填）");
+    expect(html).toContain("确认驳回");
+    expect(html).toContain("disabled");
+    expect(html).not.toContain("window.prompt");
+  });
+
+  it("allows optional inline feedback when accepting a root task", () => {
+    const html = renderToStaticMarkup(<TaskReviewActions
+      mode="accept"
+      feedback="证据完整"
+      busy={false}
+      choose={vi.fn()}
+      changeFeedback={vi.fn()}
+      submit={vi.fn()}
+      cancel={vi.fn()}
+    />);
+
+    expect(html).toContain("验收意见（可选）");
+    expect(html).toContain("确认验收并关闭");
+    expect(html).not.toContain("disabled");
   });
 });

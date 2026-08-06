@@ -116,7 +116,7 @@ describe("hourly task check-in store", () => {
     expect(dispatch?.prompt).not.toContain(parent.id);
   });
 
-  it("records empty runs and retries a relevant dispatch at most three times", () => {
+  it("records empty runs and never retries the same Agent patrol dispatch", () => {
     store.close();
     rmSync(directory, { recursive: true, force: true });
     directory = mkdtempSync(path.join(os.tmpdir(), "company-os-checkin-empty-"));
@@ -132,22 +132,30 @@ describe("hourly task check-in store", () => {
 
     const task = store.createRootTask({ title: "重试任务", description: "说明", acceptanceCriteria: "标准", assigneeId: "main" });
     store.queueTaskCheckinRun("2030-01-01T03:00:00.000Z");
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const dispatch = store.claimNextTaskCheckinDispatch(Date.parse("2030-01-01T03:00:00.000Z"));
-      expect(dispatch).toMatchObject({ taskId: task.id, attempts: attempt });
-      expect(store.failTaskCheckinDispatch(dispatch!.id, `failure ${attempt}`)).toBe(attempt < 3);
-    }
+    const failed = store.claimNextTaskCheckinDispatch(Date.parse("2030-01-01T03:00:00.000Z"));
+    expect(failed).toMatchObject({ taskId: task.id, attempts: 1 });
+    expect(store.failTaskCheckinDispatch(failed!.id, "first failure")).toBe(false);
+    expect(store.claimNextTaskCheckinDispatch(Date.parse("2030-01-01T03:00:00.000Z"))).toBeNull();
     expect(store.db.prepare("SELECT status, attempts FROM task_checkin_dispatches WHERE task_id = ?").get(task.id))
-      .toMatchObject({ status: "failed", attempts: 3 });
+      .toMatchObject({ status: "failed", attempts: 1 });
 
     store.queueTaskCheckinRun("2030-01-01T04:00:00.000Z");
     const interrupted = store.claimNextTaskCheckinDispatch(Date.parse("2030-01-01T04:00:00.000Z"));
     expect(interrupted).toMatchObject({ status: "running", attempts: 1 });
     expect(store.recoverTaskCheckinDispatches()).toBe(1);
-    const recovered = store.claimNextTaskCheckinDispatch(Date.parse("2030-01-01T04:00:00.000Z"));
-    expect(recovered).toMatchObject({ id: interrupted!.id, status: "running", attempts: 2 });
-    expect(store.listAudit("task_checkin", recovered!.runId).map((event) => event.action))
-      .toContain("task.checkin_dispatch_recovered");
+    expect(store.claimNextTaskCheckinDispatch(Date.parse("2030-01-01T04:00:00.000Z"))).toBeNull();
+    expect(store.db.prepare("SELECT status, attempts, last_error FROM task_checkin_dispatches WHERE id = ?").get(interrupted!.id))
+      .toMatchObject({ status: "failed", attempts: 1, last_error: expect.stringContaining("duplicate delivery") });
+
+    store.startTask("main", task.id);
+    store.queueTaskCheckinRun("2030-01-01T05:00:00.000Z");
+    const progressed = store.claimNextTaskCheckinDispatch(Date.parse("2030-01-01T05:00:00.000Z"));
+    store.addTaskProgress("main", task.id, "已按巡检要求开始推进");
+    expect(store.recoverTaskCheckinDispatches()).toBe(1);
+    expect(store.db.prepare("SELECT status, attempts FROM task_checkin_dispatches WHERE id = ?").get(progressed!.id))
+      .toMatchObject({ status: "succeeded", attempts: 1 });
+    expect(store.listAudit("task_checkin", progressed!.runId).map((event) => event.action))
+      .toContain("task.checkin_dispatch_delivered");
   });
 });
 

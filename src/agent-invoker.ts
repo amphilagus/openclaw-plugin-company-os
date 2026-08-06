@@ -19,6 +19,7 @@ export type AgentInvocation = {
   agentId: string;
   prompt: string;
   timeoutSeconds: number;
+  maxInFlightRetries?: number;
   signal?: AbortSignal;
 };
 
@@ -56,18 +57,19 @@ export class OpenClawCliAgentInvoker implements AgentInvoker {
   async invoke(input: AgentInvocation): Promise<AgentInvocationResult> {
     const directory = await mkdtemp(path.join(os.tmpdir(), "company-os-agent-"));
     const promptFile = path.join(directory, "prompt.txt");
+    const maxInFlightRetries = input.maxInFlightRetries ?? this.maxInFlightRetries;
     try {
       await writeFile(promptFile, input.prompt, { encoding: "utf8", mode: 0o600 });
-      for (let attempt = 1; attempt <= this.maxInFlightRetries + 1; attempt += 1) {
+      for (let attempt = 1; attempt <= maxInFlightRetries + 1; attempt += 1) {
         const result = await this.invokeOnce(input, promptFile, attempt);
-        if (result.ok || result.code !== "in_flight" || attempt > this.maxInFlightRetries) return result;
+        if (result.ok || result.code !== "in_flight" || attempt > maxInFlightRetries) return result;
         try {
           await this.wait(this.retryDelayMs, input.signal);
         } catch {
           return { ok: false, code: "aborted", error: "agent invocation aborted", attempts: attempt };
         }
       }
-      return { ok: false, code: "in_flight", error: "agent session remained in flight", attempts: this.maxInFlightRetries + 1 };
+      return { ok: false, code: "in_flight", error: "agent session remained in flight", attempts: maxInFlightRetries + 1 };
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
