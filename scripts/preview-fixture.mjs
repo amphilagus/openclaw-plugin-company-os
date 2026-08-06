@@ -35,7 +35,19 @@ const snapshot = {
   organization: members,
   tasks,
   notices: [{ id: "notice-001", authorId: "main", kind: "manual", title: "Company OS 架构基线", body: "所有治理行为统一进入会议、任务和公告三个模块。\n任务关闭严格遵循自下而上原则。", sourceMeetingId: null, supersedesNoticeId: null, supersededById: null, effective: true, activeEmployeeCount: 4, readCount: 3, createdAt: now }],
-  meetings: { active: activeMeeting, queue: [{ ...activeMeeting, id: "meeting-002", type: "discussion", status: "queued", title: "前端交互评审", hostId: "eng-a", parentTaskId: null, queuePosition: 1, currentTurnId: null }], history: [historySummary] },
+  meetings: { active: activeMeeting, closing: null, queue: [{ ...activeMeeting, id: "meeting-002", type: "discussion", status: "queued", title: "前端交互评审", hostId: "eng-a", parentTaskId: null, queuePosition: 1, currentTurnId: null }], history: [historySummary] },
+  taskHourlyCheckin: {
+    enabled: true,
+    timeZone: "Asia/Shanghai",
+    startHour: 8,
+    endHour: 17,
+    nextRunAt: now,
+    nextDispatchAt: now,
+    nextDispatch: { scheduledAt: now, targetMemberId: "cto", channel: "agent", taskId: "child-002", title: "完成任务树与审计", actionKind: "review" },
+    backlog: 1,
+    today: { localDate: now.slice(0, 10), latestRun: { id: "checkin-001", scheduledAt: now, candidateEmployees: 2, plannedReminders: 5, pending: 1, running: 1, delivered: 3, failed: 0, skipped: 0, canceled: 0 } },
+    boss: { reviewCount: 1, anomalyCount: 1, emailStatus: "succeeded", lastError: null },
+  },
   generatedAt: now,
 };
 

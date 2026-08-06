@@ -56,12 +56,15 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 201, data: result.meeting };
   }
 
-  const taskAction = route.match(/^\/tasks\/([^/]+)\/(review|revise|reassign|cancel|unblock)$/);
+  const taskAction = route.match(/^\/tasks\/([^/]+)\/(review|revise|reassign|cancel|unblock|remind)$/);
   if (method === "POST" && taskAction) {
     const taskId = decodeURIComponent(taskAction[1]!);
     const action = taskAction[2]!;
+    if (action === "remind") {
+      return { status: 202, data: service.remindTaskByBoss(taskId) };
+    }
     const data = action === "review"
-      ? store.reviewTask("boss", taskId, body.decision, body.feedback)
+      ? service.reviewTask("boss", taskId, body.decision, body.feedback)
       : action === "revise"
         ? store.reviseTask("boss", taskId, body, body.reason)
         : action === "reassign"
@@ -104,7 +107,9 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
       await service.dispatchAdvance(advance);
       return { status: 200, data: store.meetingView(meetingId) };
     }
-    return { status: 200, data: store.cancelMeeting("boss", meetingId, body.reason) };
+    const canceled = store.cancelMeeting("boss", meetingId, body.reason);
+    await service.dispatchAdvance({});
+    return { status: 200, data: canceled };
   }
 
   throw new Error("Company OS API route not found");

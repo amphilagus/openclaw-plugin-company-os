@@ -1,0 +1,100 @@
+.meeting-closeout {
+  margin: 18px 0 4px;
+  padding: 22px;
+  border: 1px solid #d5c39b;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #fffaf0, #fff);
+}
+
+.meeting-closeout > span {
+  color: var(--amber);
+  font: 750 10px var(--mono);
+  letter-spacing: 0.1em;
+}
+
+.meeting-closeout h3 {
+  margin: 8px 0 6px;
+  font-size: 19px;
+}
+
+.meeting-closeout p,
+.meeting-closeout small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.meeting-closeout em {
+  display: block;
+  margin-top: 8px;
+  color: var(--red);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.closeout-progress {
+  height: 6px;
+  margin: 15px 0 9px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #e8e2d5;
+}
+
+.closeout-progress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green);
+  transition: width 180ms ease;
+}
+
+.closeout-member {
+  display: grid;
+  grid-template-columns: 8px 1fr;
+  gap: 9px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.closeout-member:last-child {
+  border-bottom: 0;
+}
+
+.closeout-member > i {
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: #b7bdb9;
+}
+
+.closeout-member.running > i {
+  background: var(--amber);
+  box-shadow: 0 0 0 4px #f7eedf;
+}
+
+.closeout-member.succeeded > i {
+  background: var(--green);
+}
+
+.closeout-member b,
+.closeout-member small,
+.closeout-member span {
+  display: block;
+}
+
+.closeout-member b {
+  font-size: 12px;
+}
+
+.closeout-member small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.closeout-member span {
+  margin-top: 5px;
+  color: var(--red);
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}

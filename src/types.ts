@@ -8,8 +8,13 @@ export const TASK_STATUSES = [
 ] as const;
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
+export type TaskAgentDispatchKind = "boss_reminder" | "review_accepted" | "review_rejected";
+export type TaskCheckinActionKind = "review" | "execute" | "boss_digest";
+export type TaskCheckinChannel = "agent" | "boss_email";
+export type TaskCheckinDispatchStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "canceled";
 export type MeetingType = "task" | "discussion";
 export type MeetingStatus = "queued" | "active" | "completed" | "canceled" | "timed_out";
+export type MeetingCloseoutOutcome = "completed" | "canceled" | "timed_out";
 export type ParticipantRole = "worker" | "advisor";
 export type Actor = "boss" | string;
 
@@ -18,6 +23,11 @@ export type CompanyOsConfig = {
   hostIdleTimeoutSeconds?: number;
   meetingAutoEndDelaySeconds?: number;
   taskStaleAfterHours?: number;
+  taskHourlyCheckins?: {
+    enabled?: boolean;
+    startHour?: number;
+    endHour?: number;
+  };
   databasePath?: string;
   organizationAdminAgentId?: string;
   bossAvatarPath?: string;
@@ -34,6 +44,12 @@ export type ResolvedCompanyOsConfig = {
   hostIdleTimeoutSeconds: number;
   meetingAutoEndDelaySeconds: number;
   taskStaleAfterHours: number;
+  taskHourlyCheckins: {
+    enabled: boolean;
+    startHour: number;
+    endHour: number;
+    timeZone: "Asia/Shanghai";
+  };
   databasePath?: string;
   organizationAdminAgentId?: string;
   bossAvatarPath: string;
@@ -122,6 +138,47 @@ export type MeetingSessionContextAppend = {
   appendedAt: string | null;
 };
 
+export type MeetingCloseoutDispatch = {
+  id: string;
+  meetingId: string;
+  memberId: string;
+  memberName: string;
+  runtimeAgentId: string;
+  outcome: MeetingCloseoutOutcome;
+  blocksRoom: boolean;
+  position: number;
+  contextFromSequence: number;
+  contextToSequence: number;
+  prompt: string;
+  status: "pending" | "running" | "succeeded";
+  attempts: number;
+  lastError: string | null;
+  nextAttemptAt: string;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
+export type TaskCheckinDispatch = {
+  id: string;
+  runId: string;
+  batchId: string;
+  targetMemberId: string;
+  targetAgentId: string | null;
+  channel: TaskCheckinChannel;
+  slotIndex: number;
+  scheduledAt: string;
+  taskId: string | null;
+  actionKind: TaskCheckinActionKind | null;
+  prompt: string | null;
+  status: TaskCheckinDispatchStatus;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
 export type MeetingTurnDelivery = {
   turnId: string;
   speakerId: string;
@@ -148,11 +205,23 @@ export type HttpMutationActor = {
 
 export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedCompanyOsConfig {
   const email = config?.bossEmailNotifications;
+  const taskCheckins = config?.taskHourlyCheckins;
+  const taskCheckinStartHour = boundedInteger(taskCheckins?.startHour, 8, 0, 23);
+  const taskCheckinEndHour = boundedInteger(taskCheckins?.endHour, 17, 0, 23);
+  if (taskCheckinStartHour > taskCheckinEndHour) {
+    throw new Error("taskHourlyCheckins.startHour must not be later than endHour");
+  }
   return {
     participantTurnTimeoutSeconds: clampInteger(config?.participantTurnTimeoutSeconds, 600, 60),
     hostIdleTimeoutSeconds: clampInteger(config?.hostIdleTimeoutSeconds, 1800, 60),
     meetingAutoEndDelaySeconds: clampInteger(config?.meetingAutoEndDelaySeconds, 60, 1),
     taskStaleAfterHours: clampInteger(config?.taskStaleAfterHours, 72, 1),
+    taskHourlyCheckins: {
+      enabled: taskCheckins?.enabled !== false,
+      startHour: taskCheckinStartHour,
+      endHour: taskCheckinEndHour,
+      timeZone: "Asia/Shanghai",
+    },
     ...(config?.databasePath?.trim() ? { databasePath: config.databasePath.trim() } : {}),
     ...(config?.organizationAdminAgentId?.trim() ? { organizationAdminAgentId: config.organizationAdminAgentId.trim() } : {}),
     bossAvatarPath: config?.bossAvatarPath?.trim() || "~/.openclaw/workspace-boss/avatar.png",
@@ -168,4 +237,9 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
 function clampInteger(value: number | undefined, fallback: number, minimum: number) {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(minimum, Math.floor(value as number));
+}
+
+function boundedInteger(value: number | undefined, fallback: number, minimum: number, maximum: number) {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(maximum, Math.max(minimum, Math.floor(value as number)));
 }

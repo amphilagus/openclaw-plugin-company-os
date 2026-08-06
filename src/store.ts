@@ -7,6 +7,8 @@ import type {
   Actor,
   EvidenceInput,
   MeetingAdvance,
+  MeetingCloseoutDispatch,
+  MeetingCloseoutOutcome,
   MeetingContextEnvelope,
   MeetingParticipantInput,
   MeetingSessionContextAppend,
@@ -17,12 +19,17 @@ import type {
   MeetingType,
   ResolvedCompanyOsConfig,
   ServiceEvent,
+  TaskAgentDispatchKind,
+  TaskCheckinActionKind,
+  TaskCheckinDispatch,
   TaskDraftInput,
   TaskStatus,
 } from "./types.js";
-import type { MeetingEmailKind, MeetingEmailNotification } from "./email.js";
+import type { MeetingEmailKind, MeetingEmailNotification, TaskCheckinEmailItem, TaskCheckinEmailNotification } from "./email.js";
 
 type Row = Record<string, any>;
+type TaskCheckinCandidate = { taskId: string; actionKind: "review" | "execute"; actionAt: string };
+type BossTaskCheckinCandidate = { taskId: string; review: boolean; anomaly: boolean };
 
 const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(["closed", "canceled"]);
 const ACTIVE_TASK_STATUSES = new Set<TaskStatus>(["assigned", "in_progress", "review", "blocked"]);
@@ -33,6 +40,8 @@ export class CompanyOsStore {
   private readonly allowedAgentIds: Set<string>;
   private readonly staleAfterMs: number;
   private readonly automaticEndDelayMs: number;
+  private readonly taskCheckinConfig: ResolvedCompanyOsConfig["taskHourlyCheckins"];
+  private readonly bossEmailEnabled: boolean;
   private readonly organizationAdminAgentId: string;
   private readonly onEvent?: (event: ServiceEvent) => void;
   private transactionDepth = 0;
@@ -50,6 +59,8 @@ export class CompanyOsStore {
     this.allowedAgentIds = new Set([...options.allowedAgentIds].map((id) => id.trim()).filter(Boolean));
     this.staleAfterMs = options.config.taskStaleAfterHours * 60 * 60 * 1000;
     this.automaticEndDelayMs = options.config.meetingAutoEndDelaySeconds * 1000;
+    this.taskCheckinConfig = options.config.taskHourlyCheckins;
+    this.bossEmailEnabled = options.config.bossEmailNotifications.enabled;
     this.onEvent = options.onEvent;
     this.initializeSchema();
     this.organizationAdminAgentId = this.resolveOrganizationAdminAgentId(options.organizationAdminAgentId);
@@ -68,28 +79,66 @@ export class CompanyOsStore {
     const schemaRow = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as Row | undefined;
     const currentVersion = schemaRow ? Number(schemaRow.value) : 0;
     if (!Number.isInteger(currentVersion) || currentVersion < 0) throw new Error("company-os schema version is invalid");
-    if (currentVersion > 5) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
-    if (currentVersion === 5) return;
+    if (currentVersion > 9) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
+    if (currentVersion === 9) return;
+    if (currentVersion === 8) {
+      this.migrateSchemaV9();
+      return;
+    }
     if (currentVersion === 1) {
       this.migrateSchemaV2();
       this.migrateSchemaV3();
       this.migrateSchemaV4();
       this.migrateSchemaV5();
+      this.migrateSchemaV6();
+      this.migrateSchemaV7();
+      this.migrateSchemaV8();
+      this.migrateSchemaV9();
       return;
     }
     if (currentVersion === 2) {
       this.migrateSchemaV3();
       this.migrateSchemaV4();
       this.migrateSchemaV5();
+      this.migrateSchemaV6();
+      this.migrateSchemaV7();
+      this.migrateSchemaV8();
+      this.migrateSchemaV9();
       return;
     }
     if (currentVersion === 3) {
       this.migrateSchemaV4();
       this.migrateSchemaV5();
+      this.migrateSchemaV6();
+      this.migrateSchemaV7();
+      this.migrateSchemaV8();
+      this.migrateSchemaV9();
       return;
     }
     if (currentVersion === 4) {
       this.migrateSchemaV5();
+      this.migrateSchemaV6();
+      this.migrateSchemaV7();
+      this.migrateSchemaV8();
+      this.migrateSchemaV9();
+      return;
+    }
+    if (currentVersion === 5) {
+      this.migrateSchemaV6();
+      this.migrateSchemaV7();
+      this.migrateSchemaV8();
+      this.migrateSchemaV9();
+      return;
+    }
+    if (currentVersion === 6) {
+      this.migrateSchemaV7();
+      this.migrateSchemaV8();
+      this.migrateSchemaV9();
+      return;
+    }
+    if (currentVersion === 7) {
+      this.migrateSchemaV8();
+      this.migrateSchemaV9();
       return;
     }
     this.db.exec("BEGIN IMMEDIATE");
@@ -187,6 +236,62 @@ export class CompanyOsStore {
         revision INTEGER NOT NULL,
         seen_at TEXT NOT NULL,
         PRIMARY KEY(member_id, task_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS task_agent_dispatches (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        target_agent_id TEXT NOT NULL REFERENCES members(id),
+        kind TEXT NOT NULL CHECK (kind IN ('boss_reminder', 'review_accepted', 'review_rejected')),
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS task_checkin_runs (
+        id TEXT PRIMARY KEY,
+        slot_key TEXT NOT NULL UNIQUE,
+        scheduled_at TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS task_checkin_batches (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES task_checkin_runs(id) ON DELETE CASCADE,
+        target_member_id TEXT NOT NULL REFERENCES members(id),
+        channel TEXT NOT NULL CHECK (channel IN ('agent', 'boss_email')),
+        candidate_json TEXT NOT NULL,
+        candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+        created_at TEXT NOT NULL,
+        UNIQUE(run_id, target_member_id, channel)
+      );
+
+      CREATE TABLE IF NOT EXISTS task_checkin_dispatches (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES task_checkin_runs(id) ON DELETE CASCADE,
+        batch_id TEXT NOT NULL REFERENCES task_checkin_batches(id) ON DELETE CASCADE,
+        target_member_id TEXT NOT NULL REFERENCES members(id),
+        channel TEXT NOT NULL CHECK (channel IN ('agent', 'boss_email')),
+        slot_index INTEGER NOT NULL CHECK (slot_index BETWEEN 0 AND 2),
+        scheduled_at TEXT NOT NULL,
+        task_id TEXT REFERENCES tasks(id),
+        action_kind TEXT CHECK (action_kind IN ('review', 'execute', 'boss_digest')),
+        prompt TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'canceled')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE(batch_id, slot_index)
       );
 
       CREATE TABLE IF NOT EXISTS notices (
@@ -357,18 +462,47 @@ export class CompanyOsStore {
         completed_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS meeting_closeout_dispatches (
+        id TEXT PRIMARY KEY,
+        meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id),
+        runtime_agent_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'canceled', 'timed_out')),
+        blocks_room INTEGER NOT NULL DEFAULT 0 CHECK (blocks_room IN (0, 1)),
+        position INTEGER NOT NULL,
+        context_from_sequence INTEGER NOT NULL DEFAULT 0 CHECK (context_from_sequence >= 0),
+        context_to_sequence INTEGER NOT NULL DEFAULT 0 CHECK (context_to_sequence >= 0),
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        next_attempt_at TEXT NOT NULL,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE(meeting_id, member_id)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee_id, status);
       CREATE INDEX IF NOT EXISTS idx_tasks_issuer_status ON tasks(issuer_id, status);
+      CREATE INDEX IF NOT EXISTS idx_task_dispatch_pending ON task_agent_dispatches(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_task_checkin_dispatch_due
+        ON task_checkin_dispatches(status, scheduled_at, created_at);
+      CREATE INDEX IF NOT EXISTS idx_task_checkin_rotation
+        ON task_checkin_dispatches(target_member_id, status, completed_at);
       CREATE INDEX IF NOT EXISTS idx_notices_created ON notices(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_meetings_status_queue ON meetings(status, queue_position);
       CREATE INDEX IF NOT EXISTS idx_meeting_messages_sequence ON meeting_messages(meeting_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_meeting_email_pending ON meeting_email_notifications(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_meeting_context_append_pending ON meeting_session_context_appends(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_meeting_dispatch_pending ON meeting_agent_dispatches(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_meeting_closeout_pending
+        ON meeting_closeout_dispatches(status, blocks_room DESC, next_attempt_at, position);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meeting ON meetings(status) WHERE status = 'active';
       `);
-      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '5')").run();
+      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '9')").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -562,6 +696,165 @@ export class CompanyOsStore {
         this.db.exec("ALTER TABLE meeting_agent_dispatches ADD COLUMN wait_for_context_append_id TEXT REFERENCES meeting_session_context_appends(id)");
       }
       this.db.prepare("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV6() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS task_agent_dispatches (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          target_agent_id TEXT NOT NULL REFERENCES members(id),
+          kind TEXT NOT NULL CHECK (kind = 'boss_reminder'),
+          prompt TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_dispatch_pending
+          ON task_agent_dispatches(status, created_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '6' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV7() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS meeting_closeout_dispatches (
+          id TEXT PRIMARY KEY,
+          meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+          member_id TEXT NOT NULL REFERENCES members(id),
+          runtime_agent_id TEXT NOT NULL,
+          outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'canceled', 'timed_out')),
+          blocks_room INTEGER NOT NULL DEFAULT 0 CHECK (blocks_room IN (0, 1)),
+          position INTEGER NOT NULL,
+          context_from_sequence INTEGER NOT NULL DEFAULT 0 CHECK (context_from_sequence >= 0),
+          context_to_sequence INTEGER NOT NULL DEFAULT 0 CHECK (context_to_sequence >= 0),
+          prompt TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          next_attempt_at TEXT NOT NULL,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT,
+          UNIQUE(meeting_id, member_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_meeting_closeout_pending
+          ON meeting_closeout_dispatches(status, blocks_room DESC, next_attempt_at, position);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '7' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV8() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        DROP INDEX IF EXISTS idx_task_dispatch_pending;
+        ALTER TABLE task_agent_dispatches RENAME TO task_agent_dispatches_v7;
+        CREATE TABLE task_agent_dispatches (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          target_agent_id TEXT NOT NULL REFERENCES members(id),
+          kind TEXT NOT NULL CHECK (kind IN ('boss_reminder', 'review_accepted', 'review_rejected')),
+          prompt TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT
+        );
+        INSERT INTO task_agent_dispatches (
+          id, task_id, target_agent_id, kind, prompt, status, attempts, last_error,
+          lease_expires_at, created_at, started_at, completed_at
+        )
+        SELECT
+          id, task_id, target_agent_id, kind, prompt, status, attempts, last_error,
+          lease_expires_at, created_at, started_at, completed_at
+        FROM task_agent_dispatches_v7;
+        DROP TABLE task_agent_dispatches_v7;
+        CREATE INDEX idx_task_dispatch_pending ON task_agent_dispatches(status, created_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '8' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV9() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS task_checkin_runs (
+          id TEXT PRIMARY KEY,
+          slot_key TEXT NOT NULL UNIQUE,
+          scheduled_at TEXT NOT NULL,
+          local_date TEXT NOT NULL,
+          local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS task_checkin_batches (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES task_checkin_runs(id) ON DELETE CASCADE,
+          target_member_id TEXT NOT NULL REFERENCES members(id),
+          channel TEXT NOT NULL CHECK (channel IN ('agent', 'boss_email')),
+          candidate_json TEXT NOT NULL,
+          candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
+          created_at TEXT NOT NULL,
+          UNIQUE(run_id, target_member_id, channel)
+        );
+        CREATE TABLE IF NOT EXISTS task_checkin_dispatches (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES task_checkin_runs(id) ON DELETE CASCADE,
+          batch_id TEXT NOT NULL REFERENCES task_checkin_batches(id) ON DELETE CASCADE,
+          target_member_id TEXT NOT NULL REFERENCES members(id),
+          channel TEXT NOT NULL CHECK (channel IN ('agent', 'boss_email')),
+          slot_index INTEGER NOT NULL CHECK (slot_index BETWEEN 0 AND 2),
+          scheduled_at TEXT NOT NULL,
+          task_id TEXT REFERENCES tasks(id),
+          action_kind TEXT CHECK (action_kind IN ('review', 'execute', 'boss_digest')),
+          prompt TEXT,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'canceled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT,
+          UNIQUE(batch_id, slot_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_checkin_dispatch_due
+          ON task_checkin_dispatches(status, scheduled_at, created_at);
+        CREATE INDEX IF NOT EXISTS idx_task_checkin_rotation
+          ON task_checkin_dispatches(target_member_id, status, completed_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '9' WHERE key = 'schema_version'").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -864,13 +1157,740 @@ export class CompanyOsStore {
     const versions = this.db.prepare("SELECT * FROM task_versions WHERE task_id = ? ORDER BY revision DESC").all(taskId) as Row[];
     const progress = this.db.prepare("SELECT * FROM task_progress WHERE task_id = ? ORDER BY created_at ASC").all(taskId) as Row[];
     const submissions = this.db.prepare("SELECT * FROM task_submissions WHERE task_id = ? ORDER BY created_at DESC").all(taskId) as Row[];
+    const latestReminder = this.db.prepare(`
+      SELECT * FROM task_agent_dispatches
+      WHERE task_id = ? AND kind = 'boss_reminder'
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(taskId) as Row | undefined;
+    const latestReviewNotification = this.db.prepare(`
+      SELECT * FROM task_agent_dispatches
+      WHERE task_id = ? AND kind IN ('review_accepted', 'review_rejected')
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(taskId) as Row | undefined;
     return {
       ...task,
       versions: versions.map(mapTaskVersion),
       progress: progress.map(mapTaskProgress),
       submissions: submissions.map(mapTaskSubmission),
+      reminderDispatch: latestReminder ? mapTaskAgentDispatch(latestReminder) : null,
+      reviewNotificationDispatch: latestReviewNotification ? mapTaskAgentDispatch(latestReviewNotification) : null,
       audit: this.listAudit("task", taskId),
     };
+  }
+
+  queueTaskReminderByBoss(taskId: string) {
+    const task = this.getTaskRow(taskId);
+    if (!(["assigned", "in_progress", "blocked"] as string[]).includes(task.status)) {
+      throw new Error("only assigned, in-progress, or blocked tasks can be reminded");
+    }
+    const targetAgentId = this.runtimeAgentId(task.assignee_id);
+    const inFlight = this.db.prepare(`
+      SELECT * FROM task_agent_dispatches
+      WHERE task_id = ? AND target_agent_id = ? AND kind = 'boss_reminder' AND status IN ('pending', 'running')
+      ORDER BY created_at DESC, rowid DESC LIMIT 1
+    `).get(taskId, task.assignee_id) as Row | undefined;
+    if (inFlight) return mapTaskAgentDispatch({ ...inFlight, target_runtime_agent_id: targetAgentId });
+    return this.transaction(() => {
+      const id = randomUUID();
+      const prompt = buildTaskReminderPrompt(task);
+      const createdAt = nowIso();
+      this.db.prepare(`
+        INSERT INTO task_agent_dispatches (
+          id, task_id, target_agent_id, kind, prompt, status, created_at
+        ) VALUES (?, ?, ?, 'boss_reminder', ?, 'pending', ?)
+      `).run(id, taskId, task.assignee_id, prompt, createdAt);
+      this.audit({
+        actorId: "boss",
+        action: "task.reminder_queued",
+        entityType: "task",
+        entityId: taskId,
+        after: { dispatchId: id, targetAgentId, taskStatus: task.status },
+      });
+      return mapTaskAgentDispatch({
+        id,
+        task_id: taskId,
+        target_agent_id: task.assignee_id,
+        target_runtime_agent_id: targetAgentId,
+        kind: "boss_reminder",
+        prompt,
+        status: "pending",
+        attempts: 0,
+        last_error: null,
+        lease_expires_at: null,
+        created_at: createdAt,
+        started_at: null,
+        completed_at: null,
+      });
+    });
+  }
+
+  recoverTaskDispatches() {
+    return this.transaction(() => {
+      const rows = this.db.prepare("SELECT * FROM task_agent_dispatches WHERE status = 'running'").all() as Row[];
+      for (const row of rows) {
+        this.db.prepare(`
+          UPDATE task_agent_dispatches SET status = 'pending', lease_expires_at = NULL,
+            last_error = 'Gateway restarted during task dispatch' WHERE id = ?
+        `).run(row.id);
+        this.audit({
+          actorId: "system",
+          action: taskDispatchAuditAction(row.kind, "recovered"),
+          entityType: "task",
+          entityId: row.task_id,
+          after: { dispatchId: row.id, kind: row.kind },
+        });
+      }
+      return rows.length;
+    });
+  }
+
+  claimNextTaskDispatch(leaseMs = 15 * 60 * 1000) {
+    return this.transaction(() => {
+      while (true) {
+        const row = this.db.prepare(`
+          SELECT * FROM task_agent_dispatches
+          WHERE status = 'pending' AND attempts < 3
+          ORDER BY created_at, rowid LIMIT 1
+        `).get() as Row | undefined;
+        if (!row) return null;
+        const task = this.getTaskRow(row.task_id);
+        if (row.kind === "boss_reminder"
+          && (!(["assigned", "in_progress", "blocked"] as string[]).includes(task.status) || task.assignee_id !== row.target_agent_id)) {
+          const completedAt = nowIso();
+          this.db.prepare(`
+            UPDATE task_agent_dispatches SET status = 'canceled', completed_at = ?, lease_expires_at = NULL WHERE id = ?
+          `).run(completedAt, row.id);
+          this.audit({
+            actorId: "system",
+            action: taskDispatchAuditAction(row.kind, "canceled"),
+            entityType: "task",
+            entityId: row.task_id,
+            reason: task.assignee_id !== row.target_agent_id ? "task assignee changed" : "task no longer accepts reminders",
+            after: { dispatchId: row.id, kind: row.kind },
+          });
+          continue;
+        }
+        const startedAt = nowIso();
+        this.db.prepare(`
+          UPDATE task_agent_dispatches SET status = 'running', attempts = attempts + 1,
+            started_at = ?, lease_expires_at = ?, last_error = NULL WHERE id = ?
+        `).run(startedAt, new Date(Date.now() + leaseMs).toISOString(), row.id);
+        return mapTaskAgentDispatch({
+          ...row,
+          target_runtime_agent_id: this.runtimeAgentId(row.target_agent_id),
+          status: "running",
+          attempts: Number(row.attempts) + 1,
+          started_at: startedAt,
+        });
+      }
+    });
+  }
+
+  hasPendingTaskDispatches() {
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM task_agent_dispatches WHERE status = 'pending' AND attempts < 3 LIMIT 1
+    `).get());
+  }
+
+  taskDispatchHasProgress(dispatchId: string) {
+    const row = this.db.prepare(`
+      SELECT task_id, target_agent_id, kind, started_at FROM task_agent_dispatches WHERE id = ?
+    `).get(dispatchId) as Row | undefined;
+    if (!row?.started_at || row.kind !== "boss_reminder") return false;
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM audit_events
+      WHERE entity_type = 'task' AND entity_id = ? AND actor_id = ? AND created_at >= ?
+        AND action IN ('task.started', 'task.progress', 'task.blocked', 'task.unblocked', 'task.submitted')
+      LIMIT 1
+    `).get(row.task_id, row.target_agent_id, row.started_at));
+  }
+
+  completeTaskDispatch(dispatchId: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_agent_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const completedAt = nowIso();
+      this.db.prepare(`
+        UPDATE task_agent_dispatches SET status = 'succeeded', completed_at = ?, lease_expires_at = NULL,
+          last_error = NULL WHERE id = ?
+      `).run(completedAt, dispatchId);
+      this.audit({
+        actorId: "system",
+        action: taskDispatchAuditAction(row.kind, "delivered"),
+        entityType: "task",
+        entityId: row.task_id,
+        after: { dispatchId, kind: row.kind, attempts: row.attempts },
+      });
+      return true;
+    });
+  }
+
+  failTaskDispatch(dispatchId: string, error: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_agent_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const reason = required(error, "task dispatch error").slice(0, 1000);
+      const task = this.getTaskRow(row.task_id);
+      const reminderStillRelevant = (["assigned", "in_progress", "blocked"] as string[]).includes(task.status)
+        && task.assignee_id === row.target_agent_id;
+      const retry = Number(row.attempts) < 3 && (row.kind !== "boss_reminder" || reminderStillRelevant);
+      this.db.prepare(`
+        UPDATE task_agent_dispatches SET status = ?, last_error = ?, lease_expires_at = NULL,
+          completed_at = ? WHERE id = ?
+      `).run(retry ? "pending" : "failed", reason, retry ? null : nowIso(), dispatchId);
+      this.audit({
+        actorId: "system",
+        action: taskDispatchAuditAction(row.kind, retry ? "retry" : "failed"),
+        entityType: "task",
+        entityId: row.task_id,
+        reason,
+        after: { dispatchId, kind: row.kind, attempts: row.attempts },
+      });
+      return retry;
+    });
+  }
+
+  // ── Hourly task check-ins ──────────────────────────────────
+
+  queueTaskCheckinRun(scheduledAtInput: string | number | Date) {
+    const scheduledAt = new Date(scheduledAtInput);
+    if (!Number.isFinite(scheduledAt.getTime())) throw new Error("task check-in scheduledAt is invalid");
+    const slot = shanghaiSlot(scheduledAt.getTime());
+    if (slot.minute !== 0 || slot.second !== 0 || slot.millisecond !== 0) {
+      throw new Error("task check-in runs must be scheduled on an exact hour");
+    }
+    if (slot.hour < this.taskCheckinConfig.startHour || slot.hour > this.taskCheckinConfig.endHour) {
+      throw new Error("task check-in run is outside the configured schedule");
+    }
+    const slotKey = `${slot.localDate}T${String(slot.hour).padStart(2, "0")}`;
+    const existing = this.db.prepare("SELECT id FROM task_checkin_runs WHERE slot_key = ?").get(slotKey) as Row | undefined;
+    if (existing) return this.taskCheckinRun(existing.id);
+
+    return this.transaction(() => {
+      const runId = randomUUID();
+      const createdAt = nowIso();
+      this.db.prepare(`
+        INSERT INTO task_checkin_runs (id, slot_key, scheduled_at, local_date, local_hour, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(runId, slotKey, scheduledAt.toISOString(), slot.localDate, slot.hour, createdAt);
+
+      let employeeCount = 0;
+      let plannedReminders = 0;
+      const employees = this.listMembers().filter((member) => member.kind === "agent" && member.active)
+        .sort((a, b) => a.level - b.level || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+      for (const employee of employees) {
+        const candidates = this.taskCheckinCandidates(employee.id, slot.localDate);
+        if (candidates.length === 0) continue;
+        employeeCount += 1;
+        const batchId = randomUUID();
+        this.db.prepare(`
+          INSERT INTO task_checkin_batches (
+            id, run_id, target_member_id, channel, candidate_json, candidate_count, created_at
+          ) VALUES (?, ?, ?, 'agent', ?, ?, ?)
+        `).run(batchId, runId, employee.id, JSON.stringify(candidates), candidates.length, createdAt);
+        const slotCount = Math.min(3, candidates.length);
+        for (let slotIndex = 0; slotIndex < slotCount; slotIndex += 1) {
+          const dispatchId = randomUUID();
+          const dispatchAt = new Date(scheduledAt.getTime() + slotIndex * 15 * 60 * 1000).toISOString();
+          this.db.prepare(`
+            INSERT INTO task_checkin_dispatches (
+              id, run_id, batch_id, target_member_id, channel, slot_index, scheduled_at, status, created_at
+            ) VALUES (?, ?, ?, ?, 'agent', ?, ?, 'pending', ?)
+          `).run(dispatchId, runId, batchId, employee.id, slotIndex, dispatchAt, createdAt);
+          this.audit({
+            actorId: "system",
+            action: "task.checkin_dispatch_queued",
+            entityType: "task_checkin",
+            entityId: runId,
+            after: { dispatchId, targetMemberId: employee.id, slotIndex, scheduledAt: dispatchAt },
+          });
+          plannedReminders += 1;
+        }
+      }
+
+      const bossCandidates = this.bossTaskCheckinCandidates();
+      if (bossCandidates.length > 0) {
+        const batchId = randomUUID();
+        const dispatchId = randomUUID();
+        const status = this.bossEmailEnabled ? "pending" : "skipped";
+        const lastError = this.bossEmailEnabled ? null : "Boss email notifications are disabled";
+        this.db.prepare(`
+          INSERT INTO task_checkin_batches (
+            id, run_id, target_member_id, channel, candidate_json, candidate_count, created_at
+          ) VALUES (?, ?, 'boss', 'boss_email', ?, ?, ?)
+        `).run(batchId, runId, JSON.stringify(bossCandidates), bossCandidates.length, createdAt);
+        this.db.prepare(`
+          INSERT INTO task_checkin_dispatches (
+            id, run_id, batch_id, target_member_id, channel, slot_index, scheduled_at,
+            action_kind, status, last_error, created_at, completed_at
+          ) VALUES (?, ?, ?, 'boss', 'boss_email', 0, ?, 'boss_digest', ?, ?, ?, ?)
+        `).run(
+          dispatchId,
+          runId,
+          batchId,
+          scheduledAt.toISOString(),
+          status,
+          lastError,
+          createdAt,
+          status === "skipped" ? createdAt : null,
+        );
+        this.audit({
+          actorId: "system",
+          action: status === "pending" ? "task.checkin_dispatch_queued" : "task.checkin_dispatch_skipped",
+          entityType: "task_checkin",
+          entityId: runId,
+          reason: lastError ?? undefined,
+          after: { dispatchId, targetMemberId: "boss", channel: "boss_email", candidateCount: bossCandidates.length },
+        });
+      }
+
+      this.audit({
+        actorId: "system",
+        action: employeeCount === 0 && bossCandidates.length === 0 ? "task.checkin_empty" : "task.checkin_created",
+        entityType: "task_checkin",
+        entityId: runId,
+        after: {
+          scheduledAt: scheduledAt.toISOString(),
+          localDate: slot.localDate,
+          localHour: slot.hour,
+          employeeCount,
+          plannedReminders,
+          bossCandidateCount: bossCandidates.length,
+        },
+      });
+      return this.taskCheckinRun(runId);
+    });
+  }
+
+  recoverTaskCheckinDispatches() {
+    return this.transaction(() => {
+      const rows = this.db.prepare("SELECT * FROM task_checkin_dispatches WHERE status = 'running'").all() as Row[];
+      for (const row of rows) {
+        const exhausted = Number(row.attempts) >= 3;
+        this.db.prepare(`
+          UPDATE task_checkin_dispatches SET status = ?, lease_expires_at = NULL,
+            last_error = 'Gateway restarted during task check-in dispatch', completed_at = ? WHERE id = ?
+        `).run(exhausted ? "failed" : "pending", exhausted ? nowIso() : null, row.id);
+        this.audit({
+          actorId: "system",
+          action: exhausted ? "task.checkin_dispatch_failed" : "task.checkin_dispatch_recovered",
+          entityType: "task_checkin",
+          entityId: row.run_id,
+          reason: exhausted ? "Gateway restarted during the final task check-in attempt" : undefined,
+          after: { dispatchId: row.id, targetMemberId: row.target_member_id, taskId: row.task_id },
+        });
+      }
+      return rows.length;
+    });
+  }
+
+  claimNextTaskCheckinDispatch(now = Date.now(), leaseMs = 15 * 60 * 1000) {
+    return this.transaction(() => {
+      while (true) {
+        const row = this.db.prepare(`
+          SELECT d.*, b.candidate_json, r.local_date
+          FROM task_checkin_dispatches d
+          JOIN task_checkin_batches b ON b.id = d.batch_id
+          JOIN task_checkin_runs r ON r.id = d.run_id
+          WHERE d.status = 'pending' AND d.attempts < 3 AND d.scheduled_at <= ?
+          ORDER BY d.scheduled_at, d.created_at, d.rowid LIMIT 1
+        `).get(new Date(now).toISOString()) as Row | undefined;
+        if (!row) return null;
+
+        let prompt: string;
+        let taskId: string | null = row.task_id ?? null;
+        let actionKind: TaskCheckinActionKind | null = row.action_kind ?? null;
+        let emailNotification: TaskCheckinEmailNotification | undefined;
+        if (row.channel === "agent") {
+          const candidates = parseJson<TaskCheckinCandidate[]>(row.candidate_json, []);
+          const used = this.db.prepare(`
+            SELECT task_id, action_kind FROM task_checkin_dispatches
+            WHERE batch_id = ? AND id != ? AND task_id IS NOT NULL
+          `).all(row.batch_id, row.id) as Row[];
+          const usedKeys = new Set(used.map((item) => `${item.task_id}:${item.action_kind}`));
+          let selected = taskId && actionKind && actionKind !== "boss_digest"
+            ? candidates.find((item) => item.taskId === taskId && item.actionKind === actionKind)
+            : undefined;
+          if (!selected || !this.taskCheckinCandidateIsRelevant(row.target_member_id, selected)) {
+            selected = candidates.find((candidate) => !usedKeys.has(`${candidate.taskId}:${candidate.actionKind}`)
+              && this.taskCheckinCandidateIsRelevant(row.target_member_id, candidate));
+          }
+          if (!selected) {
+            this.skipTaskCheckinDispatch(row, "no eligible task remains in this hourly candidate snapshot");
+            continue;
+          }
+          const task = this.getTaskRow(selected.taskId);
+          taskId = selected.taskId;
+          actionKind = selected.actionKind;
+          prompt = buildTaskCheckinPrompt(task, selected.actionKind);
+        } else {
+          const snapshot = parseJson<BossTaskCheckinCandidate[]>(row.candidate_json, []);
+          emailNotification = this.buildBossTaskCheckinEmail(row.id, row.run_id, row.scheduled_at, snapshot);
+          if (emailNotification.reviews.length === 0 && emailNotification.anomalies.length === 0) {
+            this.skipTaskCheckinDispatch(row, "no eligible Boss task remains in this hourly snapshot");
+            continue;
+          }
+          taskId = null;
+          actionKind = "boss_digest";
+          prompt = `Boss task check-in digest: ${emailNotification.reviews.length} reviews, ${emailNotification.anomalies.length} anomalies`;
+        }
+
+        const startedAt = nowIso();
+        this.db.prepare(`
+          UPDATE task_checkin_dispatches SET task_id = ?, action_kind = ?, prompt = ?, status = 'running',
+            attempts = attempts + 1, started_at = ?, lease_expires_at = ?, last_error = NULL WHERE id = ?
+        `).run(taskId, actionKind, prompt, startedAt, new Date(now + leaseMs).toISOString(), row.id);
+        this.audit({
+          actorId: "system",
+          action: "task.checkin_dispatch_started",
+          entityType: "task_checkin",
+          entityId: row.run_id,
+          after: { dispatchId: row.id, targetMemberId: row.target_member_id, taskId, actionKind, attempts: Number(row.attempts) + 1 },
+        });
+        return {
+          ...mapTaskCheckinDispatch({
+            ...row,
+            task_id: taskId,
+            action_kind: actionKind,
+            prompt,
+            status: "running",
+            attempts: Number(row.attempts) + 1,
+            started_at: startedAt,
+            target_runtime_agent_id: row.channel === "agent" ? this.runtimeAgentId(row.target_member_id) : null,
+          }),
+          emailNotification,
+        };
+      }
+    });
+  }
+
+  completeTaskCheckinDispatch(dispatchId: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_checkin_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const completedAt = nowIso();
+      this.db.prepare(`
+        UPDATE task_checkin_dispatches SET status = 'succeeded', completed_at = ?, lease_expires_at = NULL,
+          last_error = NULL WHERE id = ?
+      `).run(completedAt, dispatchId);
+      this.audit({
+        actorId: "system",
+        action: "task.checkin_dispatch_delivered",
+        entityType: "task_checkin",
+        entityId: row.run_id,
+        after: { dispatchId, targetMemberId: row.target_member_id, taskId: row.task_id, actionKind: row.action_kind, attempts: row.attempts },
+      });
+      return true;
+    });
+  }
+
+  failTaskCheckinDispatch(dispatchId: string, error: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_checkin_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const reason = required(error, "task check-in dispatch error").slice(0, 1000);
+      const bossSnapshot = row.channel === "boss_email"
+        ? parseJson<BossTaskCheckinCandidate[]>((this.db.prepare("SELECT candidate_json FROM task_checkin_batches WHERE id = ?").get(row.batch_id) as Row)?.candidate_json, [])
+        : [];
+      const bossStillRelevant = row.channel === "boss_email"
+        ? (() => {
+            const notification = this.buildBossTaskCheckinEmail(row.id, row.run_id, row.scheduled_at, bossSnapshot);
+            return notification.reviews.length > 0 || notification.anomalies.length > 0;
+          })()
+        : false;
+      const retry = Number(row.attempts) < 3 && (row.channel === "boss_email"
+        ? bossStillRelevant
+        : this.taskCheckinCandidateIsRelevant(row.target_member_id, {
+            taskId: row.task_id,
+            actionKind: row.action_kind,
+            actionAt: row.started_at,
+          }));
+      this.db.prepare(`
+        UPDATE task_checkin_dispatches SET status = ?, last_error = ?, lease_expires_at = NULL,
+          completed_at = ? WHERE id = ?
+      `).run(retry ? "pending" : "failed", reason, retry ? null : nowIso(), dispatchId);
+      this.audit({
+        actorId: "system",
+        action: retry ? "task.checkin_dispatch_retry" : "task.checkin_dispatch_failed",
+        entityType: "task_checkin",
+        entityId: row.run_id,
+        reason,
+        after: { dispatchId, targetMemberId: row.target_member_id, taskId: row.task_id, attempts: row.attempts },
+      });
+      return retry;
+    });
+  }
+
+  taskCheckinDispatchHasProgress(dispatchId: string) {
+    const row = this.db.prepare(`
+      SELECT task_id, target_member_id, action_kind, started_at
+      FROM task_checkin_dispatches WHERE id = ?
+    `).get(dispatchId) as Row | undefined;
+    if (!row?.task_id || !row.started_at || row.action_kind === "boss_digest") return false;
+    const actions = row.action_kind === "review"
+      ? ["task.closed", "task.rejected"]
+      : ["task.started", "task.progress", "task.blocked", "task.unblocked", "task.submitted"];
+    const placeholders = actions.map(() => "?").join(", ");
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM audit_events
+      WHERE entity_type = 'task' AND entity_id = ? AND actor_id = ? AND created_at >= ?
+        AND action IN (${placeholders}) LIMIT 1
+    `).get(row.task_id, row.target_member_id, row.started_at, ...actions));
+  }
+
+  hasDueTaskCheckinDispatches(now = Date.now()) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM task_checkin_dispatches
+      WHERE status = 'pending' AND attempts < 3 AND scheduled_at <= ? LIMIT 1
+    `).get(new Date(now).toISOString()));
+  }
+
+  nextPendingTaskCheckinDispatchAt() {
+    const row = this.db.prepare(`
+      SELECT scheduled_at FROM task_checkin_dispatches
+      WHERE status = 'pending' AND attempts < 3 ORDER BY scheduled_at, created_at LIMIT 1
+    `).get() as Row | undefined;
+    return row?.scheduled_at as string | undefined;
+  }
+
+  nextPendingTaskCheckinDispatchPreview() {
+    const row = this.db.prepare(`
+      SELECT d.*, b.candidate_json
+      FROM task_checkin_dispatches d
+      JOIN task_checkin_batches b ON b.id = d.batch_id
+      WHERE d.status = 'pending' AND d.attempts < 3
+      ORDER BY d.scheduled_at, d.created_at, d.rowid LIMIT 1
+    `).get() as Row | undefined;
+    if (!row) return null;
+    if (row.channel === "boss_email") {
+      return {
+        scheduledAt: row.scheduled_at,
+        targetMemberId: "boss",
+        channel: "boss_email" as const,
+        taskId: null,
+        title: "Boss 根任务巡检汇总",
+        actionKind: "boss_digest" as const,
+      };
+    }
+    const candidates = parseJson<TaskCheckinCandidate[]>(row.candidate_json, []);
+    const used = this.db.prepare(`
+      SELECT task_id, action_kind FROM task_checkin_dispatches
+      WHERE batch_id = ? AND id != ? AND task_id IS NOT NULL
+    `).all(row.batch_id, row.id) as Row[];
+    const usedKeys = new Set(used.map((item) => `${item.task_id}:${item.action_kind}`));
+    const current = row.task_id && row.action_kind
+      ? candidates.find((item) => item.taskId === row.task_id && item.actionKind === row.action_kind)
+      : undefined;
+    const candidate = current && this.taskCheckinCandidateIsRelevant(row.target_member_id, current)
+      ? current
+      : candidates.find((item) => !usedKeys.has(`${item.taskId}:${item.actionKind}`)
+        && this.taskCheckinCandidateIsRelevant(row.target_member_id, item));
+    const task = candidate ? this.db.prepare("SELECT title FROM tasks WHERE id = ?").get(candidate.taskId) as Row | undefined : undefined;
+    return {
+      scheduledAt: row.scheduled_at,
+      targetMemberId: row.target_member_id,
+      channel: "agent" as const,
+      taskId: candidate?.taskId ?? null,
+      title: task?.title ?? "等待实时递补",
+      actionKind: candidate?.actionKind ?? null,
+    };
+  }
+
+  taskCheckinSummary(now = Date.now()) {
+    const localDate = shanghaiSlot(now).localDate;
+    const latestRun = this.db.prepare(`
+      SELECT * FROM task_checkin_runs WHERE local_date = ? ORDER BY scheduled_at DESC LIMIT 1
+    `).get(localDate) as Row | undefined;
+    const nextRunAt = this.taskCheckinConfig.enabled
+      ? nextTaskCheckinRunAt(now, this.taskCheckinConfig.startHour, this.taskCheckinConfig.endHour)
+      : null;
+    const nextDispatch = this.nextPendingTaskCheckinDispatchPreview();
+    const nextDispatchAt = nextDispatch?.scheduledAt ?? null;
+    const backlog = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM task_checkin_dispatches WHERE status = 'pending' AND scheduled_at <= ?
+    `).get(new Date(now).toISOString()) as Row;
+    const bossCurrent = this.bossTaskCheckinCandidates();
+    const bossReviewCount = bossCurrent.filter((item) => item.review).length;
+    const bossAnomalyCount = bossCurrent.filter((item) => item.anomaly).length;
+    if (!latestRun) {
+      return {
+        enabled: this.taskCheckinConfig.enabled,
+        timeZone: this.taskCheckinConfig.timeZone,
+        startHour: this.taskCheckinConfig.startHour,
+        endHour: this.taskCheckinConfig.endHour,
+        nextRunAt,
+        nextDispatchAt,
+        nextDispatch,
+        backlog: Number(backlog.count),
+        today: { localDate, latestRun: null },
+        boss: { reviewCount: bossReviewCount, anomalyCount: bossAnomalyCount, emailStatus: null, lastError: null },
+      };
+    }
+    const statusRows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM task_checkin_dispatches
+      WHERE run_id = ? AND channel = 'agent' GROUP BY status
+    `).all(latestRun.id) as Row[];
+    const counts = Object.fromEntries(statusRows.map((row) => [row.status, Number(row.count)]));
+    const employeeBatchCount = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM task_checkin_batches WHERE run_id = ? AND channel = 'agent'
+    `).get(latestRun.id) as Row;
+    const planned = this.db.prepare("SELECT COUNT(*) AS count FROM task_checkin_dispatches WHERE run_id = ? AND channel = 'agent'")
+      .get(latestRun.id) as Row;
+    const bossDispatch = this.db.prepare(`
+      SELECT * FROM task_checkin_dispatches WHERE run_id = ? AND channel = 'boss_email' LIMIT 1
+    `).get(latestRun.id) as Row | undefined;
+    return {
+      enabled: this.taskCheckinConfig.enabled,
+      timeZone: this.taskCheckinConfig.timeZone,
+      startHour: this.taskCheckinConfig.startHour,
+      endHour: this.taskCheckinConfig.endHour,
+      nextRunAt,
+      nextDispatchAt,
+      nextDispatch,
+      backlog: Number(backlog.count),
+      today: {
+        localDate,
+        latestRun: {
+          id: latestRun.id,
+          scheduledAt: latestRun.scheduled_at,
+          candidateEmployees: Number(employeeBatchCount.count),
+          plannedReminders: Number(planned.count),
+          pending: counts.pending ?? 0,
+          running: counts.running ?? 0,
+          delivered: counts.succeeded ?? 0,
+          failed: counts.failed ?? 0,
+          skipped: counts.skipped ?? 0,
+          canceled: counts.canceled ?? 0,
+        },
+      },
+      boss: {
+        reviewCount: bossReviewCount,
+        anomalyCount: bossAnomalyCount,
+        emailStatus: bossDispatch?.status ?? null,
+        lastError: bossDispatch?.last_error ?? null,
+      },
+    };
+  }
+
+  private taskCheckinRun(runId: string) {
+    const run = this.db.prepare("SELECT * FROM task_checkin_runs WHERE id = ?").get(runId) as Row;
+    const batches = this.db.prepare("SELECT * FROM task_checkin_batches WHERE run_id = ? ORDER BY created_at, rowid").all(runId) as Row[];
+    const dispatches = this.db.prepare("SELECT * FROM task_checkin_dispatches WHERE run_id = ? ORDER BY scheduled_at, created_at, rowid")
+      .all(runId) as Row[];
+    return {
+      id: run.id,
+      slotKey: run.slot_key,
+      scheduledAt: run.scheduled_at,
+      localDate: run.local_date,
+      localHour: Number(run.local_hour),
+      batches: batches.map((row) => ({
+        id: row.id,
+        targetMemberId: row.target_member_id,
+        channel: row.channel,
+        candidateCount: Number(row.candidate_count),
+        candidates: parseJson(row.candidate_json, []),
+      })),
+      dispatches: dispatches.map(mapTaskCheckinDispatch),
+    };
+  }
+
+  private taskCheckinCandidates(memberId: string, localDate: string): TaskCheckinCandidate[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM tasks
+      WHERE (issuer_id = ? AND status = 'review')
+         OR (assignee_id = ? AND status IN ('assigned', 'in_progress', 'blocked'))
+    `).all(memberId, memberId) as Row[];
+    const rotationRows = this.db.prepare(`
+      SELECT d.task_id, d.action_kind, MAX(d.completed_at) AS last_reminded_at
+      FROM task_checkin_dispatches d
+      JOIN task_checkin_runs r ON r.id = d.run_id
+      WHERE d.target_member_id = ? AND d.channel = 'agent' AND d.status = 'succeeded'
+        AND r.local_date = ? AND d.task_id IS NOT NULL
+      GROUP BY d.task_id, d.action_kind
+    `).all(memberId, localDate) as Row[];
+    const remindedAt = new Map(rotationRows.map((row) => [`${row.task_id}:${row.action_kind}`, row.last_reminded_at as string]));
+    const candidates = rows.map((row): TaskCheckinCandidate => ({
+      taskId: row.id,
+      actionKind: row.status === "review" ? "review" : "execute",
+      actionAt: row.status === "review" ? row.submitted_at ?? row.last_activity_at : row.last_activity_at,
+    }));
+    return candidates.sort((a, b) => {
+      const aReminded = remindedAt.get(`${a.taskId}:${a.actionKind}`);
+      const bReminded = remindedAt.get(`${b.taskId}:${b.actionKind}`);
+      if (Boolean(aReminded) !== Boolean(bReminded)) return aReminded ? 1 : -1;
+      if (aReminded && bReminded && aReminded !== bReminded) return aReminded.localeCompare(bReminded);
+      return a.actionAt.localeCompare(b.actionAt) || a.taskId.localeCompare(b.taskId);
+    });
+  }
+
+  private taskCheckinCandidateIsRelevant(memberId: string, candidate: Partial<TaskCheckinCandidate>) {
+    if (!candidate.taskId || (candidate.actionKind !== "review" && candidate.actionKind !== "execute")) return false;
+    const task = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(candidate.taskId) as Row | undefined;
+    if (!task) return false;
+    return candidate.actionKind === "review"
+      ? task.issuer_id === memberId && task.status === "review"
+      : task.assignee_id === memberId && (["assigned", "in_progress", "blocked"] as string[]).includes(task.status);
+  }
+
+  private bossTaskCheckinCandidates(): BossTaskCheckinCandidate[] {
+    const roots = this.db.prepare("SELECT * FROM tasks WHERE parent_id IS NULL ORDER BY created_at").all() as Row[];
+    return this.decorateTasks(roots).flatMap((task) => {
+      const review = task.issuerId === "boss" && task.status === "review";
+      const anomaly = (["assigned", "in_progress", "blocked"] as string[]).includes(task.status)
+        && (task.status === "blocked" || task.risks.stale || task.risks.blockedDescendants > 0 || task.risks.staleDescendants > 0);
+      return review || anomaly ? [{ taskId: task.id, review, anomaly }] : [];
+    });
+  }
+
+  private buildBossTaskCheckinEmail(
+    dispatchId: string,
+    runId: string,
+    scheduledAt: string,
+    snapshot: BossTaskCheckinCandidate[],
+  ): TaskCheckinEmailNotification {
+    const allowed = new Map(snapshot.map((item) => [item.taskId, item]));
+    const current = this.bossTaskCheckinCandidates().filter((item) => allowed.has(item.taskId));
+    const itemFor = (candidate: BossTaskCheckinCandidate): TaskCheckinEmailItem => {
+      const task = this.decorateTasks([this.getTaskRow(candidate.taskId)])[0]!;
+      const assignee = this.getMember(task.assigneeId, { active: false });
+      return {
+        taskId: task.id,
+        title: task.title,
+        assigneeId: task.assigneeId,
+        assigneeName: assignee.name,
+        status: task.status,
+        submittedAt: task.submittedAt,
+        lastActivityAt: task.lastActivityAt,
+        blocked: task.status === "blocked",
+        stale: task.risks.stale,
+        blockedDescendants: task.risks.blockedDescendants,
+        staleDescendants: task.risks.staleDescendants,
+      };
+    };
+    return {
+      id: dispatchId,
+      kind: "task_checkin",
+      runId,
+      scheduledAt,
+      reviews: current.filter((item) => item.review).map(itemFor),
+      anomalies: current.filter((item) => item.anomaly).map(itemFor),
+    };
+  }
+
+  private skipTaskCheckinDispatch(row: Row, reason: string) {
+    const completedAt = nowIso();
+    this.db.prepare(`
+      UPDATE task_checkin_dispatches SET status = 'skipped', last_error = ?, completed_at = ?,
+        lease_expires_at = NULL WHERE id = ?
+    `).run(reason, completedAt, row.id);
+    this.audit({
+      actorId: "system",
+      action: "task.checkin_dispatch_skipped",
+      entityType: "task_checkin",
+      entityId: row.run_id,
+      reason,
+      after: { dispatchId: row.id, targetMemberId: row.target_member_id, taskId: row.task_id },
+    });
   }
 
   createRootTask(input: { title: string; description: string; acceptanceCriteria: string; assigneeId: string }) {
@@ -929,7 +1949,9 @@ export class CompanyOsStore {
     this.requireAgentMember(actorId);
     const task = this.getTaskRow(taskId);
     if (task.assignee_id !== actorId) throw new Error("only the assignee can report progress");
-    if (task.status !== "assigned" && task.status !== "in_progress") throw new Error("task is not accepting progress");
+    if (task.status !== "assigned" && task.status !== "in_progress" && task.status !== "blocked") {
+      throw new Error("task is not accepting progress");
+    }
     const now = nowIso();
     const progressId = randomUUID();
     this.transaction(() => {
@@ -1028,28 +2050,59 @@ export class CompanyOsStore {
   reviewTask(actorId: Actor, taskId: string, decision: "accept" | "reject", feedback?: string) {
     const before = this.getTaskRow(taskId);
     if (actorId !== "boss") this.requireAgentMember(actorId);
-    if (actorId !== "boss" && before.issuer_id !== actorId) throw new Error("only the issuer or Boss can review a task");
+    if (before.issuer_id !== actorId) throw new Error("only the task issuer can review a task");
     if (before.status !== "review") throw new Error("task is not awaiting review");
     const submission = this.db.prepare("SELECT * FROM task_submissions WHERE task_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").get(taskId) as Row | undefined;
     if (!submission) throw new Error("pending task submission not found");
+    const reviewer = this.getMember(actorId);
+    const normalizedFeedback = decision === "reject" ? required(feedback, "feedback") : feedback?.trim() || null;
     const now = this.nextTaskActivityAt(taskId, before.updated_at);
     this.transaction(() => {
       if (decision === "accept") {
         this.db.prepare("UPDATE task_submissions SET status = 'accepted', reviewer_id = ?, feedback = ?, reviewed_at = ? WHERE id = ?")
-          .run(actorId, feedback?.trim() || null, now, submission.id);
+          .run(actorId, normalizedFeedback, now, submission.id);
         this.db.prepare("UPDATE tasks SET status = 'closed', review_feedback = ?, closed_at = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
-          .run(feedback?.trim() || null, now, now, now, taskId);
-        this.audit({ actorId, action: "task.closed", entityType: "task", entityId: taskId, reason: feedback, before: mapTaskRow(before) });
+          .run(normalizedFeedback, now, now, now, taskId);
+        this.audit({ actorId, action: "task.closed", entityType: "task", entityId: taskId, reason: normalizedFeedback ?? undefined, before: mapTaskRow(before) });
       } else {
-        const rejection = required(feedback, "feedback");
         this.db.prepare("UPDATE task_submissions SET status = 'rejected', reviewer_id = ?, feedback = ?, reviewed_at = ? WHERE id = ?")
-          .run(actorId, rejection, now, submission.id);
+          .run(actorId, normalizedFeedback, now, submission.id);
         this.db.prepare("UPDATE tasks SET status = 'in_progress', review_feedback = ?, submitted_at = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?")
-          .run(rejection, now, now, taskId);
-        this.audit({ actorId, action: "task.rejected", entityType: "task", entityId: taskId, reason: rejection, before: mapTaskRow(before) });
+          .run(normalizedFeedback, now, now, taskId);
+        this.audit({ actorId, action: "task.rejected", entityType: "task", entityId: taskId, reason: normalizedFeedback ?? undefined, before: mapTaskRow(before) });
       }
+      this.queueTaskReviewNotification(
+        before,
+        reviewer,
+        decision === "accept" ? "review_accepted" : "review_rejected",
+        normalizedFeedback,
+        now,
+      );
     });
     return this.readTask(actorId, taskId, false);
+  }
+
+  private queueTaskReviewNotification(
+    task: Row,
+    reviewer: Row,
+    kind: "review_accepted" | "review_rejected",
+    feedback: string | null,
+    createdAt: string,
+  ) {
+    const dispatchId = randomUUID();
+    const prompt = buildTaskReviewNotificationPrompt(task, reviewer, kind, feedback);
+    this.db.prepare(`
+      INSERT INTO task_agent_dispatches (
+        id, task_id, target_agent_id, kind, prompt, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    `).run(dispatchId, task.id, task.assignee_id, kind, prompt, createdAt);
+    this.audit({
+      actorId: reviewer.id,
+      action: taskDispatchAuditAction(kind, "queued"),
+      entityType: "task",
+      entityId: task.id,
+      after: { dispatchId, kind, targetAgentId: task.assignee_id },
+    });
   }
 
   reassignTask(actorId: Actor, taskId: string, assigneeId: string, reason: string) {
@@ -1312,7 +2365,7 @@ export class CompanyOsStore {
     const createdAt = nowIso();
     const bossParticipates = Boolean(input.bossParticipates);
     const advance = this.transaction(() => {
-      const active = this.db.prepare("SELECT id FROM meetings WHERE status = 'active'").get() as Row | undefined;
+      const active = this.roomIsOccupied();
       const queue = this.db.prepare("SELECT COALESCE(MAX(queue_position), 0) AS position FROM meetings WHERE status = 'queued'").get() as Row;
       const status: MeetingStatus = active ? "queued" : "active";
       const position = status === "active" ? 0 : Number(queue.position) + 1;
@@ -1445,6 +2498,12 @@ export class CompanyOsStore {
       JOIN members target ON target.id = d.target_agent_id
       WHERE d.meeting_id = ? ORDER BY d.created_at DESC, d.rowid DESC LIMIT 1
     `).get(meetingId) as Row | undefined;
+    const closeoutDispatches = this.db.prepare(`
+      SELECT d.*, member.name AS member_name
+      FROM meeting_closeout_dispatches d
+      JOIN members member ON member.id = d.member_id
+      WHERE d.meeting_id = ? ORDER BY d.position, d.created_at, d.rowid
+    `).all(meetingId) as Row[];
     return {
       ...this.mapMeetingSummary(row),
       participants: participants.map((participant) => ({
@@ -1457,6 +2516,7 @@ export class CompanyOsStore {
       taskDrafts: drafts.map(mapTaskDraft),
       currentTurn: currentTurn ? mapMeetingTurn(currentTurn) : null,
       hostDispatchStatus: hostDispatch ? mapHostDispatch(hostDispatch) : null,
+      closeoutDispatches: closeoutDispatches.map(mapMeetingCloseoutDispatch),
       audit: this.listAudit("meeting", meetingId),
     };
   }
@@ -1509,7 +2569,8 @@ export class CompanyOsStore {
           waiting_on_host_since = NULL, ended_at = ? WHERE id = ?
       `).run(`Boss 拒绝：${rejectionReason}`, endedAt, meetingId);
       this.cancelOpenHostDispatches(meetingId);
-      this.addMeetingMessage(meetingId, "system", null, null, `Boss 已拒绝召开本次会议：${rejectionReason}。会议室已释放。`);
+      this.addMeetingMessage(meetingId, "system", null, null, `Boss 已拒绝召开本次会议：${rejectionReason}。`);
+      this.queueMeetingCloseoutDispatches(meetingId, "canceled", true);
       this.audit({
         actorId: "boss",
         action: "meeting.rejected_by_boss",
@@ -1517,7 +2578,6 @@ export class CompanyOsStore {
         entityId: meetingId,
         reason: rejectionReason,
       });
-      advance = this.activateNextMeeting();
     });
     return { meeting: this.meetingView(meetingId), advance };
   }
@@ -1883,15 +2943,16 @@ export class CompanyOsStore {
         });
       }
       const endedAt = nowIso();
+      this.addMeetingMessage(meeting.id, "member", hostId, null, `【主持人最终总结】\n${finalSummary}`);
       this.db.prepare(`
         UPDATE meetings SET status = 'completed', summary = ?, publish_notice = ?, current_turn_id = NULL,
           waiting_on_host_since = NULL, end_requested_at = NULL, end_requested_summary = NULL,
           end_requested_publish_notice = 0, ended_at = ? WHERE id = ?
       `).run(finalSummary, notice ? 1 : 0, endedAt, meeting.id);
       this.cancelOpenHostDispatches(meeting.id);
-      this.addMeetingMessage(meeting.id, "system", null, null, "会议已完成，会议室已释放。");
+      this.addMeetingMessage(meeting.id, "system", null, null, "会议讨论已结束，正在向全体参会者同步最终记录。");
+      this.queueMeetingCloseoutDispatches(meeting.id, "completed", true);
       this.audit({ actorId, action: "meeting.completed", entityType: "meeting", entityId: meeting.id, after: { summary: finalSummary, createdTaskIds: createdTasks.map((task) => task.id), noticeId: notice?.id } });
-      advance = this.activateNextMeeting();
     });
     return { meeting: this.meetingView(meeting.id), createdTasks, notice, advance };
   }
@@ -1907,6 +2968,8 @@ export class CompanyOsStore {
       this.db.prepare("UPDATE meetings SET status = 'canceled', canceled_reason = ?, ended_at = ? WHERE id = ?")
         .run(required(reason, "reason"), nowIso(), meetingId);
       this.cancelOpenHostDispatches(meetingId);
+      this.addMeetingMessage(meetingId, "system", null, null, `会议已取消：${required(reason, "reason")}。`);
+      this.queueMeetingCloseoutDispatches(meetingId, "canceled", false);
       this.audit({ actorId, action: "meeting.canceled", entityType: "meeting", entityId: meetingId, reason });
       this.normalizeMeetingQueue();
     });
@@ -2050,6 +3113,39 @@ export class CompanyOsStore {
       startedAt: row.started_at,
       endedAt: row.ended_at,
       canceledReason: row.canceled_reason,
+      closeoutStatus: this.meetingCloseoutStatus(row.id),
+    };
+  }
+
+  private meetingCloseoutStatus(meetingId: string) {
+    const aggregate = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS delivered,
+        MAX(blocks_room) AS blocks_room
+      FROM meeting_closeout_dispatches WHERE meeting_id = ?
+    `).get(meetingId) as Row;
+    const total = Number(aggregate.total ?? 0);
+    if (total === 0) return null;
+    const delivered = Number(aggregate.delivered ?? 0);
+    const current = this.db.prepare(`
+      SELECT d.*, member.name AS member_name
+      FROM meeting_closeout_dispatches d
+      JOIN members member ON member.id = d.member_id
+      WHERE d.meeting_id = ? AND d.status != 'succeeded'
+      ORDER BY CASE d.status WHEN 'running' THEN 0 ELSE 1 END, d.position, d.created_at, d.rowid
+      LIMIT 1
+    `).get(meetingId) as Row | undefined;
+    return {
+      state: delivered === total ? "delivered" as const : "syncing" as const,
+      blocksRoom: Boolean(aggregate.blocks_room),
+      total,
+      delivered,
+      pending: total - delivered,
+      currentMemberId: (current?.member_id ?? null) as string | null,
+      currentMemberName: (current?.member_name ?? null) as string | null,
+      attempts: Number(current?.attempts ?? 0),
+      lastError: (current?.last_error ?? null) as string | null,
+      nextAttemptAt: (current?.next_attempt_at ?? null) as string | null,
     };
   }
 
@@ -2080,6 +3176,126 @@ export class CompanyOsStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, meetingId, Number(row.sequence), authorKind, authorId, targetId, required(body, "body"), turnId ?? null, nowIso());
     return { id, sequence: Number(row.sequence) };
+  }
+
+  private queueMeetingCloseoutDispatches(
+    meetingId: string,
+    outcome: MeetingCloseoutOutcome,
+    blocksRoom: boolean,
+  ) {
+    const meeting = this.getMeetingRow(meetingId);
+    const participantRows = this.db.prepare(`
+      SELECT p.member_id FROM meeting_participants p
+      JOIN members member ON member.id = p.member_id
+      WHERE p.meeting_id = ?
+      ORDER BY CASE p.role WHEN 'worker' THEN 0 ELSE 1 END, member.created_at, p.rowid
+    `).all(meetingId) as Row[];
+    const memberIds = [...new Set([
+      ...participantRows.map((row) => row.member_id as string),
+      meeting.host_id as string,
+    ])];
+    const toSequence = this.maxMeetingSequence(meetingId);
+    const createdAt = nowIso();
+    memberIds.forEach((memberId, position) => {
+      const member = this.getMember(memberId, { active: false });
+      const runtimeAgentId = required(member.agent_id, `member ${memberId} agentId`);
+      if (runtimeAgentId !== memberId) {
+        throw new Error(`company member ID must equal its OpenClaw Agent ID: ${memberId} != ${runtimeAgentId}`);
+      }
+      if (!this.allowedAgentIds.has(runtimeAgentId)) throw new Error(`OpenClaw agent does not exist: ${runtimeAgentId}`);
+      const watermark = this.db.prepare(`
+        SELECT sequence FROM meeting_context_watermarks WHERE meeting_id = ? AND member_id = ?
+      `).get(meetingId, memberId) as Row | undefined;
+      const fromSequence = Number(watermark?.sequence ?? 0);
+      const prompt = this.buildMeetingCloseoutPrompt(meeting, member, outcome, fromSequence, toSequence);
+      const dispatchId = randomUUID();
+      const result = this.db.prepare(`
+        INSERT OR IGNORE INTO meeting_closeout_dispatches (
+          id, meeting_id, member_id, runtime_agent_id, outcome, blocks_room, position,
+          context_from_sequence, context_to_sequence, prompt, status, next_attempt_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        dispatchId,
+        meetingId,
+        memberId,
+        runtimeAgentId,
+        outcome,
+        blocksRoom ? 1 : 0,
+        position,
+        fromSequence,
+        toSequence,
+        prompt,
+        createdAt,
+        createdAt,
+      );
+      if (Number(result.changes) > 0) {
+        this.audit({
+          actorId: "system",
+          action: "meeting.closeout_dispatch_queued",
+          entityType: "meeting",
+          entityId: meetingId,
+          after: { dispatchId, memberId, outcome, blocksRoom, fromSequence, toSequence, position },
+        });
+      }
+    });
+    return memberIds.length;
+  }
+
+  private buildMeetingCloseoutPrompt(
+    meeting: Row,
+    member: Row,
+    outcome: MeetingCloseoutOutcome,
+    fromSequence: number,
+    toSequence: number,
+  ) {
+    const rows = this.db.prepare(`
+      WITH turn_base AS (
+        SELECT turn.*, MIN(msg.sequence) AS turn_first_sequence
+        FROM meeting_turns turn
+        LEFT JOIN meeting_messages msg ON msg.turn_id = turn.id
+        WHERE turn.meeting_id = ?
+        GROUP BY turn.id
+      ), turn_order AS (
+        SELECT turn_base.*, ROW_NUMBER() OVER (
+          ORDER BY COALESCE(turn_first_sequence, 9223372036854775807), started_at, id
+        ) AS round_number
+        FROM turn_base
+      )
+      SELECT msg.*, author.name AS author_name, target.name AS target_name,
+        turn_order.round_number, turn_order.turn_first_sequence,
+        turn_order.speaker_id AS turn_speaker_id,
+        turn_order.requested_by AS turn_requested_by,
+        turn_order.kind AS turn_kind
+      FROM meeting_messages msg
+      LEFT JOIN members author ON author.id = msg.author_id
+      LEFT JOIN members target ON target.id = msg.target_id
+      LEFT JOIN turn_order ON turn_order.id = msg.turn_id
+      WHERE msg.meeting_id = ? AND msg.sequence > ? AND msg.sequence <= ?
+      ORDER BY msg.sequence
+    `).all(meeting.id, meeting.id, fromSequence, toSequence) as Row[];
+    const outcomeLabel = outcome === "completed" ? "正常完成" : outcome === "canceled" ? "已取消" : "已超时";
+    const timeline = rows.length
+      ? [
+          `【自你上次同步后的最终会议时间线｜消息 #${padMeetingSequence(Number(rows[0]!.sequence))} → #${padMeetingSequence(toSequence)}】`,
+          ...rows.map((row) => formatMeetingContextMessage(row, member.id, fromSequence)),
+        ]
+      : [
+          "【自你上次同步后的最终会议时间线】",
+          outcome === "completed"
+            ? `没有遗漏的编号消息。最终总结：\n${meeting.summary ?? "（无）"}`
+            : `没有遗漏的编号消息。结束原因：${meeting.canceled_reason ?? outcomeLabel}`,
+        ];
+    return [
+      "【Company OS 会议结束同步】",
+      `会议「${meeting.title}」已结束。`,
+      `结果：${outcomeLabel}`,
+      `你的身份：${member.name}（${member.id}）`,
+      "",
+      ...timeline,
+      "",
+      "请阅读并同步以上最终会议记录。后续执行以 Company OS 中的正式任务为准。",
+      "阅读完成后只需确认已同步；本场会议已经关闭，不要再调用会议工具。",
+    ].join("\n");
   }
 
   private queueMeetingSessionContextAppend(input: {
@@ -2351,8 +3567,131 @@ export class CompanyOsStore {
 
   acknowledgeHostContext(meetingId: string, actorId: string) {
     const meeting = this.getMeetingRow(meetingId);
-    if (meeting.host_id !== actorId) return;
+    if (meeting.host_id !== actorId || meeting.status !== "active") return;
     this.advanceMeetingWatermark(meetingId, actorId, this.maxMeetingSequence(meetingId));
+  }
+
+  recoverMeetingCloseoutDispatches() {
+    return this.transaction(() => {
+      const rows = this.db.prepare("SELECT * FROM meeting_closeout_dispatches WHERE status = 'running'").all() as Row[];
+      const recoveredAt = nowIso();
+      for (const row of rows) {
+        this.db.prepare(`
+          UPDATE meeting_closeout_dispatches
+          SET status = 'pending', next_attempt_at = ?, lease_expires_at = NULL,
+            last_error = 'Gateway restarted during meeting closeout dispatch'
+          WHERE id = ?
+        `).run(recoveredAt, row.id);
+        this.audit({
+          actorId: "system",
+          action: "meeting.closeout_dispatch_recovered",
+          entityType: "meeting",
+          entityId: row.meeting_id,
+          after: { dispatchId: row.id, memberId: row.member_id },
+        });
+      }
+      return rows.length;
+    });
+  }
+
+  claimNextMeetingCloseoutDispatch(leaseMs = 15 * 60 * 1000): MeetingCloseoutDispatch | null {
+    return this.transaction(() => {
+      const claimedAt = nowIso();
+      const row = this.db.prepare(`
+        SELECT d.*, member.name AS member_name
+        FROM meeting_closeout_dispatches d
+        JOIN members member ON member.id = d.member_id
+        JOIN meetings meeting ON meeting.id = d.meeting_id
+        WHERE d.status = 'pending' AND d.next_attempt_at <= ?
+        ORDER BY d.blocks_room DESC, meeting.ended_at, d.position, d.created_at, d.rowid
+        LIMIT 1
+      `).get(claimedAt) as Row | undefined;
+      if (!row) return null;
+      this.db.prepare(`
+        UPDATE meeting_closeout_dispatches
+        SET status = 'running', attempts = attempts + 1, started_at = ?,
+          lease_expires_at = ?, last_error = NULL
+        WHERE id = ? AND status = 'pending'
+      `).run(claimedAt, new Date(Date.now() + leaseMs).toISOString(), row.id);
+      return mapMeetingCloseoutDispatch({
+        ...row,
+        status: "running",
+        attempts: Number(row.attempts) + 1,
+        started_at: claimedAt,
+      });
+    });
+  }
+
+  completeMeetingCloseoutDispatch(dispatchId: string): MeetingAdvance {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_closeout_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status === "succeeded") return {};
+      if (row.status !== "running") throw new Error("meeting closeout dispatch is not running");
+      const completedAt = nowIso();
+      this.db.prepare(`
+        UPDATE meeting_closeout_dispatches
+        SET status = 'succeeded', completed_at = ?, lease_expires_at = NULL, last_error = NULL
+        WHERE id = ?
+      `).run(completedAt, dispatchId);
+      this.advanceMeetingWatermark(row.meeting_id, row.member_id, Number(row.context_to_sequence));
+      this.audit({
+        actorId: "system",
+        action: "meeting.closeout_delivered",
+        entityType: "meeting",
+        entityId: row.meeting_id,
+        after: { dispatchId, memberId: row.member_id, attempts: Number(row.attempts) },
+      });
+      const remaining = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM meeting_closeout_dispatches
+        WHERE meeting_id = ? AND status != 'succeeded'
+      `).get(row.meeting_id) as Row;
+      if (Number(remaining.count) > 0) return {};
+      this.audit({
+        actorId: "system",
+        action: "meeting.closeout_all_delivered",
+        entityType: "meeting",
+        entityId: row.meeting_id,
+      });
+      return Boolean(row.blocks_room) ? this.activateNextMeeting() : {};
+    });
+  }
+
+  retryMeetingCloseoutDispatch(dispatchId: string, error: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM meeting_closeout_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return null;
+      const reason = required(error, "meeting closeout error").slice(0, 1000);
+      const nextAttemptAt = new Date(Date.now() + closeoutRetryDelayMs(Number(row.attempts))).toISOString();
+      this.db.prepare(`
+        UPDATE meeting_closeout_dispatches
+        SET status = 'pending', last_error = ?, next_attempt_at = ?, lease_expires_at = NULL
+        WHERE id = ?
+      `).run(reason, nextAttemptAt, dispatchId);
+      this.audit({
+        actorId: "system",
+        action: "meeting.closeout_dispatch_retry",
+        entityType: "meeting",
+        entityId: row.meeting_id,
+        reason,
+        after: { dispatchId, memberId: row.member_id, attempts: Number(row.attempts), nextAttemptAt },
+      });
+      return nextAttemptAt;
+    });
+  }
+
+  hasReadyMeetingCloseoutDispatches(now = nowIso()) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM meeting_closeout_dispatches
+      WHERE status = 'pending' AND next_attempt_at <= ? LIMIT 1
+    `).get(now));
+  }
+
+  nextMeetingCloseoutDispatchAt() {
+    const row = this.db.prepare(`
+      SELECT MIN(next_attempt_at) AS next_attempt_at
+      FROM meeting_closeout_dispatches WHERE status = 'pending'
+    `).get() as Row;
+    return (row.next_attempt_at ?? null) as string | null;
   }
 
   meetingTurnDelivery(turnId: string): MeetingTurnDelivery {
@@ -2738,6 +4077,7 @@ export class CompanyOsStore {
   }
 
   private activateNextMeeting(): MeetingAdvance {
+    if (this.roomIsOccupied()) return {};
     const next = this.db.prepare("SELECT * FROM meetings WHERE status = 'queued' ORDER BY queue_position, created_at LIMIT 1").get() as Row | undefined;
     if (!next) return {};
     const startedAt = nowIso();
@@ -2780,8 +4120,17 @@ export class CompanyOsStore {
     `).run(endedAt, meeting.id);
     this.cancelOpenHostDispatches(meeting.id);
     this.addMeetingMessage(meeting.id, "system", null, null, `${reason}，会议已超时结束；未创建任务且未发布会议汇报。`);
+    this.queueMeetingCloseoutDispatches(meeting.id, "timed_out", true);
     this.audit({ actorId: "system", action: "meeting.timed_out", entityType: "meeting", entityId: meeting.id, reason });
-    return this.activateNextMeeting();
+    return {};
+  }
+
+  private roomIsOccupied() {
+    if (this.db.prepare("SELECT 1 AS ok FROM meetings WHERE status = 'active' LIMIT 1").get()) return true;
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS ok FROM meeting_closeout_dispatches
+      WHERE blocks_room = 1 AND status != 'succeeded' LIMIT 1
+    `).get());
   }
 
   private normalizeMeetingQueue() {
@@ -2826,15 +4175,18 @@ export class CompanyOsStore {
 
   bossSnapshot() {
     const meetings = this.listMeetings("boss");
+    const closing = meetings.find((meeting) => meeting.closeoutStatus?.blocksRoom && meeting.closeoutStatus.state === "syncing") ?? null;
     return {
       organization: this.listMembers(true),
       tasks: this.listTasks("boss"),
       notices: this.listNotices("boss"),
       meetings: {
         active: meetings.find((meeting) => meeting.status === "active") ?? null,
+        closing,
         queue: meetings.filter((meeting) => meeting.status === "queued"),
-        history: meetings.filter((meeting) => !OPEN_MEETING_STATUSES.has(meeting.status)),
+        history: meetings.filter((meeting) => !OPEN_MEETING_STATUSES.has(meeting.status) && meeting.id !== closing?.id),
       },
+      taskHourlyCheckin: this.taskCheckinSummary(),
       generatedAt: nowIso(),
     };
   }
@@ -2946,6 +4298,116 @@ function mapTaskSubmission(row: Row) {
   };
 }
 
+function mapTaskAgentDispatch(row: Row) {
+  return {
+    id: row.id as string,
+    taskId: row.task_id as string,
+    targetMemberId: row.target_agent_id as string,
+    targetAgentId: (row.target_runtime_agent_id ?? row.target_agent_id) as string,
+    kind: row.kind as TaskAgentDispatchKind,
+    prompt: row.prompt as string,
+    status: row.status as "pending" | "running" | "succeeded" | "failed" | "canceled",
+    attempts: Number(row.attempts),
+    lastError: (row.last_error ?? null) as string | null,
+    createdAt: row.created_at as string,
+    startedAt: (row.started_at ?? null) as string | null,
+    completedAt: (row.completed_at ?? null) as string | null,
+  };
+}
+
+function mapTaskCheckinDispatch(row: Row): TaskCheckinDispatch {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    batchId: row.batch_id,
+    targetMemberId: row.target_member_id,
+    targetAgentId: row.target_runtime_agent_id ?? null,
+    channel: row.channel,
+    slotIndex: Number(row.slot_index),
+    scheduledAt: row.scheduled_at,
+    taskId: row.task_id ?? null,
+    actionKind: row.action_kind ?? null,
+    prompt: row.prompt ?? null,
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error ?? null,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
+    completedAt: row.completed_at ?? null,
+  };
+}
+
+function taskDispatchAuditAction(kind: TaskAgentDispatchKind, phase: "queued" | "recovered" | "canceled" | "delivered" | "retry" | "failed") {
+  return kind === "boss_reminder" ? `task.reminder_${phase}` : `task.review_notification_${phase}`;
+}
+
+function buildTaskReminderPrompt(task: Row) {
+  return [
+    "【Company OS 任务催办】",
+    `Boss 正在跟进任务「${task.title}」（任务 ID：${task.id}）。`,
+    "请先调用 company_task_read 读取任务的最新版本、验收标准、子任务状态和已有进度，再根据实际情况执行下一步：",
+    "- 若仍在执行，调用 company_task_progress 记录最新进展和下一步计划；",
+    "- 若出现阻塞，调用 company_task_block 如实报告；若任务已处于 blocked，使用 company_task_progress 更新阻塞进展，解除后调用 company_task_unblock；",
+    "- 若已满足验收标准且直接子任务均已终结，调用 company_task_submit 提交完整摘要和 proof/artifact，推进任务进入验收阶段。",
+    "请完成相应的任务工具操作，不要只回复进度说明。",
+  ].join("\n");
+}
+
+function buildTaskCheckinPrompt(task: Row, actionKind: "review" | "execute") {
+  if (actionKind === "review") {
+    return [
+      "【Company OS 任务整点巡检 · 待验收】",
+      "本次只处理下面这一项任务验收，不要扩展到其他任务。",
+      `任务：${task.title}`,
+      `任务 ID：${task.id}`,
+      `负责人：${task.assignee_id}`,
+      `提交时间：${task.submitted_at ?? task.last_activity_at}`,
+      "请调用 company_task_read 读取最新任务版本、验收标准、直接子任务、提交摘要和证据。",
+      "核验后必须调用 company_task_review：满足标准则 accept；不满足则 reject，并写出具体拒绝原因和整改方向。",
+      "请实际完成验收工具操作，不要只回复验收意见。",
+    ].join("\n");
+  }
+  return [
+    "【Company OS 任务整点巡检 · 执行提醒】",
+    "本次只推进下面这一项任务，不要扩展到其他任务。",
+    `任务：${task.title}`,
+    `任务 ID：${task.id}`,
+    `当前状态：${task.status}`,
+    `最后活动：${task.last_activity_at}`,
+    "请先调用 company_task_read 读取最新版本、验收标准、子任务状态和已有进度，再实际推进任务：",
+    "- assigned：调用 company_task_start 开始任务并继续执行；",
+    "- in_progress：完成当前可执行工作，并调用 company_task_progress 记录成果和下一步；",
+    "- blocked：调用 company_task_progress 更新阻塞处理进展，解除后调用 company_task_unblock；",
+    "- 已满足验收标准且直接子任务均已终结：调用 company_task_submit 提交摘要和 proof/artifact。",
+    "若发现新的真实阻塞，请调用 company_task_block。请完成相应工具操作，不要只回复进度说明。",
+  ].join("\n");
+}
+
+function buildTaskReviewNotificationPrompt(
+  task: Row,
+  reviewer: Row,
+  kind: "review_accepted" | "review_rejected",
+  feedback: string | null,
+) {
+  const reviewerLabel = reviewer.kind === "boss" ? "Boss" : `${reviewer.name}（${reviewer.title}）`;
+  const header = [
+    "【Company OS 任务验收通知】",
+    `任务「${task.title}」（任务 ID：${task.id}）已由 ${reviewerLabel} ${kind === "review_accepted" ? "验收通过" : "驳回验收"}。`,
+  ];
+  if (feedback) header.push(`验收意见：${feedback}`);
+  if (kind === "review_accepted") {
+    return [...header, "任务现已关闭。这是一条状态通知，无需再次提交或修改该任务。"].join("\n");
+  }
+  return [
+    ...header,
+    "任务已退回进行中。请立即按以下步骤继续处理：",
+    "- 调用 company_task_read 读取最新任务、验收标准和本次反馈；",
+    "- 根据驳回原因完成整改，并调用 company_task_progress 记录整改进展；",
+    "- 满足验收标准后，调用 company_task_submit 重新提交验收。",
+    "请完成相应的任务工具操作，不要只回复已收到。",
+  ].join("\n");
+}
+
 function normalizeEvidence(evidence: EvidenceInput[]) {
   return evidence.map((item, index) => {
     if (item.type !== "proof" && item.type !== "artifact") throw new Error(`evidence[${index}].type is invalid`);
@@ -2967,6 +4429,34 @@ function normalizeEvidence(evidence: EvidenceInput[]) {
 function isTaskStale(row: Row, now: number, thresholdMs: number) {
   if (row.status !== "assigned" && row.status !== "in_progress") return false;
   return now - Date.parse(row.last_activity_at) >= thresholdMs;
+}
+
+const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function shanghaiSlot(value: number) {
+  const shifted = new Date(value + SHANGHAI_OFFSET_MS);
+  return {
+    localDate: `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`,
+    hour: shifted.getUTCHours(),
+    minute: shifted.getUTCMinutes(),
+    second: shifted.getUTCSeconds(),
+    millisecond: shifted.getUTCMilliseconds(),
+  };
+}
+
+export function nextTaskCheckinRunAt(now: number, startHour: number, endHour: number) {
+  const local = new Date(now + SHANGHAI_OFFSET_MS);
+  const baseYear = local.getUTCFullYear();
+  const baseMonth = local.getUTCMonth();
+  const baseDate = local.getUTCDate();
+  for (let dayOffset = 0; dayOffset < 3; dayOffset += 1) {
+    for (let hour = startHour; hour <= endHour; hour += 1) {
+      const localCandidate = Date.UTC(baseYear, baseMonth, baseDate + dayOffset, hour);
+      const candidate = localCandidate - SHANGHAI_OFFSET_MS;
+      if (candidate > now) return new Date(candidate).toISOString();
+    }
+  }
+  throw new Error("unable to calculate next task check-in run");
 }
 
 function mapNotice(row: Row) {
@@ -3067,6 +4557,33 @@ function mapMeetingSessionContextAppend(row: Row): MeetingSessionContextAppend {
     createdAt: row.created_at,
     appendedAt: row.appended_at ?? null,
   };
+}
+
+function mapMeetingCloseoutDispatch(row: Row): MeetingCloseoutDispatch {
+  return {
+    id: row.id,
+    meetingId: row.meeting_id,
+    memberId: row.member_id,
+    memberName: row.member_name ?? row.member_id,
+    runtimeAgentId: row.runtime_agent_id,
+    outcome: row.outcome,
+    blocksRoom: Boolean(row.blocks_room),
+    position: Number(row.position),
+    contextFromSequence: Number(row.context_from_sequence),
+    contextToSequence: Number(row.context_to_sequence),
+    prompt: row.prompt,
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error ?? null,
+    nextAttemptAt: row.next_attempt_at,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
+    completedAt: row.completed_at ?? null,
+  };
+}
+
+function closeoutRetryDelayMs(attempts: number) {
+  return Math.min(5 * 60_000, 30_000 * (2 ** Math.max(0, Math.min(attempts - 1, 4))));
 }
 
 function formatSelfMeetingContextMessage(input: {

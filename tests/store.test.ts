@@ -46,6 +46,16 @@ function taskFields(title: string) {
   return { title, description: `${title} 说明`, acceptanceCriteria: `${title} 验收标准` };
 }
 
+function deliverAllMeetingCloseouts() {
+  let advance: Record<string, unknown> = {};
+  while (true) {
+    const dispatch = store.claimNextMeetingCloseoutDispatch();
+    if (!dispatch) return advance;
+    const completed = store.completeMeetingCloseoutDispatch(dispatch.id);
+    if (completed.activatedMeetingId || completed.hostDispatchId) advance = completed;
+  }
+}
+
 describe("organization", () => {
   it("seeds Boss and main, rejects unknown agents, non-main writes, and cycles", () => {
     expect(store.listMembers().map((member) => member.id)).toEqual(["boss", "main"]);
@@ -128,6 +138,104 @@ describe("hierarchical tasks", () => {
     expect(view.versions).toHaveLength(2);
     expect(view.risks.stale).toBe(true);
     expect(view.status).toBe("assigned");
+  });
+
+  it("queues an idempotent Boss reminder, tracks delivery, and accepts blocked progress updates", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("催办测试"), assigneeId: "cto" });
+
+    const queued = store.queueTaskReminderByBoss(root.id);
+    const duplicate = store.queueTaskReminderByBoss(root.id);
+    expect(duplicate.id).toBe(queued.id);
+    expect(queued).toMatchObject({
+      taskId: root.id,
+      targetMemberId: "cto",
+      targetAgentId: "cto",
+      status: "pending",
+    });
+    expect(queued.prompt).toContain("Boss 正在跟进任务「催办测试」");
+    expect(queued.prompt).toContain("company_task_read");
+    expect(queued.prompt).toContain("company_task_progress");
+    expect(queued.prompt).toContain("company_task_submit");
+    expect(queued.prompt).toContain("不要只回复进度说明");
+
+    const claimed = store.claimNextTaskDispatch();
+    expect(claimed).toMatchObject({ id: queued.id, status: "running", attempts: 1 });
+    expect(store.completeTaskDispatch(queued.id)).toBe(true);
+    expect(store.readTask("boss", root.id, false).reminderDispatch).toMatchObject({ status: "succeeded" });
+    expect(store.listAudit("task", root.id).map((item) => item.action)).toEqual(expect.arrayContaining([
+      "task.reminder_queued",
+      "task.reminder_delivered",
+    ]));
+
+    store.blockTask("cto", root.id, "等待依赖");
+    store.addTaskProgress("cto", root.id, "已确认依赖将在今晚恢复");
+    expect(store.readTask("boss", root.id, false)).toMatchObject({
+      status: "blocked",
+      progress: [expect.objectContaining({ body: "已确认依赖将在今晚恢复" })],
+    });
+  });
+
+  it("enforces issuer-only review and durably notifies each task assignee", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("根任务验收通知"), assigneeId: "cto" });
+    const child = store.createChildTask("cto", { ...taskFields("二级任务验收通知"), parentId: root.id, assigneeId: "eng-a" });
+    store.startTask("cto", root.id);
+    store.startTask("eng-a", child.id);
+    store.submitTask("eng-a", child.id, "first child submission", PROOF);
+
+    expect(() => store.reviewTask("boss", child.id, "accept")).toThrow(/only the task issuer/);
+    const rejected = store.reviewTask("cto", child.id, "reject", "测试证据不完整");
+    expect(rejected).toMatchObject({
+      status: "in_progress",
+      reviewNotificationDispatch: {
+        kind: "review_rejected",
+        targetMemberId: "eng-a",
+        status: "pending",
+      },
+    });
+    store.submitTask("eng-a", child.id, "second child submission", PROOF);
+    const accepted = store.reviewTask("cto", child.id, "accept", "证据完整");
+    expect(accepted).toMatchObject({
+      status: "closed",
+      reviewNotificationDispatch: {
+        kind: "review_accepted",
+        targetMemberId: "eng-a",
+        status: "pending",
+      },
+    });
+
+    const rejectedDispatch = store.claimNextTaskDispatch();
+    expect(rejectedDispatch).toMatchObject({ kind: "review_rejected", targetAgentId: "eng-a" });
+    expect(rejectedDispatch?.prompt).toContain("已由 CTO（首席技术官） 驳回验收");
+    expect(rejectedDispatch?.prompt).toContain("验收意见：测试证据不完整");
+    expect(rejectedDispatch?.prompt).toContain("company_task_progress");
+    expect(store.failTaskDispatch(rejectedDispatch!.id, "temporary failure")).toBe(true);
+    const rejectedRetry = store.claimNextTaskDispatch();
+    expect(rejectedRetry).toMatchObject({ id: rejectedDispatch!.id, attempts: 2 });
+    expect(store.completeTaskDispatch(rejectedRetry!.id)).toBe(true);
+
+    const acceptedDispatch = store.claimNextTaskDispatch();
+    expect(acceptedDispatch).toMatchObject({ kind: "review_accepted", targetAgentId: "eng-a" });
+    expect(acceptedDispatch?.prompt).toContain("验收通过");
+    expect(acceptedDispatch?.prompt).toContain("无需再次提交或修改该任务");
+    expect(store.completeTaskDispatch(acceptedDispatch!.id)).toBe(true);
+
+    store.submitTask("cto", root.id, "root submission", PROOF);
+    expect(() => store.reviewTask("cto", root.id, "accept")).toThrow(/only the task issuer/);
+    const closedRoot = store.reviewTask("boss", root.id, "accept", "目标达成");
+    expect(closedRoot.reviewNotificationDispatch).toMatchObject({
+      kind: "review_accepted",
+      targetMemberId: "cto",
+    });
+    const rootDispatch = store.claimNextTaskDispatch();
+    expect(rootDispatch).toMatchObject({ kind: "review_accepted", targetAgentId: "cto" });
+    expect(rootDispatch?.prompt).toContain("已由 Boss 验收通过");
+    expect(store.listAudit("task", child.id).map((event) => event.action)).toEqual(expect.arrayContaining([
+      "task.review_notification_queued",
+      "task.review_notification_retry",
+      "task.review_notification_delivered",
+    ]));
   });
 
   it("surfaces inbox changes without marking them read and supports reject/resubmit", () => {
@@ -248,6 +356,100 @@ describe("meeting room", () => {
     `).get(meeting.id)).toMatchObject({ sequence: 3 });
   });
 
+  it("freezes a per-member final timeline and blocks the next meeting until everyone receives it", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "终局同步测试",
+      agenda: "确保所有人得到最终记录",
+      participants: [
+        { agentId: "eng-a", role: "worker" },
+        { agentId: "eng-b", role: "advisor" },
+      ],
+    }).meeting;
+    const turn = store.delegateMeeting("cto", meeting.id, "eng-a", "请先给出实现意见");
+    store.speakMeeting("eng-a", meeting.id, "我建议使用持久化 outbox", turn.turnId);
+    store.speakMeeting("cto", meeting.id, "主持人确认采用该方案");
+    const requestedEnd = store.endMeeting("cto", meeting.id, "采用持久化终局同步并设置关会屏障", false);
+    const finalized = store.finalizeDueAutomaticMeetingEnd(Date.parse(requestedEnd.meeting.autoEndAt))!;
+    const queued = store.requestMeeting("eng-a", { type: "discussion", title: "下一场", agenda: "不得抢跑" }).meeting;
+
+    expect(finalized.meeting.status).toBe("completed");
+    expect(finalized.meeting.messages.at(-2)).toMatchObject({
+      authorId: "cto",
+      body: "【主持人最终总结】\n采用持久化终局同步并设置关会屏障",
+    });
+    expect(store.bossSnapshot().meetings).toMatchObject({ active: null, closing: { id: meeting.id } });
+    expect(queued.status).toBe("queued");
+
+    const dispatches: any[] = [];
+    while (true) {
+      const dispatch = store.claimNextMeetingCloseoutDispatch();
+      if (!dispatch) break;
+      dispatches.push(dispatch);
+      if (dispatch.memberId === "eng-a") {
+        expect(dispatch.contextFromSequence).toBeGreaterThan(0);
+        expect(dispatch.prompt).not.toContain("会议室已开放");
+        expect(dispatch.prompt).not.toContain("我建议使用持久化 outbox");
+        expect(dispatch.prompt).toContain("主持人确认采用该方案");
+        expect(dispatch.prompt).toContain("【主持人最终总结】");
+        expect(dispatch.prompt).toContain("结果：正常完成");
+      }
+      if (dispatch.memberId === "eng-b") {
+        expect(dispatch.contextFromSequence).toBe(0);
+        expect(dispatch.prompt).toContain("会议室已开放");
+        expect(dispatch.prompt).toContain("第 1 轮｜点名");
+      }
+      const advance = store.completeMeetingCloseoutDispatch(dispatch.id);
+      if (dispatches.length < 3) expect(advance).toEqual({});
+    }
+
+    expect(dispatches.map((item) => item.memberId)).toEqual(["eng-a", "eng-b", "cto"]);
+    expect(dispatches.map((item) => item.memberId)).not.toContain("boss");
+    expect(store.meetingView(meeting.id).closeoutStatus).toMatchObject({ state: "delivered", delivered: 3, total: 3 });
+    expect(store.meetingView(queued.id).status).toBe("active");
+  });
+
+  it("retries closeout delivery without advancing the member watermark", () => {
+    addOrg();
+    const meeting = store.requestMeeting("cto", {
+      type: "discussion",
+      title: "终局失败恢复",
+      agenda: "失败不得释放会议室",
+      participants: [{ agentId: "eng-a", role: "advisor" }],
+    }).meeting;
+    const requested = store.endMeeting("cto", meeting.id, "重试直到送达", false);
+    store.finalizeDueAutomaticMeetingEnd(Date.parse(requested.meeting.autoEndAt));
+
+    const first = store.claimNextMeetingCloseoutDispatch()!;
+    expect(first.memberId).toBe("eng-a");
+    expect(store.retryMeetingCloseoutDispatch(first.id, "temporary in_flight")).toBeTruthy();
+    expect(store.db.prepare(`
+      SELECT sequence FROM meeting_context_watermarks WHERE meeting_id = ? AND member_id = ?
+    `).get(meeting.id, first.memberId)).toBeUndefined();
+
+    const otherMember = store.claimNextMeetingCloseoutDispatch()!;
+    expect(otherMember.memberId).toBe("cto");
+    store.acknowledgeHostContext(meeting.id, "cto");
+    expect(store.db.prepare(`
+      SELECT sequence FROM meeting_context_watermarks WHERE meeting_id = ? AND member_id = ?
+    `).get(meeting.id, "cto")).toBeUndefined();
+    store.completeMeetingCloseoutDispatch(otherMember.id);
+    expect(store.claimNextMeetingCloseoutDispatch()).toBeNull();
+
+    store.db.prepare("UPDATE meeting_closeout_dispatches SET next_attempt_at = ? WHERE id = ?")
+      .run(new Date(Date.now() - 1_000).toISOString(), first.id);
+    const retried = store.claimNextMeetingCloseoutDispatch()!;
+    expect(retried).toMatchObject({ id: first.id, attempts: 2, status: "running" });
+    store.recoverMeetingCloseoutDispatches();
+    const recovered = store.claimNextMeetingCloseoutDispatch()!;
+    expect(recovered).toMatchObject({ id: first.id, attempts: 3, status: "running" });
+    store.completeMeetingCloseoutDispatch(recovered.id);
+    expect(store.db.prepare(`
+      SELECT sequence FROM meeting_context_watermarks WHERE meeting_id = ? AND member_id = ?
+    `).get(meeting.id, first.memberId)).toMatchObject({ sequence: recovered.contextToSequence });
+  });
+
   it("waits for Boss to start and requires Boss approval before a direct-participation meeting can end", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("Boss 参会父任务"), assigneeId: "cto" });
@@ -294,7 +496,7 @@ describe("meeting room", () => {
     expect(approved.meeting.audit.some((event: any) => event.actorId === "boss" && event.action === "meeting.completed")).toBe(true);
   });
 
-  it("lets Boss reject a waiting direct-participation meeting and advances the room queue", () => {
+  it("lets Boss reject a waiting direct-participation meeting and advances only after closeout delivery", () => {
     addOrg();
     const waiting = store.requestMeeting("cto", {
       type: "discussion",
@@ -317,7 +519,11 @@ describe("meeting room", () => {
     expect(rejected.meeting.audit).toEqual(expect.arrayContaining([
       expect.objectContaining({ actorId: "boss", action: "meeting.rejected_by_boss", reason: "议题准备不充分" }),
     ]));
-    expect(rejected.advance).toMatchObject({ activatedMeetingId: queued.id, hostDispatchId: expect.any(String) });
+    expect(rejected.advance).toEqual({});
+    expect(store.meetingView(queued.id).status).toBe("queued");
+    expect(store.bossSnapshot().meetings.closing?.id).toBe(waiting.id);
+    const advance = deliverAllMeetingCloseouts();
+    expect(advance).toMatchObject({ activatedMeetingId: queued.id, hostDispatchId: expect.any(String) });
     expect(store.meetingView(queued.id).status).toBe("active");
     expect(() => store.startMeetingByBoss(waiting.id)).toThrow(/not active/);
   });
@@ -333,6 +539,27 @@ describe("meeting room", () => {
     store.startMeetingByBoss(meeting.id);
 
     expect(() => store.rejectMeetingByBoss(meeting.id, "临时改变主意")).toThrow(/already started/);
+  });
+
+  it("notifies invitees when a queued meeting is canceled without blocking the occupied room", () => {
+    addOrg();
+    const active = store.requestMeeting("cto", { type: "discussion", title: "当前会议", agenda: "继续进行" }).meeting;
+    const queued = store.requestMeeting("eng-a", {
+      type: "discussion",
+      title: "取消的排队会",
+      agenda: "不再讨论",
+      participants: [{ agentId: "dev-a", role: "advisor" }],
+    }).meeting;
+
+    const canceled = store.cancelMeeting("eng-a", queued.id, "议题已在线下解决");
+
+    expect(canceled.status).toBe("canceled");
+    expect(canceled.closeoutStatus).toMatchObject({ blocksRoom: false, pending: 2, total: 2 });
+    expect(store.meetingView(active.id).status).toBe("active");
+    const first = store.claimNextMeetingCloseoutDispatch()!;
+    expect(first).toMatchObject({ outcome: "canceled", blocksRoom: false, memberId: "dev-a" });
+    expect(first.prompt).toContain("结果：已取消");
+    expect(first.prompt).toContain("议题已在线下解决");
   });
 
   it("recovers a running host dispatch with the same durable id and never reclaims a succeeded job", () => {
@@ -445,7 +672,7 @@ describe("meeting room", () => {
     expect(store.meetingView(first.meeting.id).currentTurn).toBeNull();
   });
 
-  it("atomically rejects incomplete drafts, then creates tasks, report, and advances queue", () => {
+  it("atomically rejects incomplete drafts, then creates tasks and report before closeout advances the queue", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("父任务"), assigneeId: "cto" });
     const meeting = store.requestMeeting("cto", {
@@ -471,7 +698,10 @@ describe("meeting room", () => {
     expect(result.createdTasks).toHaveLength(2);
     expect(result.notice?.kind).toBe("meeting_report");
     expect(result.meeting.status).toBe("completed");
-    expect(result.advance.activatedMeetingId).toBeTruthy();
+    expect(result.advance).toEqual({});
+    expect(store.listMeetings("boss").filter((item) => item.status === "active")).toHaveLength(0);
+    expect(store.bossSnapshot().meetings.closing?.id).toBe(meeting.id);
+    expect(deliverAllMeetingCloseouts().activatedMeetingId).toBeTruthy();
     expect(store.listMeetings("boss").filter((item) => item.status === "active")).toHaveLength(1);
   });
 
@@ -491,6 +721,8 @@ describe("meeting room", () => {
       .run(new Date(Date.now() - 40 * 60 * 1000).toISOString(), meeting.id);
     store.sweepMeetingTimeouts(10 * 60 * 1000, 30 * 60 * 1000);
     expect(store.meetingView(meeting.id).status).toBe("timed_out");
+    expect(store.meetingView(meeting.id).closeoutStatus).toMatchObject({ blocksRoom: true, pending: 2, total: 2 });
+    expect(store.claimNextMeetingCloseoutDispatch()).toMatchObject({ outcome: "timed_out" });
     expect(store.listNotices("boss")).toHaveLength(0);
   });
 
@@ -542,6 +774,7 @@ describe("meeting room", () => {
     const strategyEnd = store.endMeeting("cto", strategy.id, "由高工负责任务引擎", false);
     const strategyResult = store.finalizeDueAutomaticMeetingEnd(Date.parse(strategyEnd.meeting.autoEndAt))!;
     const seniorTask = strategyResult.createdTasks[0]!;
+    deliverAllMeetingCloseouts();
     const workshop = store.requestMeeting("eng-a", {
       type: "task", title: "任务引擎小会", agenda: "分解实现", parentTaskId: seniorTask.id,
       participants: [{ agentId: "dev-a", role: "worker" }],
@@ -550,6 +783,7 @@ describe("meeting room", () => {
     const workshopEnd = store.endMeeting("eng-a", workshop.id, "工程师实现状态机", false);
     const workshopResult = store.finalizeDueAutomaticMeetingEnd(Date.parse(workshopEnd.meeting.autoEndAt))!;
     const leaf = workshopResult.createdTasks[0]!;
+    deliverAllMeetingCloseouts();
 
     store.startTask("dev-a", leaf.id);
     store.submitTask("dev-a", leaf.id, "状态机测试通过", PROOF);

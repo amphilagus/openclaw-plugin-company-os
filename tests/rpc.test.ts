@@ -67,4 +67,32 @@ describe("Company OS Gateway bridge", () => {
     expect(dispatchAdvance).toHaveBeenNthCalledWith(2, rejection.advance);
     expect(dispatchAdvance).toHaveBeenNthCalledWith(3, completion.advance);
   });
+
+  it("routes Boss task reminders through the persistent dispatcher", async () => {
+    const response = { dispatch: { id: "dispatch-1", status: "pending" }, task: { id: "task-1" } };
+    const remindTaskByBoss = vi.fn(() => response);
+
+    const result = await executeBossApi({ remindTaskByBoss } as any, {
+      method: "POST",
+      path: "/tasks/task-1/remind",
+      body: {},
+    });
+
+    expect(result).toEqual({ status: 202, data: response });
+    expect(remindTaskByBoss).toHaveBeenCalledWith("task-1");
+  });
+
+  it("routes Boss root review through the service dispatcher", async () => {
+    const task = { id: "task-1", status: "closed", reviewNotificationDispatch: { status: "pending" } };
+    const reviewTask = vi.fn(() => task);
+
+    const result = await executeBossApi({ store: {}, reviewTask } as any, {
+      method: "POST",
+      path: "/tasks/task-1/review",
+      body: { decision: "accept", feedback: "验收通过" },
+    });
+
+    expect(result).toEqual({ status: 200, data: task });
+    expect(reviewTask).toHaveBeenCalledWith("boss", "task-1", "accept", "验收通过");
+  });
 });

@@ -13,14 +13,17 @@
         // OpenClaw's active-run registry to report this main session as idle.
         hooks: {
           allowConversationAccess: true,
-          // Allows the plugin to prepend the shared company rules.
-          allowPromptInjection: true,
         },
         config: {
           participantTurnTimeoutSeconds: 600,
           hostIdleTimeoutSeconds: 1800,
           meetingAutoEndDelaySeconds: 60,
           taskStaleAfterHours: 72,
+          taskHourlyCheckins: {
+            enabled: true,
+            startHour: 8,
+            endHour: 17,
+          },
           // Defaults to the OpenClaw Agent marked default: true.
           // organizationAdminAgentId: "jia-goushi",
           // Boss is a human member, so this avatar does not come from agents.list.

@@ -7,18 +7,19 @@
 - 一个 Boss、一间会议室、单一 Gateway、单一 SQLite 数据库。
 - 任务是严格树，不是 DAG：根任务只能由 Boss 派给一级直属员工；子任务只能由父任务负责人派给直属下属。
 - 任务只能自下而上关闭。负责人携 proof 提交 review，派发者验收后永久关闭。
-- 会议严格串行。任务会议结束时，子任务、会议总结和会议汇报公告在同一事务中原子提交。
+- 会议严格串行。任务会议结束时，子任务、会议总结、会议汇报公告和全员终局同步 outbox 在同一事务中原子提交。
 - 会议可设置 `bossParticipates=true`：进入会议室后等待 Boss 手动开始，主持人只能申请结束，最终结束权固定属于 Boss。
 - 未邀请 Boss 的会议也先提交结束申请，WebUI 显示 60 秒倒计时；到期后服务原子关会，Gateway 重启不会丢失倒计时。
 - 公告不可编辑；修正通过 `supersedesNoticeId` 发布新公告。Boss 还可在 WebUI 二次确认后审计删除公告。
 - Boss 写操作由服务端固定记录为 `actor=boss`；Agent 身份只读取可信的 `toolContext.agentId`。
-- 任务与公告不主动唤醒 Agent；会议点名由插件同步调用 `agent:<agentId>:main`。会议工具成功后结束当前 turn，编排器持久化回写记录并用新的主持人 turn 继续会议。
+- 普通任务派发与公告不立即唤醒 Agent；Boss 催办、逐级验收结果和分时任务巡检会进入持久任务调度队列。会议点名由插件同步调用 `agent:<agentId>:main`，会议工具成功后结束当前 turn，编排器持久化回写记录并用新的主持人 turn 继续会议。
+- 会议进入完成、取消或超时终态后，编排器主动唤醒主持人及全部参会 Agent，同步各自水位之后的最终记录；曾占用会议室的会议必须等全员送达后才释放下一场。
 
 ## 技术结构
 
 ```text
 OpenClaw Gateway
-├── CompanyOsService（同步会议编排、持久主持人队列、自动关会、恢复、超时扫描、SSE）
+├── CompanyOsService（同步会议编排、持久主持人/终局队列、自动关会、恢复、超时扫描、SSE）
 ├── 28 个 company_* Agent 工具
 ├── /plugins/company-os/api/v1/*（Gateway 鉴权，仅 API）
 ├── /plugins/company-os-ui/*（无敏感数据的 WebUI 静态壳）
@@ -27,13 +28,14 @@ OpenClaw Gateway
     ├── organization + audit
     ├── task tree + versions + proof
     ├── notices + read marks
-    └── meeting queue + transcript + turns + context watermarks + session append/dispatch/email outbox
+    ├── task check-in runs + batches + dispatch outbox
+    └── meeting queue + transcript + turns + context watermarks + session append/dispatch/email/closeout outbox
 ```
 
 前端是 React + Vite，包含三个真实路由：
 
-- `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、Boss 开始/结束审批、普通会议结束倒计时、插话、任务草案、队列和历史。
-- `/plugins/company-os-ui/tasks`：任务树、风险、版本/proof/审计、Boss 兜底操作和根任务创建。
+- `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、Boss 开始/结束审批、普通会议结束倒计时、插话、任务草案、散会同步进度、队列和历史。
+- `/plugins/company-os-ui/tasks`：任务树、风险、版本/proof/审计、Boss 催办与兜底操作和根任务创建。
 - `/plugins/company-os-ui/notices`：当前共识、历史更正、会议汇报和阅读覆盖。
 
 ## 安装与开发
@@ -52,7 +54,7 @@ openclaw gateway restart
 
 `trusted` 让同源插件 iframe 在静态壳加载后复用 Control UI 保存在同一顶层浏览上下文 `sessionStorage` 中的 Gateway 登录令牌；页面本身不提供第二套认证。静态壳不包含公司数据，所有读取、写入和 SSE 请求仍访问 Gateway 鉴权的 `/plugins/company-os/api/v1/*`。标签页和写接口面向拥有 `operator.write` 的 Boss 操作者。
 
-插件还必须设置 `plugins.entries.company-os.hooks.allowConversationAccess=true` 和 `allowPromptInjection=true`。前者允许 Company OS 用可信工具上下文完成 main-session 会议记录回写；后者允许 `before_prompt_build` 在所有员工 Prompt 头部统一注入精简的公司规则。完整配置见样例。
+插件必须设置 `plugins.entries.company-os.hooks.allowConversationAccess=true`，用于通过可信工具上下文完成 main-session 会议记录回写。会议基本规则不由插件注入，而由现有 `company-guidelines` Hook 在 `agent:bootstrap` 时从 `~/.openclaw/company-info/company-hard-rules.md` 统一添加到临时 `AGENTS.md` 头部。完整配置见样例。
 
 开发前端：
 
@@ -77,7 +79,7 @@ Agent 申请会议时可传入 `bossParticipates: true`。该模式有四个额�
 1. 创建会议时向 Boss 邮箱发送“会议已创建”提醒；轮到该会议进入唯一会议室时再发送“已进入会议室”提醒。
 2. 会议进入会议室后不会唤醒主持人，也不会触发主持人超时；Boss 必须在会议室页面点击「我已进入，开始会议」。
 3. 主持人调用 `company_meeting_end` 只会提交总结和结束申请。Boss 在 WebUI 批准后才会原子创建任务/公告并释放会议室，也可退回主持人继续讨论。
-4. Boss 可在开始前填写原因并拒绝会议；会议以取消状态保留在历史和审计中，会议室立即推进下一场。会议一旦开始便不能再使用会前拒绝。
+4. Boss 可在开始前填写原因并拒绝会议；会议以取消状态保留在历史和审计中，并在受邀 Agent 全部收到取消原因后释放会议室。会议一旦开始便不能再使用会前拒绝。
 
 Boss 点击开始后接口立即返回，会议室显示“主持人启动中”。Boss 开场原文和主持人启动任务在同一 SQLite 事务中持久化；Gateway 重启时会恢复未完成任务，但不会重复执行已经成功的任务。
 
@@ -93,13 +95,37 @@ Boss 点击开始后接口立即返回，会议室显示“主持人启动中”
 
 OpenClaw 2026.7.1 会把某些 `terminate: true` 工具路径归类为 `incomplete_turn`，此时不能假定一定收到 `agent_end`。因此工具成功后会立即登记一个内存空闲检查；服务通过官方 `resolveActiveEmbeddedRunSessionId` 探针确认目标 main session 已退出 active run，才调用 transcript API。`agent_end` 只负责加速同一检查，普通超时扫描绝不写 transcript，避免 session takeover。
 
-会议时间线按固定六位消息号和全局轮次排序；增量窗口从某轮中间开始时显示“第 N 轮（续）”。读取、搜索、浏览器和命令工具的使用规范不再重复塞进每一条会议调度消息，而由 `before_prompt_build` 作为公司规则统一放在 Prompt 头部。
+会议时间线按固定六位消息号和全局轮次排序；增量窗口从某轮中间开始时显示“第 N 轮（续）”。参会规则不重复塞进每一条会议调度消息，而由公司治理项目的 `company-guidelines` Hook 维护和注入；Company OS 只发送本场会议上下文与当前动作。
+
+### 会议终局同步
+
+正常完成、主持人超时、Boss 会前拒绝和排队取消都会为主持人、worker 与 advisor 各创建一项持久终局同步；Boss 是真人，只在 WebUI 查看完整记录，不调用 Agent session。每项提示在关会事务中冻结，从该成员的 `meeting_context_watermarks` 之后开始，按六位消息号包含全部新增时间线、主持人最终总结或明确终止原因。只有 `AgentInvoker` 成功处理提示后才推进该成员水位，Agent 的确认回复保留在其 main session，不写回已关闭会议。
+
+曾经占用会议室的会议进入终态后，WebUI 会先显示“散会同步中”，逐人展示送达、尝试次数和最近错误。`meeting_closeout_dispatches` 对临时失败持续指数退避重试，Gateway 重启会回收租约并恢复未完成项；最后一名成员送达前，排队会议始终保持 `queued`，没有跳过失败成员的旁路。排队阶段取消也会通知受邀成员，但不会阻塞当前正在使用的会议室。v7 上线前的历史终态会议不会回溯唤醒。
 
 Agent 成员 ID 与 OpenClaw Agent ID 保持一致，不再维护 `main → jia-goushi` 一类别名。Schema v4 会把旧别名及任务、会议、消息、公告和调度外键统一迁移到真实 Agent ID，并留下迁移审计。若主持人的 CLI 最终结果为空，但本次调用期间已经产生经过工具校验的会议进展，持久调度会按成功处理，避免把已完成的主持过程误报为启动失败。
 
 Boss 是真人虚拟成员，不走 Agent 身份解析。WebUI 默认从 `~/.openclaw/workspace-boss/avatar.png` 读取 Boss 头像并通过鉴权身份接口传给会议消息组件；可用 `bossAvatarPath` 覆盖。
 
+### Boss 任务催办
+
+Boss 可在“已派发”“进行中”或“阻塞”的任务详情点击「催促负责人」。插件会把催办写入 SQLite 持久队列，再主动调用负责人的 `agent:<agentId>:main` session；同一任务存在等待中或发送中的催办时不会重复入队。提示要求负责人先调用 `company_task_read` 核对最新版本、验收标准、子任务和进度，再根据事实调用 `company_task_progress`、`company_task_block` / `company_task_unblock` 或 `company_task_submit`，不能只回复一段进度说明。
+
+任务详情会显示最近一次催办的等待、发送、送达或失败状态。Gateway 重启后会恢复遗留的发送任务；负责人已变更或任务进入 `review` / 终态时，旧催办会审计取消。普通任务派发和公告仍不主动唤醒 Agent。
+
+### 全层级任务验收通知
+
+每项任务只能由自己的派发者验收：Boss 验收根任务，一级员工验收自己派发的二级任务，依次类推，Boss 不能越级验收子任务。批准或驳回会和任务状态变更一起写入持久调度队列，并主动通知该任务负责人。批准通知说明任务已经关闭；驳回通知包含验收意见，并要求负责人读取任务、记录整改进度后重新提交。任务详情会独立显示最近一次验收通知的发送状态，Gateway 重启后继续发送，失败最多重试三次。
+
 邮件默认复用 `~/.config/mail-skills/.env` 的默认 SMTP 账号，并发送到该账号自身。本机已有的 QQ 邮箱配置无需复制授权码。可以通过 `bossEmailNotifications.account` 选择命名账号，或用 `recipient`、`configPath` 覆盖收件地址和配置路径。
+
+### 分时任务巡检
+
+任务巡检默认每天按北京时间 08:00–17:00 每个整点启动。系统在整点冻结每位员工当轮候选清单：本人派发的待验收任务，以及本人负责的 `assigned`、`in_progress`、`blocked` 任务。每位员工每轮最多收到三个单任务提示，计划时间固定为 `:00`、`:15`、`:30`；发送前若原候选已失效，会从同一整点快照中递补，整点后新增任务进入下一轮。
+
+候选统一按等待时间排序：待验收使用提交时间，执行任务使用最后活动时间。当天尚未成功提醒的任务优先；全部轮过后按最早一次成功提醒继续轮转，避免少数老任务永久占满三个名额。每次 Agent 只处理一个任务，并被要求实际调用读取、审批、进度、阻塞或提交工具。
+
+Boss 每个整点收到一封不设任务上限的汇总邮件，包含全部根任务待验收和根任务树阻塞/停滞异常；未处理事项下个整点继续提醒。邮件账号完全复用 `bossEmailNotifications`。巡检运行、候选快照和三个分时槽位都持久化到 SQLite，失败最多尝试三次，Gateway 重启不补建错过的整点，但会继续处理已经排队的历史槽位。可通过 `taskHourlyCheckins.enabled/startHour/endHour` 调整开关与整点窗口，时区固定为 `Asia/Shanghai`。
 
 ## Agent 工具
 
@@ -115,7 +141,7 @@ Boss 是真人虚拟成员，不走 Agent 身份解析。WebUI 默认从 `~/.ope
 
 ## 测试
 
-`npm test` 覆盖组织环、真实 Agent ID 迁移、非法员工、跨级派发、proof、版本、阻塞/停滞风险、取消分支、逐层关单、统一 inbox、单会议室、同步点名、可信发言校验、审计代录、固定消息号/全局轮次、第二人称 session 回写、幂等水位推进、先回写再恢复主持人的顺序、Boss `@` FIFO、Boss 参会开始/拒绝/结束闸门、普通会议自动结束与重启恢复、Boss 真人头像、持久主持人任务恢复、QQ SMTP 配置、数据库迁移、任务会议原子回滚、超时、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
+`npm test` 覆盖组织环、真实 Agent ID 迁移、非法员工、跨级派发、proof、版本、阻塞/停滞风险、Boss 持久催办、分时任务巡检轮转/递补/恢复、Boss 巡检邮件、取消分支、逐层关单、统一 inbox、单会议室、同步点名、可信发言校验、审计代录、固定消息号/全局轮次、第二人称 session 回写、幂等水位推进、先回写再恢复主持人的顺序、Boss `@` FIFO、Boss 参会开始/拒绝/结束闸门、普通会议自动结束与重启恢复、全终态的逐成员终局同步、严格散会屏障、失败重试/租约恢复、Boss 真人头像、持久主持人任务恢复、QQ SMTP 配置、数据库迁移、任务会议原子回滚、超时、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
 
 `npm run plugin:validate` 还会验证构建产物、清单与 28 个工具契约、长驻服务、相互隔离的 WebUI/API 路由，以及 `operator.write` Control UI 标签页。
 

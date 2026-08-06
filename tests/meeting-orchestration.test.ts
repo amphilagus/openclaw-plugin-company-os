@@ -371,6 +371,120 @@ describe("synchronous meeting orchestration", () => {
       await service.stop();
     }
   });
+
+  it("delivers a durable Boss task reminder to the assignee main session", async () => {
+    const agentInvoker: AgentInvoker = {
+      invoke: vi.fn(async ({ agentId, prompt }) => {
+        expect(agentId).toBe("cto");
+        expect(prompt).toContain("【Company OS 任务催办】");
+        expect(prompt).toContain("company_task_read");
+        expect(prompt).toContain("company_task_submit");
+        return { ok: true, text: "已核对并更新任务进度", raw: {}, attempts: 1 };
+      }),
+    };
+    const service = createService(agentInvoker);
+    seedOrganization(service);
+    const task = service.store.createRootTask({
+      title: "交付催办闭环",
+      description: "实现 Boss 催办",
+      acceptanceCriteria: "负责人 main session 收到规范提醒",
+      assigneeId: "cto",
+    });
+
+    const result = service.remindTaskByBoss(task.id);
+    expect(result.dispatch).toMatchObject({ status: "pending", targetAgentId: "cto" });
+    await waitFor(() => expect(service.store.readTask("boss", task.id, false).reminderDispatch?.status).toBe("succeeded"));
+    expect(agentInvoker.invoke).toHaveBeenCalledTimes(1);
+    await service.stop();
+  });
+
+  it("delivers every level's review result to that task's assignee main session", async () => {
+    const deliveries: Array<{ agentId: string; prompt: string }> = [];
+    const agentInvoker: AgentInvoker = {
+      invoke: vi.fn(async ({ agentId, prompt }) => {
+        deliveries.push({ agentId, prompt });
+        return { ok: true, text: "已收到验收结果", raw: {}, attempts: 1 };
+      }),
+    };
+    const service = createService(agentInvoker);
+    seedOrganization(service);
+    const root = service.store.createRootTask({
+      title: "交付全层级通知",
+      description: "验证逐级验收通知",
+      acceptanceCriteria: "各层负责人收到自己的验收结果",
+      assigneeId: "cto",
+    });
+    const child = service.store.createChildTask("cto", {
+      parentId: root.id,
+      title: "实现通知编排",
+      description: "接通审批结果",
+      acceptanceCriteria: "eng-a 收到审批通知",
+      assigneeId: "eng-a",
+    });
+    service.store.startTask("cto", root.id);
+    service.store.startTask("eng-a", child.id);
+    service.store.submitTask("eng-a", child.id, "child done", [{ type: "proof", label: "tests", command: "npm test" }]);
+
+    service.reviewTask("cto", child.id, "accept", "子任务证据完整");
+    await waitFor(() => expect(service.store.readTask("boss", child.id, false).reviewNotificationDispatch?.status).toBe("succeeded"));
+    service.store.submitTask("cto", root.id, "root ready", [{ type: "artifact", label: "report", path: "/tmp/report.md" }]);
+    service.reviewTask("boss", root.id, "reject", "根任务报告需要补充");
+    await waitFor(() => expect(service.store.readTask("boss", root.id, false).reviewNotificationDispatch?.status).toBe("succeeded"));
+
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries[0]).toMatchObject({ agentId: "eng-a" });
+    expect(deliveries[0]?.prompt).toContain("已由 CTO（首席技术官） 验收通过");
+    expect(deliveries[1]).toMatchObject({ agentId: "cto" });
+    expect(deliveries[1]?.prompt).toContain("已由 Boss 驳回验收");
+    expect(deliveries[1]?.prompt).toContain("根任务报告需要补充");
+    expect(deliveries[1]?.prompt).toContain("company_task_submit");
+    await service.stop();
+  });
+
+  it("actively synchronizes every attendee before activating the next room meeting", async () => {
+    const deliveries: Array<{ agentId: string; prompt: string }> = [];
+    const agentInvoker: AgentInvoker = {
+      invoke: vi.fn(async ({ agentId, prompt }) => {
+        deliveries.push({ agentId, prompt });
+        if (agentId === "eng-a") {
+          return { ok: false, code: "empty_reply" as const, error: "agent returned no text payload", attempts: 1, completed: true, raw: { status: "ok", payloads: [] } };
+        }
+        return { ok: true, text: "已同步会议最终记录", raw: {}, attempts: 1 };
+      }),
+    };
+    const service = createService(agentInvoker);
+    seedOrganization(service);
+    const meeting = service.store.requestMeeting("cto", {
+      type: "discussion",
+      title: "终局主动同步",
+      agenda: "验证 main session 编排",
+      participants: [
+        { agentId: "eng-a", role: "worker" },
+        { agentId: "eng-b", role: "advisor" },
+      ],
+    }).meeting;
+    const next = service.store.requestMeeting("eng-a", {
+      type: "discussion",
+      title: "屏障后的会议",
+      agenda: "必须后启动",
+      bossParticipates: true,
+    }).meeting;
+    const requested = service.store.endMeeting("cto", meeting.id, "全员获得最终上下文", false);
+    const finalized = service.store.finalizeDueAutomaticMeetingEnd(Date.parse(requested.meeting.autoEndAt))!;
+    const messageCount = service.store.meetingView(meeting.id).messages.length;
+
+    expect(service.store.meetingView(next.id).status).toBe("queued");
+    await service.dispatchAdvance(finalized.advance);
+    await waitFor(() => expect(service.store.meetingView(meeting.id).closeoutStatus?.state).toBe("delivered"));
+
+    const closeouts = deliveries.filter((item) => item.prompt.includes("【Company OS 会议结束同步】"));
+    expect(closeouts.map((item) => item.agentId)).toEqual(["eng-a", "eng-b", "cto"]);
+    expect(closeouts.every((item) => item.prompt.includes("【主持人最终总结】"))).toBe(true);
+    expect(closeouts.every((item) => item.prompt.includes("不要再调用会议工具"))).toBe(true);
+    expect(service.store.meetingView(meeting.id).messages).toHaveLength(messageCount);
+    expect(service.store.meetingView(next.id)).toMatchObject({ status: "active", awaitingBossStart: true });
+    await service.stop();
+  });
 });
 
 function createService(

@@ -14,7 +14,6 @@ import {
   createCompanyOsApiHttpHandler,
   createCompanyOsWebHttpHandler,
 } from "./http.js";
-import { COMPANY_RULES_PROMPT } from "./company-rules.js";
 import { COMPANY_OS_GATEWAY_METHOD, createCompanyOsGatewayHandler } from "./rpc.js";
 import { CompanyOsService } from "./service.js";
 import { COMPANY_TOOL_NAMES, createCompanyOsTools } from "./tools.js";
@@ -28,6 +27,11 @@ const ConfigSchema = Type.Object({
   hostIdleTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 60, default: 1800 })),
   meetingAutoEndDelaySeconds: Type.Optional(Type.Integer({ minimum: 1, default: 60 })),
   taskStaleAfterHours: Type.Optional(Type.Integer({ minimum: 1, default: 72 })),
+  taskHourlyCheckins: Type.Optional(Type.Object({
+    enabled: Type.Optional(Type.Boolean({ default: true })),
+    startHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 8 })),
+    endHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 17 })),
+  }, { additionalProperties: false })),
   databasePath: Type.Optional(Type.String({ minLength: 1 })),
   organizationAdminAgentId: Type.Optional(Type.String({ minLength: 1 })),
   bossAvatarPath: Type.Optional(Type.String({ minLength: 1, default: "~/.openclaw/workspace-boss/avatar.png" })),
@@ -75,10 +79,6 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
         { name },
       );
     }
-
-    api.on("before_prompt_build", async () => ({
-      prependSystemContext: COMPANY_RULES_PROMPT,
-    }));
 
     api.on("agent_end", async (_event, context) => {
       if (!service) return;

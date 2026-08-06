@@ -46,12 +46,9 @@ assert(registered.tabs.length === 1 && registered.tabs[0].requiredScopes?.includ
 assert(registered.gatewayMethods.length === 1, "Company OS authenticated Gateway bridge is missing");
 assert(registered.gatewayMethods[0].method === "companyOs.api", "Company OS Gateway bridge method name is invalid");
 assert(registered.gatewayMethods[0].options?.scope === "operator.write", "Company OS Gateway bridge must require operator.write");
-assert(
-  JSON.stringify(registered.hooks.map((hook) => hook.name).sort()) === JSON.stringify(["agent_end", "before_prompt_build"]),
-  "Company OS company-rules and agent_end hooks are missing",
-);
+assert(registered.hooks.length === 1 && registered.hooks[0].name === "agent_end", "Company OS agent_end transcript hook is missing");
 
-console.log(`company-os validation passed: ${registered.tools.length} tools, 1 service, 2 typed hooks, 1 authenticated Gateway bridge, 2 isolated HTTP routes, 1 Control UI tab`);
+console.log(`company-os validation passed: ${registered.tools.length} tools, 1 service, 1 agent_end hook, 1 authenticated Gateway bridge, 2 isolated HTTP routes, 1 Control UI tab`);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);

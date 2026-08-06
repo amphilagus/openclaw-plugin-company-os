@@ -5,8 +5,9 @@ import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
 import { resolveAgentVisualIdentity, resolveStandaloneAvatar, type AgentVisualIdentity } from "./identity.js";
 import { OpenClawSessionContextAppender, type SessionContextAppender } from "./session-context.js";
-import { CompanyOsStore } from "./store.js";
+import { CompanyOsStore, nextTaskCheckinRunAt } from "./store.js";
 import type {
+  Actor,
   MeetingAdvance,
   MeetingToolSessionIdentity,
   MeetingTurnDelivery,
@@ -31,6 +32,12 @@ export class CompanyOsService {
   private automaticEndTimer?: NodeJS.Timeout;
   private emailFlush?: Promise<void>;
   private dispatchFlush?: Promise<void>;
+  private closeoutDispatchFlush?: Promise<void>;
+  private closeoutRetryTimer?: NodeJS.Timeout;
+  private taskDispatchFlush?: Promise<void>;
+  private taskCheckinFlush?: Promise<void>;
+  private taskCheckinRunTimer?: NodeJS.Timeout;
+  private taskCheckinDispatchTimer?: NodeJS.Timeout;
   private contextAppendFlush?: Promise<void>;
   private contextAppendIdleTimer?: NodeJS.Timeout;
   private readonly contextAppendIdleQueue = new Map<string, { agentId: string; sessionKey: string; sessionId: string }>();
@@ -67,11 +74,18 @@ export class CompanyOsService {
 
   async start() {
     this.store.recoverAgentDispatches();
+    this.store.recoverMeetingCloseoutDispatches();
+    this.store.recoverTaskDispatches();
+    this.store.recoverTaskCheckinDispatches();
     this.store.recoverSessionContextAppends();
     await this.recover();
     await this.flushSessionContextAppends();
     await this.flushMeetingEmails();
     this.kickHostDispatches();
+    this.kickMeetingCloseoutDispatches();
+    this.kickTaskDispatches();
+    this.kickTaskCheckinDispatches();
+    this.scheduleNextTaskCheckinRun();
     this.scheduleNextAutomaticEnd();
     this.scanTimer = setInterval(() => {
       void this.scanTimeouts().catch((error) => this.logger.error(`company-os timeout scan failed: ${formatError(error)}`));
@@ -84,9 +98,15 @@ export class CompanyOsService {
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.automaticEndTimer) clearTimeout(this.automaticEndTimer);
     if (this.contextAppendIdleTimer) clearTimeout(this.contextAppendIdleTimer);
+    if (this.closeoutRetryTimer) clearTimeout(this.closeoutRetryTimer);
+    if (this.taskCheckinRunTimer) clearTimeout(this.taskCheckinRunTimer);
+    if (this.taskCheckinDispatchTimer) clearTimeout(this.taskCheckinDispatchTimer);
     this.lifecycleAbort.abort();
     await Promise.allSettled([
       ...(this.dispatchFlush ? [this.dispatchFlush] : []),
+      ...(this.closeoutDispatchFlush ? [this.closeoutDispatchFlush] : []),
+      ...(this.taskDispatchFlush ? [this.taskDispatchFlush] : []),
+      ...(this.taskCheckinFlush ? [this.taskCheckinFlush] : []),
       ...(this.contextAppendFlush ? [this.contextAppendFlush] : []),
       ...this.activeTurnDeliveries,
     ]);
@@ -154,7 +174,29 @@ export class CompanyOsService {
   async dispatchAdvance(advance: MeetingAdvance | null | undefined) {
     await this.flushMeetingEmails();
     if (advance?.hostDispatchId) this.kickHostDispatches();
+    this.kickMeetingCloseoutDispatches();
     this.scheduleNextAutomaticEnd();
+  }
+
+  remindTaskByBoss(taskId: string) {
+    const dispatch = this.store.queueTaskReminderByBoss(taskId);
+    this.kickTaskDispatches();
+    return {
+      dispatch,
+      task: this.store.readTask("boss", taskId, false),
+    };
+  }
+
+  reviewTask(actorId: Actor, taskId: string, decision: "accept" | "reject", feedback?: string) {
+    const task = this.store.reviewTask(actorId, taskId, decision, feedback);
+    this.kickTaskDispatches();
+    return task;
+  }
+
+  dispatchTaskCheckinRun(scheduledAt: string | number | Date) {
+    const run = this.store.queueTaskCheckinRun(scheduledAt);
+    this.kickTaskCheckinDispatches();
+    return run;
   }
 
   async delegateMeeting(
@@ -299,6 +341,10 @@ export class CompanyOsService {
     for (const advance of advances) await this.dispatchAdvance(advance);
     if (advances.length === 0) await this.flushMeetingEmails();
     this.kickHostDispatches();
+    this.kickMeetingCloseoutDispatches();
+    this.kickTaskDispatches();
+    this.kickTaskCheckinDispatches();
+    this.scheduleNextTaskCheckinDispatch();
     this.scheduleNextAutomaticEnd();
   }
 
@@ -423,6 +469,192 @@ export class CompanyOsService {
       } catch (error) {
         this.store.failHostDispatch(dispatch.id, formatError(error));
         this.logger.error(`company-os host dispatch ${dispatch.id} crashed: ${formatError(error)}`);
+      }
+    }
+  }
+
+  private kickMeetingCloseoutDispatches() {
+    if (this.stopping || this.closeoutDispatchFlush) return;
+    if (this.closeoutRetryTimer) {
+      clearTimeout(this.closeoutRetryTimer);
+      this.closeoutRetryTimer = undefined;
+    }
+    this.closeoutDispatchFlush = this.flushMeetingCloseoutDispatches()
+      .catch((error) => this.logger.error(`company-os meeting closeout dispatch loop failed: ${formatError(error)}`))
+      .finally(() => {
+        this.closeoutDispatchFlush = undefined;
+        if (this.stopping) return;
+        if (this.store.hasReadyMeetingCloseoutDispatches()) this.kickMeetingCloseoutDispatches();
+        else this.scheduleNextMeetingCloseoutDispatch();
+      });
+  }
+
+  private scheduleNextMeetingCloseoutDispatch() {
+    if (this.stopping || this.closeoutRetryTimer) return;
+    const nextAttemptAt = this.store.nextMeetingCloseoutDispatchAt();
+    if (!nextAttemptAt) return;
+    const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
+    this.closeoutRetryTimer = setTimeout(() => {
+      this.closeoutRetryTimer = undefined;
+      this.kickMeetingCloseoutDispatches();
+    }, delay);
+    this.closeoutRetryTimer.unref();
+  }
+
+  private async flushMeetingCloseoutDispatches() {
+    while (!this.stopping) {
+      const dispatch = this.store.claimNextMeetingCloseoutDispatch();
+      if (!dispatch) return;
+      try {
+        const result = await this.agentInvoker.invoke({
+          agentId: dispatch.runtimeAgentId,
+          prompt: dispatch.prompt,
+          timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+          signal: this.lifecycleAbort.signal,
+        });
+        if (result.ok || (result.code === "empty_reply" && result.completed)) {
+          const advance = this.store.completeMeetingCloseoutDispatch(dispatch.id);
+          if (!result.ok) {
+            this.logger.warn(`company-os accepted meeting closeout ${dispatch.id} after a completed CLI turn returned no text payload`);
+          }
+          this.logger.info(`company-os delivered meeting closeout ${dispatch.id} to agent:${dispatch.runtimeAgentId}:main`);
+          await this.dispatchAdvance(advance);
+        } else {
+          this.store.retryMeetingCloseoutDispatch(dispatch.id, result.error);
+          this.logger.error(`company-os meeting closeout ${dispatch.id} failed for agent:${dispatch.runtimeAgentId}:main: ${result.error}`);
+        }
+      } catch (error) {
+        const message = formatError(error);
+        this.store.retryMeetingCloseoutDispatch(dispatch.id, message);
+        this.logger.error(`company-os meeting closeout ${dispatch.id} crashed: ${message}`);
+      }
+    }
+  }
+
+  private kickTaskDispatches() {
+    if (this.stopping || this.taskDispatchFlush) return;
+    this.taskDispatchFlush = this.flushTaskDispatches()
+      .catch((error) => this.logger.error(`company-os task dispatch loop failed: ${formatError(error)}`))
+      .finally(() => {
+        this.taskDispatchFlush = undefined;
+        if (!this.stopping && this.store.hasPendingTaskDispatches()) this.kickTaskDispatches();
+      });
+  }
+
+  private async flushTaskDispatches() {
+    while (!this.stopping) {
+      const dispatch = this.store.claimNextTaskDispatch();
+      if (!dispatch) return;
+      try {
+        const result = await this.agentInvoker.invoke({
+          agentId: dispatch.targetAgentId,
+          prompt: dispatch.prompt,
+          timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+          signal: this.lifecycleAbort.signal,
+        });
+        if (result.ok || this.store.taskDispatchHasProgress(dispatch.id)) {
+          this.store.completeTaskDispatch(dispatch.id);
+          if (!result.ok) {
+            this.logger.warn(`company-os accepted task dispatch ${dispatch.id} after verified task progress despite CLI result: ${result.error}`);
+          }
+          this.logger.info(`company-os delivered task ${dispatch.kind} dispatch ${dispatch.id} to agent:${dispatch.targetAgentId}:main`);
+        } else {
+          this.store.failTaskDispatch(dispatch.id, result.error);
+          this.logger.error(`company-os task ${dispatch.kind} dispatch ${dispatch.id} failed for agent:${dispatch.targetAgentId}:main: ${result.error}`);
+        }
+      } catch (error) {
+        this.store.failTaskDispatch(dispatch.id, formatError(error));
+        this.logger.error(`company-os task ${dispatch.kind} dispatch ${dispatch.id} crashed: ${formatError(error)}`);
+      }
+    }
+  }
+
+  private scheduleNextTaskCheckinRun() {
+    if (this.taskCheckinRunTimer) clearTimeout(this.taskCheckinRunTimer);
+    this.taskCheckinRunTimer = undefined;
+    if (this.stopping || !this.config.taskHourlyCheckins.enabled) return;
+    const scheduledAt = nextTaskCheckinRunAt(
+      Date.now(),
+      this.config.taskHourlyCheckins.startHour,
+      this.config.taskHourlyCheckins.endHour,
+    );
+    const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
+    this.taskCheckinRunTimer = setTimeout(() => {
+      this.taskCheckinRunTimer = undefined;
+      try {
+        this.dispatchTaskCheckinRun(scheduledAt);
+      } catch (error) {
+        this.logger.error(`company-os task check-in run ${scheduledAt} failed: ${formatError(error)}`);
+      } finally {
+        this.scheduleNextTaskCheckinRun();
+      }
+    }, delay);
+    this.taskCheckinRunTimer.unref();
+  }
+
+  private scheduleNextTaskCheckinDispatch() {
+    if (this.taskCheckinDispatchTimer) clearTimeout(this.taskCheckinDispatchTimer);
+    this.taskCheckinDispatchTimer = undefined;
+    if (this.stopping || this.taskCheckinFlush) return;
+    const scheduledAt = this.store.nextPendingTaskCheckinDispatchAt();
+    if (!scheduledAt) return;
+    const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
+    this.taskCheckinDispatchTimer = setTimeout(() => {
+      this.taskCheckinDispatchTimer = undefined;
+      this.kickTaskCheckinDispatches();
+    }, delay);
+    this.taskCheckinDispatchTimer.unref();
+  }
+
+  private kickTaskCheckinDispatches() {
+    if (this.stopping || this.taskCheckinFlush) return;
+    if (this.taskCheckinDispatchTimer) clearTimeout(this.taskCheckinDispatchTimer);
+    this.taskCheckinDispatchTimer = undefined;
+    if (!this.store.hasDueTaskCheckinDispatches()) {
+      this.scheduleNextTaskCheckinDispatch();
+      return;
+    }
+    this.taskCheckinFlush = this.flushTaskCheckinDispatches()
+      .catch((error) => this.logger.error(`company-os task check-in dispatch loop failed: ${formatError(error)}`))
+      .finally(() => {
+        this.taskCheckinFlush = undefined;
+        if (!this.stopping && this.store.hasDueTaskCheckinDispatches()) this.kickTaskCheckinDispatches();
+        else this.scheduleNextTaskCheckinDispatch();
+      });
+  }
+
+  private async flushTaskCheckinDispatches() {
+    while (!this.stopping) {
+      const dispatch = this.store.claimNextTaskCheckinDispatch();
+      if (!dispatch) return;
+      try {
+        if (dispatch.channel === "boss_email") {
+          if (!dispatch.emailNotification) throw new Error("Boss task check-in email payload is missing");
+          await this.meetingEmailSender.send(dispatch.emailNotification);
+          this.store.completeTaskCheckinDispatch(dispatch.id);
+          this.logger.info(`company-os sent Boss task check-in email for run ${dispatch.runId}`);
+          continue;
+        }
+        if (!dispatch.targetAgentId || !dispatch.prompt) throw new Error("agent task check-in dispatch is incomplete");
+        const result = await this.agentInvoker.invoke({
+          agentId: dispatch.targetAgentId,
+          prompt: dispatch.prompt,
+          timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+          signal: this.lifecycleAbort.signal,
+        });
+        if (result.ok || this.store.taskCheckinDispatchHasProgress(dispatch.id)) {
+          this.store.completeTaskCheckinDispatch(dispatch.id);
+          if (!result.ok) {
+            this.logger.warn(`company-os accepted task check-in ${dispatch.id} after verified task action despite CLI result: ${result.error}`);
+          }
+          this.logger.info(`company-os delivered task check-in ${dispatch.id} to agent:${dispatch.targetAgentId}:main`);
+        } else {
+          this.store.failTaskCheckinDispatch(dispatch.id, result.error);
+          this.logger.error(`company-os task check-in ${dispatch.id} failed for agent:${dispatch.targetAgentId}:main: ${result.error}`);
+        }
+      } catch (error) {
+        this.store.failTaskCheckinDispatch(dispatch.id, formatError(error));
+        this.logger.error(`company-os task check-in ${dispatch.id} crashed: ${formatError(error)}`);
       }
     }
   }

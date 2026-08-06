@@ -26,6 +26,28 @@
         "minimum": 1,
         "default": 72
       },
+      "taskHourlyCheckins": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "startHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 8
+          },
+          "endHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 17
+          }
+        },
+        "additionalProperties": false
+      },
       "databasePath": {
         "type": "string"
       },

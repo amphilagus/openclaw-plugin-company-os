@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import entry from "../src/index.js";
 import { CompanyOsStore } from "../src/store.js";
+import { createCompanyOsTools } from "../src/tools.js";
 import { resolveConfig } from "../src/types.js";
 
 const temporaryDirectories: string[] = [];
@@ -21,7 +22,6 @@ describe("agent tool runtime lifecycle", () => {
     const tools = new Map<string, (context: any) => any>();
     let serviceRegistration: any;
     let agentEndHook: any;
-    let companyRulesHook: any;
     const databasePath = path.join(stateDir, "plugins", "company-os", "company-os.sqlite");
     const seeded = new CompanyOsStore({
       databasePath,
@@ -45,7 +45,6 @@ describe("agent tool runtime lifecycle", () => {
       registerTool: (factory: any, options: any) => tools.set(options.name, factory),
       on: (name: string, handler: any) => {
         if (name === "agent_end") agentEndHook = handler;
-        if (name === "before_prompt_build") companyRulesHook = handler;
       },
       registerService: (registration: any) => { serviceRegistration = registration; },
       registerGatewayMethod: vi.fn(),
@@ -95,11 +94,29 @@ describe("agent tool runtime lifecycle", () => {
         formatted_text: "【消息 #000002｜主持人发言事件】\n你（架构师）：\n主持人已经回应",
       });
     expect(agentEndHook).toBeTypeOf("function");
-    expect(companyRulesHook).toBeTypeOf("function");
-    await expect(companyRulesHook({}, {})).resolves.toMatchObject({
-      prependSystemContext: expect.stringContaining("涉及源码、文件、日志、配置、运行状态或外部事实时，须先实际核验"),
-    });
     verification.close();
     await serviceRegistration.stop();
+  });
+
+  it("routes agent task reviews through the service dispatcher", async () => {
+    const task = { id: "task-child", status: "closed", reviewNotificationDispatch: { status: "pending" } };
+    const reviewTask = vi.fn(() => task);
+    const service = {
+      store: { requireAgentMember: vi.fn(() => ({ id: "cto" })) },
+      reviewTask,
+    } as any;
+    const reviewTool = createCompanyOsTools({
+      getService: () => service,
+      toolContext: { agentId: "cto" } as any,
+    }).find((tool) => tool.name === "company_task_review")!;
+
+    const result = await reviewTool.execute("call-review", {
+      taskId: "task-child",
+      decision: "reject",
+      feedback: "需要补充证据",
+    });
+
+    expect(reviewTask).toHaveBeenCalledWith("cto", "task-child", "reject", "需要补充证据");
+    expect(JSON.stringify(result)).toContain('"reviewNotificationDispatch":{"status":"pending"}');
   });
 });

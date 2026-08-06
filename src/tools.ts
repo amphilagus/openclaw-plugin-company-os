@@ -170,7 +170,11 @@ export function createCompanyOsTools(options: {
     }),
     tool("company_meeting_cancel", "取消排队会议", "主持人或申请人可带原因取消自己的排队会议，不能中断活动会议。", Type.Object({
       meetingId: Id, reason: Reason,
-    }, { additionalProperties: false }), async (p) => store.cancelMeeting(actorId(), p.meetingId, p.reason)),
+    }, { additionalProperties: false }), async (p) => {
+      const meeting = store.cancelMeeting(actorId(), p.meetingId, p.reason);
+      await service.dispatchAdvance({});
+      return meeting;
+    }),
 
     tool("company_task_list", "任务列表", "查看你的责任树中的多级任务、子任务计数和阻塞/停滞风险。", Empty,
       async () => store.listTasks(actorId())),
@@ -204,7 +208,7 @@ export function createCompanyOsTools(options: {
       taskId: Id,
       decision: Type.Union([Type.Literal("accept"), Type.Literal("reject")]),
       feedback: Type.Optional(Type.String()),
-    }, { additionalProperties: false }), async (p) => store.reviewTask(actorId(), p.taskId, p.decision, p.feedback)),
+    }, { additionalProperties: false }), async (p) => service.reviewTask(actorId(), p.taskId, p.decision, p.feedback)),
     tool("company_task_reassign", "重派任务", "派发者带原因重派给自己的另一名直属下属。", Type.Object({
       taskId: Id, assigneeId: Id, reason: Reason,
     }, { additionalProperties: false }), async (p) => store.reassignTask(actorId(), p.taskId, p.assigneeId, p.reason)),

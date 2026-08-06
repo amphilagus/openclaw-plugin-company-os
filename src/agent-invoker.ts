@@ -6,7 +6,14 @@ import { promisify } from "node:util";
 
 export type AgentInvocationResult =
   | { ok: true; text: string; raw: unknown; attempts: number }
-  | { ok: false; code: "aborted" | "timeout" | "in_flight" | "launch_failed" | "exit" | "invalid_json" | "empty_reply"; error: string; attempts: number };
+  | {
+      ok: false;
+      code: "aborted" | "timeout" | "in_flight" | "launch_failed" | "exit" | "invalid_json" | "empty_reply";
+      error: string;
+      attempts: number;
+      completed?: boolean;
+      raw?: unknown;
+    };
 
 export type AgentInvocation = {
   agentId: string;
@@ -109,7 +116,16 @@ export class OpenClawCliAgentInvoker implements AgentInvoker {
     const text = Array.isArray(parsed?.payloads)
       ? parsed.payloads.find((payload: unknown) => typeof (payload as { text?: unknown })?.text === "string")?.text?.trim()
       : "";
-    if (!text) return { ok: false, code: "empty_reply", error: "agent returned no text payload", attempts: attempt };
+    if (!text) {
+      return {
+        ok: false,
+        code: "empty_reply",
+        error: "agent returned no text payload",
+        attempts: attempt,
+        completed: ["ok", "completed", "success"].includes(parsed?.status),
+        raw: parsed,
+      };
+    }
     return { ok: true, text, raw: parsed, attempts: attempt };
   }
 }

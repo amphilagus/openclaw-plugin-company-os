@@ -66,7 +66,7 @@ describe("OpenClaw CLI agent invoker", () => {
       execFile: async () => ({ stdout: JSON.stringify({ status: "ok", payloads: [] }), stderr: "" }),
     });
     await expect(empty.invoke({ agentId: "engineer", prompt: "x", timeoutSeconds: 60 }))
-      .resolves.toMatchObject({ ok: false, code: "empty_reply" });
+      .resolves.toMatchObject({ ok: false, code: "empty_reply", completed: true });
 
     const exited = new OpenClawCliAgentInvoker({
       execFile: async () => { throw Object.assign(new Error("exit 2"), { code: 2, stderr: "agent command failed" }); },

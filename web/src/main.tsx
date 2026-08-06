@@ -5,5 +5,8 @@ import App from "./App";
 import "./styles.css";
 import "./boss-participation.css";
 import "./meeting-dispatch.css";
+import "./meeting-closeout.css";
+import "./task-reminder.css";
+import "./task-checkin.css";
 
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);

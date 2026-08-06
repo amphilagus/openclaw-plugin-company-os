@@ -21,8 +21,33 @@ export type MeetingEmailNotification = {
   startedAt: string | null;
 };
 
+export type TaskCheckinEmailItem = {
+  taskId: string;
+  title: string;
+  assigneeId: string;
+  assigneeName: string;
+  status: string;
+  submittedAt: string | null;
+  lastActivityAt: string;
+  blocked: boolean;
+  stale: boolean;
+  blockedDescendants: number;
+  staleDescendants: number;
+};
+
+export type TaskCheckinEmailNotification = {
+  id: string;
+  kind: "task_checkin";
+  runId: string;
+  scheduledAt: string;
+  reviews: TaskCheckinEmailItem[];
+  anomalies: TaskCheckinEmailItem[];
+};
+
+export type BossEmailNotification = MeetingEmailNotification | TaskCheckinEmailNotification;
+
 export type MeetingEmailSender = {
-  send(notification: MeetingEmailNotification): Promise<void>;
+  send(notification: BossEmailNotification): Promise<void>;
 };
 
 type SmtpSettings = {
@@ -50,7 +75,7 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
     this.notificationConfig = config;
   }
 
-  async send(notification: MeetingEmailNotification) {
+  async send(notification: BossEmailNotification) {
     if (!this.notificationConfig.enabled) return;
     const settings = this.settings ??= loadSmtpSettings(this.notificationConfig);
     const transporter = this.transporter ??= nodemailer.createTransport({
@@ -63,6 +88,15 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
       greetingTimeout: 10_000,
       socketTimeout: 15_000,
     });
+    if (notification.kind === "task_checkin") {
+      await transporter.sendMail({
+        from: settings.from,
+        to: settings.recipient,
+        subject: `[Company OS] 任务整点巡检：待验收 ${notification.reviews.length} · 异常 ${notification.anomalies.length}`,
+        text: buildTaskCheckinEmailText(notification),
+      });
+      return;
+    }
     const entered = notification.kind === "room_entered";
     const eventTime = entered ? notification.startedAt ?? notification.createdAt : notification.createdAt;
     await transporter.sendMail({
@@ -89,6 +123,45 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
       ].join("\n"),
     });
   }
+}
+
+export function buildTaskCheckinEmailText(notification: TaskCheckinEmailNotification) {
+  const lines = [
+    "Company OS 已完成本时段任务巡检。以下事项需要 Boss 处理。",
+    "",
+    `巡检时间：${formatShanghaiTime(notification.scheduledAt)}`,
+  ];
+  if (notification.reviews.length > 0) {
+    lines.push("", `待验收根任务（${notification.reviews.length}）：`);
+    notification.reviews.forEach((item, index) => {
+      lines.push(
+        `${index + 1}. ${item.title}`,
+        `   任务 ID：${item.taskId}`,
+        `   负责人：${item.assigneeName} (${item.assigneeId})`,
+        `   提交时间：${formatShanghaiTime(item.submittedAt ?? item.lastActivityAt)}`,
+      );
+    });
+  }
+  if (notification.anomalies.length > 0) {
+    lines.push("", `异常根任务（${notification.anomalies.length}）：`);
+    notification.anomalies.forEach((item, index) => {
+      const risks = [
+        item.blocked ? "根任务阻塞" : null,
+        item.stale ? "根任务停滞" : null,
+        item.blockedDescendants ? `阻塞后代 ${item.blockedDescendants}` : null,
+        item.staleDescendants ? `停滞后代 ${item.staleDescendants}` : null,
+      ].filter(Boolean).join("、");
+      lines.push(
+        `${index + 1}. ${item.title}`,
+        `   任务 ID：${item.taskId}`,
+        `   负责人：${item.assigneeName} (${item.assigneeId})`,
+        `   异常：${risks}`,
+        `   最后活动：${formatShanghaiTime(item.lastActivityAt)}`,
+      );
+    });
+  }
+  lines.push("", "请打开 OpenClaw 的“公司 → 任务”页面完成验收或处理异常。");
+  return lines.join("\n");
 }
 
 export function loadSmtpSettings(config: ResolvedCompanyOsConfig["bossEmailNotifications"]): SmtpSettings {
