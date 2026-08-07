@@ -28,4 +28,25 @@ describe("Boss task correction API", () => {
     expect(canceled.status).toBe(200);
     expect(service.reviewTaskCancellationRequest).toHaveBeenCalledWith("task-1", "request-1", "accept", "批准");
   });
+
+  it("routes per-agent countdown overrides and restoration through the service", async () => {
+    const setTaskPromptInterval = vi.fn((_memberId: string, intervalMinutes: number | null) => ({ intervalMinutes }));
+    const service = { store: {}, setTaskPromptInterval } as any;
+
+    const overridden = await executeBossApi(service, {
+      method: "PUT",
+      path: "/task-prompt-settings/cto",
+      body: { intervalMinutes: 15 },
+    });
+    const restored = await executeBossApi(service, {
+      method: "PUT",
+      path: "/task-prompt-settings/cto",
+      body: { intervalMinutes: null },
+    });
+
+    expect(overridden).toEqual({ status: 200, data: { intervalMinutes: 15 } });
+    expect(restored).toEqual({ status: 200, data: { intervalMinutes: null } });
+    expect(setTaskPromptInterval).toHaveBeenNthCalledWith(1, "cto", 15);
+    expect(setTaskPromptInterval).toHaveBeenNthCalledWith(2, "cto", null);
+  });
 });

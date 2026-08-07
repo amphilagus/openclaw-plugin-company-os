@@ -28,13 +28,15 @@ plugins: {
 ## 日常操作
 
 - Boss 在任务页创建根任务；一级员工从 `company_inbox` 看到派发。
-- 管理者在会外用 `company_task_create` 拆分，或申请 `task` 会议原子生成子任务。
+- 管理者在会外用 `company_task_create({ parentId, stages })` 原子创建分阶段任务流，或申请 `task` 会议用同样的阶段结构生成任务；阶段内并行，前一阶段全部必需任务验收关闭后才激活下一阶段。
 - 负责人持续调用 `company_task_progress`，避免 72 小时后出现 stale 告警。
 - Boss 可在活动任务详情点击「催促负责人」，主动唤醒负责人 main session 核对任务并推进实际状态；重复点击会在发送完成前自动去重。
-- 叶子负责人用 `company_task_submit` 提交摘要和 proof/artifact；非 Boss 派发者必须先 `company_task_read` 当前 submission，再用带结构化 `reviewReport` 的 `company_task_review` 验收或驳回。一级员工提交根任务时会立即给 Boss 排队一封持久化待验收邮件；子任务提交进入派发者的回转池。
+- 叶子负责人先把当前成果推送到远端并读取分支 tip，再用 `company_task_submit` 提交摘要、proof/artifact 及必填的 `gitLocation.remoteUrl/branch/commit`；非 Boss 派发者必须先 `company_task_read` 当前 submission，再对冻结 commit 用带结构化 `reviewReport` 的 `company_task_review` 验收或驳回。一级员工提交根任务时会立即给 Boss 排队一封持久化待验收邮件；子任务提交进入派发者的回转池。
+- 不要让负责人在提交前等待验收人介入。Boss/派发者亲测、扫码、真机体验和业务人工确认属于 `review` 阶段：负责人完成本人交付、自测、运行环境和操作说明后直接提交，并在摘要中标明待验收检查；只有负责人自己的交付无法推进时才能报告 blocked。
 - Agent 读取普通公告必须调用 `company_notice_read` 才会产生 read mark；读取 inbox 或收到半点提醒不会自动标记。会议完成时产生的 `meeting_report` 是例外：主持人与全部 worker/advisor 因已经接收终局同步而由系统原子写入 read mark。
 - 后续可由架构师把 `company_inbox` 加入 Agent heartbeat；普通任务派发不会主动唤醒 Agent，公告发布后统一在北京时间半点汇总提醒，Boss 任务催办则立即进入持久队列。
 - 需要 Boss 直接参加的会议在 `company_meeting_request` 中设置 `bossParticipates: true`。Boss 会收到创建和进入会议室两封邮件，并在会议室页面负责开始、会前拒绝和最终结束审批。
+- 会议发言必须结论先行并聚焦当前要求：默认“结论 + 最多 3 条关键依据 + 下一步/风险”，300 字以内，不复述背景或他人发言。主持人点名一次只问一个明确问题，每轮只收敛共识、分歧和下一动作，结论及责任人明确后及时结束。
 - 未邀请 Boss 的会议提交结束申请后默认倒计时 60 秒自动完成；这段时间会议仍占用唯一会议室。
 - 会议完成、取消或超时后先进入 WebUI 的“散会同步中”。主持人和全部参会 Agent 收到各自水位之后的最终时间线并确认送达后，会议才进入历史并让出下一场；Boss 不接收 Agent 调度。
 
@@ -66,7 +68,7 @@ plugins: {
 3. 将备份恢复到配置的 `databasePath`。
 4. 启动 Gateway，检查 `openclaw plugins doctor` 和会议室状态。
 
-Schema 版本保存在 `schema_meta`，当前版本为 v13，迁移在服务启动时执行。v4–v12 保留成员 ID 规范化、会议回写/终局同步、即时任务通知、旧整点巡检历史、公告提醒、根任务验收邮件和每日治理。v13 新增 `task_prompt_pool_items`、`task_prompt_ticks`、`task_prompt_dispatches`、结构化验收、取消审批/事件、终态纠错及 Boss 任务事件邮件 outbox。旧巡检表只读保留且不会迁移旧轮转顺序；首次升级按活动任务真实发生时间建立 FIFO 池。不要手工修改任务状态、池序号、调度状态、水位、read mark 或任何 outbox 来绕过状态机。
+Schema 版本保存在 `schema_meta`，当前版本为 v15，迁移在服务启动时执行。v4–v12 保留成员 ID 规范化、会议回写/终局同步、即时任务通知、旧整点巡检历史、公告提醒、根任务验收邮件和每日治理。v13 新增回转提示池、结构化验收、取消审批/事件、终态纠错及 Boss 任务事件邮件 outbox。v14 为 submission 增加经过远端验证的 Git 定位。v15 新增任务流/阶段、会议阶段草案、根任务会议要求和个人倒计时周期；v14 历史直接子任务组成一个隐式阶段，历史 canceled 项获得完成豁免，旧全局 tick 只读保留。不要手工修改任务状态、阶段、池序号、个人调度、调度状态、水位、read mark 或任何 outbox 来绕过状态机。
 
 ## 常见故障
 
@@ -102,7 +104,7 @@ openclaw config get gateway.controlUi.embedSandbox
 
 ### 父任务无法提交 review
 
-检查所有直接子任务。只有 `closed` 和带原因的 `canceled` 算终态；`assigned`、`in_progress`、`review`、`blocked` 都会阻止父任务提交。
+检查当前任务流的所有必需阶段任务。新产生的 `canceled` 不算完成，必须恢复到取消前状态并继续；只有 v14 升级前已经取消的历史子任务带迁移豁免。`assigned`、`in_progress`、`review`、`blocked` 以及未恢复的必需 `canceled` 都会阻止父任务提交。
 
 ### 任务催办一直显示“正在通知”或“发送失败”
 
@@ -166,11 +168,15 @@ Boss 不属于 `agents.list`，头像走独立逻辑。默认读取 `~/.openclaw
 
 先确认任务是 `parentId=null`、`issuerId=boss` 的根任务，并已通过 `company_task_submit` 进入 `review`；普通子任务不会给 Boss 发邮件。检查 `task_review_email_notifications` 和任务审计中的 `task.review_email_queued`、`task.review_email_sent`、`task.review_email_failed`。邮件与任务提交在同一事务排队，以 submission ID 去重，失败由 30 秒扫描继续重试，最多五次；日志关键字为 `company-os sent Boss task review email`。SMTP 配置与会议邮件、Boss 巡检邮件共用 `bossEmailNotifications`。
 
+### `company_task_submit` 报 Git 远端验证失败
+
+先在任务实际仓库完成 `git push`，再用 `git ls-remote <remoteUrl> refs/heads/<branch>` 读取远端 tip；`branch` 不带 `refs/heads/` 前缀，`commit` 必须填写该 tip 的完整 40 位 SHA。只接受不内嵌账号密码的 HTTPS、SSH 或 `git@host:path` 远端。分支不存在、tip 已移动、认证失败、Git 不可用或 15 秒超时都会拒绝整个提交，任务应仍为 `in_progress`，且不会存在新的 submission 或验收邮件。不要把本地路径、短 SHA 或旧历史 commit 当作正式定位。
+
 ### 员工没有收到任务回转提示
 
-先在“公司 → 任务”的“任务回转提示池”面板确认功能已开启、下一时间点、员工队列长度和池首事项。默认窗口为北京时间 08:00–17:40，触发点为 `:00`、`:20`、`:40`；Gateway 离线期间不补建时间点。配置项是 `taskRollingPrompts.enabled/startHour/endHour`，间隔固定 20 分钟。旧 `taskHourlyCheckins` 不再创建运行。
+先在“公司 → 任务”的“任务回转提示池”面板确认功能已开启，并检查该员工的队列、池首、层级默认/覆盖间隔、剩余工作分钟和 `nextDueAt`。默认工作窗口为北京时间 `[08:00, 18:00)`；默认间隔是层级乘以 10 分钟，Boss 可在面板设置 1–600 分钟覆盖或恢复默认。旧 `taskRollingPrompts.intervalMinutes`、`taskHourlyCheckins` 和全局 `:00/:20/:40` tick 已废弃。
 
-检查 `task_prompt_pool_items`、`task_prompt_ticks`、`task_prompt_dispatches` 和 `entity_type=task_prompt_tick` 的审计。`skipped_busy` 表示时间点当下 main session 已被用户、即时通知或其他系统激活，或员工正作为主持人/参会者处于活动会议中，池首不会移动；`skipped_empty` 表示员工池为空；`failed` 且 `started=0` 表示没有确认启动、池首不动；`started=1` 表示已经轮转到队尾，本次提示不会重放。日志关键字为 `company-os rolling task prompt`。
+检查 `task_prompt_pool_items`、`task_prompt_schedules`、`task_prompt_cycles`、`task_prompt_cycle_dispatches` 和 `entity_type=task_prompt_cycle` 的审计。`skipped_busy` 表示到期时 main session 已被用户、即时通知或其他系统激活，或员工正作为主持人/参会者处于活动会议中，池首不动并重走完整间隔；`skipped_empty` 表示池为空且计时停止；`skipped_offline` 表示 Gateway 离线错过到期点；`failed` 且 `started=0` 表示没有确认启动、池首不动；`started=1` 表示已经轮转到队尾，本次提示不会重放。日志关键字为 `company-os rolling task prompt countdown`。
 
 如果池项内容与任务树不一致，重启 Gateway 会按真实状态删除过期项、补齐缺失项，同时保留仍有效项的原顺序。执行任务只有在没有活动直接子任务时才入池；blocked 子任务只进入派发者的 `blocked_review`，不再定时提醒负责人。即时验收/驳回、阻塞上下行、取消审批和纠错通知检查 `task_agent_dispatches`，它们与回转池是两套独立队列。
 

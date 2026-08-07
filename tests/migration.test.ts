@@ -7,9 +7,10 @@ import { describe, expect, it } from "vitest";
 
 import { CompanyOsStore } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
+import { VERIFIED_GIT } from "./test-git.js";
 
 describe("database migrations", () => {
-  it("upgrades a version 1 database through schema v13 with rolling task prompts and terminal correction state", () => {
+  it("upgrades a version 1 database through schema v15 with staged flows and personal prompt schedules", () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-"));
     const databasePath = path.join(directory, "company-os.sqlite");
     const database = new DatabaseSync(databasePath);
@@ -56,9 +57,11 @@ describe("database migrations", () => {
       const taskReviewEmails = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_review_email_notifications'").get();
       const dailyRuns = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'daily_agent_runs'").get();
       const dailyDispatches = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'daily_agent_dispatches'").get();
+      const taskFlows = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_flows'").get();
+      const taskPromptSchedules = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_prompt_schedules'").get();
       const dispatchColumns = store.db.prepare("PRAGMA table_info(meeting_agent_dispatches)").all() as Array<{ name: string }>;
 
-      expect(version.value).toBe("13");
+      expect(version.value).toBe("15");
       expect(meetingColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
         "boss_participates",
         "boss_started_at",
@@ -79,6 +82,8 @@ describe("database migrations", () => {
       expect(taskReviewEmails).toBeTruthy();
       expect(dailyRuns).toBeTruthy();
       expect(dailyDispatches).toBeTruthy();
+      expect(taskFlows).toBeTruthy();
+      expect(taskPromptSchedules).toBeTruthy();
       expect(dispatchColumns.map((column) => column.name)).toContain("wait_for_context_append_id");
     } finally {
       store.close();
@@ -118,7 +123,7 @@ describe("database migrations", () => {
         "context_from_sequence",
         "context_to_sequence",
       ]));
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
     } finally {
       store.close();
       rmSync(directory, { recursive: true, force: true });
@@ -144,7 +149,7 @@ describe("database migrations", () => {
 
     store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
       expect(store.meetingView(meeting.id).status).toBe("completed");
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM meeting_closeout_dispatches").get()).toMatchObject({ count: 0 });
     } finally {
@@ -195,7 +200,7 @@ describe("database migrations", () => {
 
     const store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
       expect(store.db.prepare("SELECT kind, prompt, status FROM task_agent_dispatches WHERE id = 'dispatch-old'").get())
         .toMatchObject({ kind: "boss_reminder", prompt: "legacy reminder", status: "succeeded" });
       expect(() => store.db.prepare(`
@@ -230,7 +235,7 @@ describe("database migrations", () => {
 
     store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
       expect(store.db.prepare("SELECT id, kind, status FROM task_agent_dispatches WHERE id = ?").get(reminder.id))
         .toMatchObject({ id: reminder.id, kind: "boss_reminder", status: "pending" });
       expect(store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_checkin_runs'").get()).toBeTruthy();
@@ -266,7 +271,7 @@ describe("database migrations", () => {
       config: resolveConfig(undefined),
     });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
       expect(store.listNotices("cto").find((notice) => notice.id === readNotice.id)?.readAt).toBeTruthy();
       expect(store.listNotices("cto").find((notice) => notice.id === unreadNotice.id)?.readAt).toBeNull();
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM notice_reminder_runs").get()).toMatchObject({ count: 0 });
@@ -293,7 +298,7 @@ describe("database migrations", () => {
       assigneeId: "main",
     });
     store.startTask("main", historical.id);
-    store.submitTask("main", historical.id, "历史提交", [{ type: "proof", label: "tests", command: "npm test" }]);
+    store.submitTask("main", historical.id, "历史提交", [{ type: "proof", label: "tests", command: "npm test" }], VERIFIED_GIT);
     store.db.exec(`
       DROP TABLE task_review_email_notifications;
       UPDATE schema_meta SET value = '10' WHERE key = 'schema_version';
@@ -302,7 +307,7 @@ describe("database migrations", () => {
 
     store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_review_email_notifications").get()).toMatchObject({ count: 0 });
       expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
@@ -324,7 +329,7 @@ describe("database migrations", () => {
 
     store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM daily_agent_runs").get()).toMatchObject({ count: 0 });
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM daily_agent_dispatches").get()).toMatchObject({ count: 0 });
       expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
@@ -359,11 +364,109 @@ describe("database migrations", () => {
 
     store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
       expect(store.db.prepare("SELECT id FROM task_checkin_runs WHERE id = ?").get(historicalRun.id)).toBeTruthy();
       expect((store.db.prepare(`
         SELECT task_id FROM task_prompt_pool_items WHERE member_id = 'main' ORDER BY queue_seq
       `).all() as Array<{ task_id: string }>).map((row) => row.task_id)).toEqual([older.id, newer.id]);
+      expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("upgrades v13 to v14 by invalidating Git-less pending submissions and preserving terminal history", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-v14-"));
+    const databasePath = path.join(directory, "company-os.sqlite");
+    let store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
+    const pendingTask = store.createRootTask({ title: "旧待验收任务", description: "pending", acceptanceCriteria: "done", assigneeId: "main" });
+    store.startTask("main", pendingTask.id);
+    store.submitTask("main", pendingTask.id, "旧格式待验收", [{ type: "proof", label: "tests", command: "npm test" }], VERIFIED_GIT);
+    const acceptedTask = store.createRootTask({ title: "旧已验收任务", description: "accepted", acceptanceCriteria: "done", assigneeId: "main" });
+    store.startTask("main", acceptedTask.id);
+    store.submitTask("main", acceptedTask.id, "旧格式已通过", [{ type: "proof", label: "tests", command: "npm test" }], VERIFIED_GIT);
+    store.reviewTask("boss", acceptedTask.id, "accept");
+    store.db.exec(`
+      ALTER TABLE task_submissions DROP COLUMN git_remote_url;
+      ALTER TABLE task_submissions DROP COLUMN git_branch;
+      ALTER TABLE task_submissions DROP COLUMN git_commit;
+      ALTER TABLE task_submissions DROP COLUMN git_verified_at;
+      UPDATE schema_meta SET value = '13' WHERE key = 'schema_version';
+    `);
+    store.close();
+
+    store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
+    try {
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
+      const pending = store.readTask("boss", pendingTask.id, false);
+      expect(pending.status).toBe("in_progress");
+      expect(pending.submissions[0]).toMatchObject({ status: "invalidated", gitLocation: null });
+      expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_review_email_notifications WHERE task_id = ?").get(pendingTask.id))
+        .toMatchObject({ count: 0 });
+      expect(store.db.prepare(`
+        SELECT kind, status FROM task_agent_dispatches WHERE task_id = ? AND kind = 'submission_git_required'
+      `).get(pendingTask.id)).toMatchObject({ kind: "submission_git_required", status: "pending" });
+      expect(store.taskPromptPoolSummary().queues.find((queue) => queue.memberId === "main")?.items)
+        .toEqual(expect.arrayContaining([expect.objectContaining({ taskId: pendingTask.id, kind: "execution" })]));
+
+      const accepted = store.readTask("boss", acceptedTask.id, false);
+      expect(accepted.status).toBe("closed");
+      expect(accepted.submissions[0]).toMatchObject({ status: "accepted", gitLocation: null });
+      expect(store.listAudit("task", pendingTask.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ action: "task.submission_invalidated_git_required" }),
+      ]));
+      expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("upgrades v14 to v15 by creating an implicit historical stage, exempting legacy canceled children, and starting personal schedules", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-v15-"));
+    const databasePath = path.join(directory, "company-os.sqlite");
+    let store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main", "cto"], config: resolveConfig(undefined) });
+    store.addMember("main", { agentId: "cto", name: "CTO", title: "首席技术官", managerId: "main" });
+    const root = store.createRootTask({ title: "历史根任务", description: "root", acceptanceCriteria: "done", assigneeId: "main" });
+    const active = store.createChildTask("main", { parentId: root.id, title: "历史活动子任务", description: "active", acceptanceCriteria: "done", assigneeId: "cto" });
+    const canceled = store.createChildTask("main", { parentId: root.id, title: "历史取消子任务", description: "canceled", acceptanceCriteria: "done", assigneeId: "cto" });
+    store.cancelTask("main", canceled.id, "v14 已取消范围");
+    store.db.exec(`
+      DROP TABLE task_prompt_cycle_dispatches;
+      DROP TABLE task_prompt_cycles;
+      DROP TABLE task_prompt_schedules;
+      DROP TABLE task_meeting_requirements;
+      DROP TABLE task_flow_stage_tasks;
+      DROP TABLE task_flow_stages;
+      DROP TABLE task_flows;
+      DROP TABLE meeting_task_drafts;
+      DROP TABLE meeting_task_draft_stages;
+      CREATE TABLE meeting_task_drafts (
+        id TEXT PRIMARY KEY,
+        meeting_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        acceptance_criteria TEXT NOT NULL,
+        assignee_id TEXT NOT NULL
+      );
+      UPDATE schema_meta SET value = '14' WHERE key = 'schema_version';
+    `);
+    store.close();
+
+    store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main", "cto"], config: resolveConfig(undefined) });
+    try {
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("15");
+      const detail = store.readTask("boss", root.id, false);
+      expect(detail.childFlow?.stages).toEqual([
+        expect.objectContaining({ name: "历史阶段", status: "active", requiredTaskCount: 1, taskIds: [active.id, canceled.id] }),
+      ]);
+      expect(store.db.prepare(`
+        SELECT completion_required FROM task_flow_stage_tasks WHERE task_id = ?
+      `).get(canceled.id)).toMatchObject({ completion_required: 0 });
+      expect(store.db.prepare("SELECT next_due_at FROM task_prompt_schedules WHERE member_id = 'cto'").get())
+        .toMatchObject({ next_due_at: expect.any(String) });
       expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       store.close();

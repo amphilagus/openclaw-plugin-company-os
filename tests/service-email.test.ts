@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { CompanyOsService } from "../src/service.js";
 import { resolveConfig } from "../src/types.js";
+import { GIT_INPUT, fakeGitRemoteVerifier } from "./test-git.js";
 
 describe("meeting email outbox", () => {
   it("delivers and acknowledges both direct-participation meeting notifications", async () => {
@@ -18,6 +19,7 @@ describe("meeting email outbox", () => {
       runtimeConfig: {},
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       meetingEmailSender: { send },
+      gitRemoteVerifier: fakeGitRemoteVerifier,
     });
     try {
       service.store.addMember("main", { agentId: "cto", name: "CTO", title: "首席技术官", managerId: "boss" });
@@ -49,6 +51,7 @@ describe("meeting email outbox", () => {
       runtimeConfig: {},
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       meetingEmailSender: { send },
+      gitRemoteVerifier: fakeGitRemoteVerifier,
     });
     try {
       service.store.addMember("main", { agentId: "cto", name: "CTO", title: "首席技术官", managerId: "boss" });
@@ -59,7 +62,7 @@ describe("meeting email outbox", () => {
         assigneeId: "cto",
       });
       service.store.startTask("cto", task.id);
-      service.submitTask("cto", task.id, "已经完成", [{ type: "proof", label: "tests", command: "npm test" }]);
+      await service.submitTask("cto", task.id, "已经完成", [{ type: "proof", label: "tests", command: "npm test" }], GIT_INPUT);
 
       await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
       expect(send).toHaveBeenCalledWith(expect.objectContaining({
@@ -77,6 +80,42 @@ describe("meeting email outbox", () => {
     }
   });
 
+  it("keeps the task and all outboxes unchanged when remote Git verification fails", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-task-git-reject-"));
+    const send = vi.fn(async () => undefined);
+    const service = new CompanyOsService({
+      databasePath: path.join(directory, "company-os.sqlite"),
+      allowedAgentIds: ["main", "cto"],
+      config: resolveConfig(undefined),
+      runtimeConfig: {},
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      meetingEmailSender: { send },
+      gitRemoteVerifier: { verify: async () => { throw new Error("Git commit does not match remote branch tip"); } },
+    });
+    try {
+      service.store.addMember("main", { agentId: "cto", name: "CTO", title: "首席技术官", managerId: "boss" });
+      const task = service.store.createRootTask({
+        title: "远端验证失败",
+        description: "不得产生部分写入",
+        acceptanceCriteria: "任务留在执行中",
+        assigneeId: "cto",
+      });
+      service.store.startTask("cto", task.id);
+
+      await expect(service.submitTask("cto", task.id, "不应保存", [{ type: "proof", label: "tests", command: "npm test" }], GIT_INPUT))
+        .rejects.toThrow(/does not match/);
+
+      expect(service.store.readTask("boss", task.id, false)).toMatchObject({ status: "in_progress", submissions: [] });
+      expect(service.store.pendingTaskReviewEmailNotifications()).toEqual([]);
+      expect(send).not.toHaveBeenCalled();
+      expect(service.store.taskPromptPoolSummary().queues.find((queue) => queue.memberId === "cto")?.head)
+        .toMatchObject({ taskId: task.id, kind: "execution" });
+    } finally {
+      await service.stop();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("retries a persisted root-task review email after Gateway restart", async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-task-review-email-recovery-"));
     const databasePath = path.join(directory, "company-os.sqlite");
@@ -88,6 +127,7 @@ describe("meeting email outbox", () => {
       runtimeConfig: {},
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       meetingEmailSender: { send: failedSend },
+      gitRemoteVerifier: fakeGitRemoteVerifier,
     });
     try {
       service.store.addMember("main", { agentId: "cto", name: "CTO", title: "首席技术官", managerId: "boss" });
@@ -98,7 +138,7 @@ describe("meeting email outbox", () => {
         assigneeId: "cto",
       });
       service.store.startTask("cto", task.id);
-      service.submitTask("cto", task.id, "等待 Boss 验收", [{ type: "proof", label: "tests", command: "npm test" }]);
+      await service.submitTask("cto", task.id, "等待 Boss 验收", [{ type: "proof", label: "tests", command: "npm test" }], GIT_INPUT);
       await waitFor(() => expect(service.store.db.prepare(`
         SELECT status, attempts FROM task_review_email_notifications WHERE task_id = ?
       `).get(task.id)).toMatchObject({ status: "failed", attempts: 1 }));

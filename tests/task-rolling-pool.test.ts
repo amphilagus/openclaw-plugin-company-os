@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanyOsService } from "../src/service.js";
 import { CompanyOsStore, nextTaskPromptTickAt } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
+import { VERIFIED_GIT } from "./test-git.js";
 
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
 const PASS_REPORT = {
@@ -57,8 +58,16 @@ describe("persistent rolling task prompt pool", () => {
     expect(poolRows()).toEqual([expect.objectContaining({ member_id: "eng-a", task_id: child.id, kind: "execution" })]);
 
     store.startTask("eng-a", child.id);
-    store.submitTask("eng-a", child.id, "实现完成", PROOF);
+    store.submitTask("eng-a", child.id, "实现完成", PROOF, VERIFIED_GIT);
     expect(poolRows()).toEqual([expect.objectContaining({ member_id: "cto", task_id: child.id, kind: "review" })]);
+    const reviewTick = store.queueTaskPromptTick("2030-01-01T02:00:00.000Z");
+    const reviewPrompt = store.createTaskPromptDispatch(reviewTick.id, "cto", false);
+    expect(reviewPrompt.prompt).toContain(VERIFIED_GIT.remoteUrl);
+    expect(reviewPrompt.prompt).toContain(VERIFIED_GIT.branch);
+    expect(reviewPrompt.prompt).toContain(VERIFIED_GIT.commit);
+    expect(reviewPrompt.prompt).toContain(VERIFIED_GIT.verifiedAt);
+    expect(reviewPrompt.prompt).toContain("应由你在当前验收阶段执行");
+    store.finishTaskPromptDispatch(reviewPrompt.id, { status: "canceled", error: "test inspection only" });
     store.readTask("cto", child.id);
     store.reviewTask("cto", child.id, "reject", "缺少边界测试", FAIL_REPORT);
     expect(poolRows()).toEqual([expect.objectContaining({ member_id: "eng-a", task_id: child.id, kind: "execution" })]);
@@ -86,6 +95,8 @@ describe("persistent rolling task prompt pool", () => {
     const tick = store.queueTaskPromptTick("2030-01-01T02:20:00.000Z");
     const dispatch = store.createTaskPromptDispatch(tick.id, "cto", false);
     expect(dispatch).toMatchObject({ claimed: true, taskId: tasks[0]!.id, kind: "execution", started: false });
+    expect(dispatch.prompt).toContain("Boss 只在任务进入 review 后介入验收");
+    expect(dispatch.prompt).toContain("待验收阶段检查");
     expect(poolRows("cto").map((row) => row.task_id)).toEqual(tasks.map((task) => task.id));
 
     store.markTaskPromptDispatchStarted(dispatch.id);
@@ -96,14 +107,13 @@ describe("persistent rolling task prompt pool", () => {
     expect(same).toMatchObject({ claimed: false, id: dispatch.id, status: "failed" });
   });
 
-  it("calculates only future :00/:20/:40 Beijing ticks", () => {
+  it("keeps the old :00/:20/:40 helper for read-only history while removing the global interval from active config", () => {
     expect(nextTaskPromptTickAt(Date.parse("2026-08-06T02:19:00.000Z"), 8, 17)).toBe("2026-08-06T02:20:00.000Z");
     expect(nextTaskPromptTickAt(Date.parse("2026-08-06T09:40:00.000Z"), 8, 17)).toBe("2026-08-07T00:00:00.000Z");
     expect(resolveConfig(undefined).taskRollingPrompts).toEqual({
       enabled: true,
       startHour: 8,
       endHour: 17,
-      intervalMinutes: 20,
       timeZone: "Asia/Shanghai",
     });
   });
@@ -183,7 +193,7 @@ describe("rolling prompt session arbitration", () => {
       assigneeId: "main",
     });
     service.store.startTask("main", task.id);
-    service.store.submitTask("main", task.id, "提交验收", PROOF);
+    service.store.submitTask("main", task.id, "提交验收", PROOF, VERIFIED_GIT);
     try {
       service.reviewTask("boss", task.id, "reject", "需要整改");
       await waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));

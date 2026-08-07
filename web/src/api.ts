@@ -29,6 +29,10 @@ export async function post<T = unknown>(path: string, body: unknown) {
   return request<T>(path, { method: "POST", body });
 }
 
+export async function put<T = unknown>(path: string, body: unknown) {
+  return request<T>(path, { method: "PUT", body });
+}
+
 export async function deleteNotice<T = unknown>(path: string) {
   return request<T>(path, { method: "DELETE" });
 }
@@ -87,7 +91,7 @@ async function stream(signal: AbortSignal, onChange: () => void, onConnection: (
   }
 }
 
-type RequestOptions = { method?: "GET" | "POST" | "DELETE"; body?: unknown };
+type RequestOptions = { method?: "GET" | "POST" | "PUT" | "DELETE"; body?: unknown };
 
 async function request<T>(path: string, options: RequestOptions = {}) {
   const method = options.method ?? "GET";

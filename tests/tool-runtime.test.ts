@@ -8,6 +8,7 @@ import entry from "../src/index.js";
 import { CompanyOsStore } from "../src/store.js";
 import { createCompanyOsTools } from "../src/tools.js";
 import { resolveConfig } from "../src/types.js";
+import { GIT_INPUT } from "./test-git.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -80,7 +81,7 @@ describe("agent tool runtime lifecycle", () => {
     const delegate = tools.get("company_meeting_delegate")!(meetingSession);
     expect(Object.keys((delegate.parameters as any).properties).sort()).toEqual(["prompt", "speakerId"]);
     const drafts = tools.get("company_meeting_set_task_drafts")!(meetingSession);
-    expect(Object.keys((drafts.parameters as any).properties)).toEqual(["drafts"]);
+    expect(Object.keys((drafts.parameters as any).properties)).toEqual(["stages"]);
     const end = tools.get("company_meeting_end")!(meetingSession);
     expect(Object.keys((end.parameters as any).properties).sort()).toEqual(["publishNotice", "summary"]);
     const speakResult = await speak.execute("call-3", { body: "主持人已经回应" });
@@ -141,9 +142,10 @@ describe("agent tool runtime lifecycle", () => {
       taskId: "task-root",
       summary: "根任务完成",
       evidence,
+      gitLocation: GIT_INPUT,
     });
 
-    expect(submitTask).toHaveBeenCalledWith("cto", "task-root", "根任务完成", evidence);
+    expect(submitTask).toHaveBeenCalledWith("cto", "task-root", "根任务完成", evidence, GIT_INPUT);
     expect(JSON.stringify(result)).toContain('"status":"review"');
   });
 

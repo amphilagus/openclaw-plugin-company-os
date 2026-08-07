@@ -32,7 +32,7 @@ const meeting: MeetingDetail = {
   canceledReason: null,
   participants: [],
   messages: [],
-  taskDrafts: [],
+  taskDraftStages: [],
   currentTurn: null,
 };
 

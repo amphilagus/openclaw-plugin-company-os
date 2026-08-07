@@ -40,6 +40,15 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 201, data: store.createRootTask(body as any) };
   }
 
+  const taskPromptSetting = route.match(/^\/task-prompt-settings\/([^/]+)$/);
+  if (method === "PUT" && taskPromptSetting) {
+    const intervalMinutes = body.intervalMinutes === null ? null : Number(body.intervalMinutes);
+    return {
+      status: 200,
+      data: service.setTaskPromptInterval(decodeURIComponent(taskPromptSetting[1]!), intervalMinutes),
+    };
+  }
+
   if (method === "POST" && route === "/notices") {
     return { status: 201, data: store.publishNotice("boss", body as any) };
   }

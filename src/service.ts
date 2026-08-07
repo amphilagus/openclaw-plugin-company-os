@@ -3,14 +3,16 @@ import { resolveActiveEmbeddedRunSessionId } from "openclaw/plugin-sdk/agent-har
 
 import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
+import { GitCliRemoteVerifier, type GitRemoteVerifier } from "./git-verifier.js";
 import { resolveAgentVisualIdentity, resolveStandaloneAvatar, type AgentVisualIdentity } from "./identity.js";
 import { OpenClawSessionContextAppender, type SessionContextAppender } from "./session-context.js";
-import { CompanyOsStore, nextDailyAgentRunAt, nextNoticeReminderRunAt, nextTaskCheckinRunAt, nextTaskPromptTickAt } from "./store.js";
+import { CompanyOsStore, nextDailyAgentRunAt, nextNoticeReminderRunAt, nextTaskCheckinRunAt } from "./store.js";
 import type {
   Actor,
   DailyAgentDispatch,
   DailyAgentKind,
   EvidenceInput,
+  GitLocationInput,
   MeetingAdvance,
   MeetingToolSessionIdentity,
   MeetingTurnDelivery,
@@ -27,6 +29,7 @@ export class CompanyOsService {
   private readonly runtimeConfig: unknown;
   private readonly meetingEmailSender: MeetingEmailSender;
   private readonly agentInvoker: AgentInvoker;
+  private readonly gitRemoteVerifier: GitRemoteVerifier;
   private readonly sessionContextAppender: SessionContextAppender;
   private readonly isSessionActive: (sessionKey: string) => boolean;
   private readonly identityCache = new Map<string, AgentVisualIdentity>();
@@ -58,6 +61,7 @@ export class CompanyOsService {
   private readonly activeTurnDeliveries = new Set<Promise<MeetingTurnDelivery>>();
   private readonly lifecycleAbort = new AbortController();
   private stopping = false;
+  private started = false;
 
   constructor(options: {
     databasePath: string;
@@ -67,6 +71,7 @@ export class CompanyOsService {
     logger: PluginLogger;
     meetingEmailSender?: MeetingEmailSender;
     agentInvoker?: AgentInvoker;
+    gitRemoteVerifier?: GitRemoteVerifier;
     sessionContextAppender?: SessionContextAppender;
     isSessionActive?: (sessionKey: string) => boolean;
   }) {
@@ -75,6 +80,7 @@ export class CompanyOsService {
     this.logger = options.logger;
     this.meetingEmailSender = options.meetingEmailSender ?? new SmtpMeetingEmailSender(options.config.bossEmailNotifications);
     this.agentInvoker = options.agentInvoker ?? new OpenClawCliAgentInvoker();
+    this.gitRemoteVerifier = options.gitRemoteVerifier ?? new GitCliRemoteVerifier();
     this.sessionContextAppender = options.sessionContextAppender ?? new OpenClawSessionContextAppender(options.runtimeConfig);
     this.isSessionActive = options.isSessionActive ?? ((sessionKey) => Boolean(resolveActiveEmbeddedRunSessionId(sessionKey)));
     this.store = new CompanyOsStore({
@@ -91,6 +97,8 @@ export class CompanyOsService {
     this.store.recoverMeetingCloseoutDispatches();
     this.store.recoverTaskDispatches();
     this.store.recoverTaskPromptDispatches();
+    this.store.recoverTaskPromptCycleDispatches();
+    this.store.recoverOverdueTaskPromptSchedules();
     this.store.recoverNoticeReminderDispatches();
     this.store.recoverDailyAgentDispatches();
     this.store.recoverSessionContextAppends();
@@ -102,7 +110,8 @@ export class CompanyOsService {
     this.kickTaskDispatches();
     this.kickNoticeReminderDispatches();
     this.kickDailyAgentDispatches();
-    this.scheduleNextTaskPromptTick();
+    this.started = true;
+    this.scheduleNextTaskPromptCountdown();
     this.scheduleNextNoticeReminderRun();
     this.scheduleNextDailySelfImprovementRun();
     this.scheduleNextDailyPersonaAuditRun();
@@ -115,6 +124,7 @@ export class CompanyOsService {
 
   async stop() {
     this.stopping = true;
+    this.started = false;
     if (this.scanTimer) clearInterval(this.scanTimer);
     if (this.automaticEndTimer) clearTimeout(this.automaticEndTimer);
     if (this.contextAppendIdleTimer) clearTimeout(this.contextAppendIdleTimer);
@@ -228,8 +238,9 @@ export class CompanyOsService {
     return task;
   }
 
-  submitTask(actorId: string, taskId: string, summary: string, evidence: EvidenceInput[]) {
-    const task = this.store.submitTask(actorId, taskId, summary, evidence);
+  async submitTask(actorId: string, taskId: string, summary: string, evidence: EvidenceInput[], gitLocation: GitLocationInput) {
+    const verifiedGitLocation = await this.gitRemoteVerifier.verify(gitLocation);
+    const task = this.store.submitTask(actorId, taskId, summary, evidence, verifiedGitLocation);
     void this.flushMeetingEmails().catch((error) => {
       this.logger.error(`company-os task review email flush failed after submission ${taskId}: ${formatError(error)}`);
     });
@@ -493,6 +504,15 @@ export class CompanyOsService {
         this.logger.warn(`company-os event listener failed: ${formatError(error)}`);
       }
     }
+    if (this.started && (event.type.startsWith("task.prompt_pool_") || event.type === "task.prompt_interval_updated")) {
+      queueMicrotask(() => this.scheduleNextTaskPromptCountdown());
+    }
+  }
+
+  setTaskPromptInterval(memberId: string, intervalMinutes: number | null) {
+    const result = this.store.setTaskPromptInterval(memberId, intervalMinutes);
+    this.scheduleNextTaskPromptCountdown();
+    return result;
   }
 
   private async recover() {
@@ -751,25 +771,103 @@ export class CompanyOsService {
     }
   }
 
-  private scheduleNextTaskPromptTick() {
+  private scheduleNextTaskPromptCountdown() {
     if (this.taskPromptTickTimer) clearTimeout(this.taskPromptTickTimer);
     this.taskPromptTickTimer = undefined;
     if (this.stopping || !this.config.taskRollingPrompts.enabled) return;
-    const scheduledAt = nextTaskPromptTickAt(
-      Date.now(),
-      this.config.taskRollingPrompts.startHour,
-      this.config.taskRollingPrompts.endHour,
-    );
+    const scheduledAt = this.store.nextTaskPromptDueAt();
+    if (!scheduledAt) return;
     const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
     this.taskPromptTickTimer = setTimeout(() => {
       this.taskPromptTickTimer = undefined;
-      this.scheduleNextTaskPromptTick();
-      void this.dispatchTaskPromptTick(scheduledAt).catch((error) => {
-        this.logger.error(`company-os rolling task prompt tick ${scheduledAt} failed: ${formatError(error)}`);
-      });
+      void this.dispatchDueTaskPrompts().catch((error) => {
+        this.logger.error(`company-os rolling task prompt countdown ${scheduledAt} failed: ${formatError(error)}`);
+      }).finally(() => this.scheduleNextTaskPromptCountdown());
     }, delay);
     this.taskPromptTickTimer.unref();
-    this.logger.info(`company-os scheduled rolling task prompt tick at ${scheduledAt} (Asia/Shanghai)`);
+    this.logger.info(`company-os scheduled next personal task prompt countdown at ${scheduledAt} (Asia/Shanghai)`);
+  }
+
+  private async dispatchDueTaskPrompts(now = Date.now()) {
+    const deliveries = this.store.dueTaskPromptMembers(now).map((memberId) => {
+      let delivery!: Promise<void>;
+      delivery = this.deliverTaskPromptCountdownMember(memberId, now)
+        .catch((error) => this.logger.error(`company-os rolling task prompt failed for ${memberId}: ${formatError(error)}`))
+        .finally(() => this.activeTaskPromptDeliveries.delete(delivery));
+      this.activeTaskPromptDeliveries.add(delivery);
+      return delivery;
+    });
+    await Promise.allSettled(deliveries);
+  }
+
+  private async deliverTaskPromptCountdownMember(memberId: string, now: number) {
+    const member = this.store.listMembers(true).find((candidate) => candidate.id === memberId);
+    if (!member?.agentId) return;
+    const activeMeeting = this.store.activeMeetingForMember(memberId);
+    if (activeMeeting) {
+      const reason = `member is participating in active meeting ${activeMeeting.id}: ${activeMeeting.title}`;
+      this.store.createTaskPromptCycleDispatch(memberId, true, reason, now);
+      this.logger.info(`company-os skipped rolling task prompt for ${memberId}: ${reason}`);
+      return;
+    }
+    const reserved = await this.reserveMainSession(member.agentId, "skip");
+    if (!reserved) {
+      this.store.createTaskPromptCycleDispatch(memberId, true, "main session is busy", now);
+      this.logger.info(`company-os skipped rolling task prompt for ${memberId}: main session is busy`);
+      return;
+    }
+    let dispatch;
+    try {
+      dispatch = this.store.createTaskPromptCycleDispatch(memberId, false, undefined, now);
+      if (!dispatch.claimed || dispatch.status !== "running" || !dispatch.prompt) return;
+      let invocationSettled = false;
+      const invocation = this.agentInvoker.invoke({
+        agentId: dispatch.targetAgentId,
+        prompt: dispatch.prompt,
+        timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+        maxInFlightRetries: 0,
+        signal: this.lifecycleAbort.signal,
+      });
+      const startObserver = this.observeTaskPromptInvocationStart(
+        dispatch.id,
+        dispatch.targetAgentId,
+        () => invocationSettled,
+      );
+      const result = await invocation.finally(() => { invocationSettled = true; });
+      await startObserver;
+      const started = invocationConfirmedStarted(result);
+      if (started) this.store.markTaskPromptCycleDispatchStarted(dispatch.id);
+      if (result.ok || (!result.ok && result.code === "empty_reply" && result.completed)) {
+        this.store.finishTaskPromptCycleDispatch(dispatch.id, { status: "succeeded" });
+      } else if (!started && result.code === "in_flight") {
+        this.store.finishTaskPromptCycleDispatch(dispatch.id, { status: "skipped_busy", error: result.error });
+      } else {
+        this.store.finishTaskPromptCycleDispatch(dispatch.id, { status: "failed", error: result.error });
+      }
+    } catch (error) {
+      if (dispatch?.status === "running") {
+        this.store.finishTaskPromptCycleDispatch(dispatch.id, { status: "failed", error: formatError(error) });
+      }
+      throw error;
+    } finally {
+      this.releaseMainSession(member.agentId);
+    }
+  }
+
+  private async observeTaskPromptInvocationStart(dispatchId: string, agentId: string, settled: () => boolean) {
+    await shortWait(150, this.lifecycleAbort.signal);
+    while (!settled() && !this.lifecycleAbort.signal.aborted) {
+      try {
+        if (this.isSessionActive(this.mainSessionKey(agentId))) {
+          this.store.markTaskPromptCycleDispatchStarted(dispatchId);
+          return;
+        }
+      } catch (error) {
+        this.logger.warn(`company-os could not confirm task prompt start for agent:${agentId}:main: ${formatError(error)}`);
+        return;
+      }
+      await shortWait(50, this.lifecycleAbort.signal);
+    }
   }
 
   private async deliverTaskPromptTickMember(tickId: string, memberId: string) {
@@ -949,12 +1047,11 @@ export class CompanyOsService {
       if (!dispatch) return;
       try {
         if (!dispatch.prompt) throw new Error("notice reminder dispatch prompt is missing");
-        const result = await this.agentInvoker.invoke({
+        const result = await this.invokeMainSession({
           agentId: dispatch.targetAgentId,
           prompt: dispatch.prompt,
           timeoutSeconds: this.config.participantTurnTimeoutSeconds,
           maxInFlightRetries: 0,
-          signal: this.lifecycleAbort.signal,
         });
         if (result.ok || (result.code === "empty_reply" && result.completed) || this.store.noticeReminderDispatchHasReadProgress(dispatch.id)) {
           this.store.completeNoticeReminderDispatch(dispatch.id);

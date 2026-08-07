@@ -23,6 +23,7 @@ export const COMPANY_TOOL_NAMES = [
   "company_task_list",
   "company_task_read",
   "company_task_create",
+  "company_task_flow_update",
   "company_task_start",
   "company_task_progress",
   "company_task_revise",
@@ -54,6 +55,11 @@ const Participant = Type.Object({
   role: Type.Union([Type.Literal("worker"), Type.Literal("advisor")]),
 }, { additionalProperties: false });
 const TaskDraft = Type.Object({ ...TaskFields, assigneeId: Id }, { additionalProperties: false });
+const TaskFlowStage = Type.Object({
+  name: Id,
+  objective: Id,
+  tasks: Type.Array(TaskDraft, { minItems: 1 }),
+}, { additionalProperties: false });
 const Evidence = Type.Object({
   type: Type.Union([Type.Literal("proof"), Type.Literal("artifact")]),
   label: Type.String({ minLength: 1 }),
@@ -61,6 +67,11 @@ const Evidence = Type.Object({
   command: Type.Optional(Type.String({ minLength: 1 })),
   url: Type.Optional(Type.String({ minLength: 1 })),
   path: Type.Optional(Type.String({ minLength: 1 })),
+}, { additionalProperties: false });
+const GitLocation = Type.Object({
+  remoteUrl: Type.String({ minLength: 1 }),
+  branch: Type.String({ minLength: 1 }),
+  commit: Type.String({ pattern: "^[0-9A-Fa-f]{40}$" }),
 }, { additionalProperties: false });
 const ReviewReport = Type.Object({
   checks: Type.Array(Type.Object({
@@ -133,7 +144,7 @@ export function createCompanyOsTools(options: {
         store.acknowledgeHostContext(meetingId, actor);
         return meeting;
       }),
-    terminatingTool("company_meeting_speak", "会议发言", "在当前活动会议中提交发言；系统自动识别会议和当前轮次。", Type.Object({
+    terminatingTool("company_meeting_speak", "会议发言", "在当前活动会议中提交结论先行、聚焦当前问题的简练发言；默认使用结论、最多三条关键依据和明确下一步，系统自动识别会议和当前轮次。", Type.Object({
       body: Id,
     }, { additionalProperties: false }), async (p, toolCallId) => {
       const actor = actorId();
@@ -144,7 +155,7 @@ export function createCompanyOsTools(options: {
       service.scheduleSessionContextAppendAfterTurn(sessionIdentity);
       return { accepted: true, receipt: "成功，本轮会话结束" };
     }),
-    terminatingTool("company_meeting_delegate", "会议点名", "在当前活动会议中点名下一位发言者；系统自动识别会议。", Type.Object({
+    terminatingTool("company_meeting_delegate", "会议点名", "在当前活动会议中点名下一位发言者；一次只提出一个需要决策或核验的明确问题，避免宽泛发挥，系统自动识别会议。", Type.Object({
       speakerId: Id, prompt: Id,
     }, { additionalProperties: false }), async (p, toolCallId) => {
       const actor = actorId();
@@ -159,12 +170,12 @@ export function createCompanyOsTools(options: {
       service.scheduleSessionContextAppendAfterTurn(sessionIdentity);
       return { accepted: true, receipt: "成功，本轮会话结束" };
     }),
-    tool("company_meeting_set_task_drafts", "会议任务草案", "为当前任务会议整体替换子任务草案；每个 worker 结束前必须至少得到一项。", Type.Object({
-      drafts: Type.Array(TaskDraft),
+    tool("company_meeting_set_task_drafts", "会议任务流草案", "为当前任务会议整体替换分阶段任务流草案；阶段内并行、阶段间顺序执行，每个 worker 结束前必须至少得到一项。", Type.Object({
+      stages: Type.Array(TaskFlowStage, { minItems: 1 }),
     }, { additionalProperties: false }), async (p) => {
       const actor = actorId();
       const meetingId = store.activeMeetingId(actor);
-      const meeting = store.setMeetingTaskDrafts(actor, meetingId, p.drafts);
+      const meeting = store.setMeetingTaskDrafts(actor, meetingId, p.stages);
       store.acknowledgeHostContext(meetingId, actor);
       return meeting;
     }),
@@ -189,11 +200,19 @@ export function createCompanyOsTools(options: {
 
     tool("company_task_list", "任务列表", "查看你的责任树中的多级任务、子任务计数和阻塞/停滞风险。", Empty,
       async () => store.listTasks(actorId())),
-    tool("company_task_read", "读取任务", "读取任务详情、版本、进度、proof 和审计，并确认已看到当前版本。", TaskId,
+    tool("company_task_read", "读取任务", "读取任务详情、版本、进度、proof、冻结的 Git 远端定位和审计，并确认已看到当前版本。", TaskId,
       async (p) => store.readTask(actorId(), p.taskId)),
-    tool("company_task_create", "创建子任务", "父任务负责人向自己的直属下属创建一个直接子任务；Agent 不能创建根任务。", Type.Object({
-      parentId: Id, assigneeId: Id, ...TaskFields,
-    }, { additionalProperties: false }), async (p) => store.createChildTask(actorId(), p as any)),
+    tool("company_task_create", "创建任务流", "父任务负责人向直属下属原子创建完整分阶段任务流；阶段内并行、阶段间顺序激活。", Type.Object({
+      parentId: Id,
+      stages: Type.Array(TaskFlowStage, { minItems: 1 }),
+    }, { additionalProperties: false }), async (p) => store.createTaskFlow(actorId(), p as any)),
+    tool("company_task_flow_update", "更新任务流", "按 revision 追加未来阶段，或原子替换所有从未激活的等待阶段；活动、冻结和完成阶段不可改结构。", Type.Object({
+      parentId: Id,
+      expectedRevision: Type.Integer({ minimum: 1 }),
+      operation: Type.Union([Type.Literal("append"), Type.Literal("replace_waiting")]),
+      stages: Type.Array(TaskFlowStage),
+      reason: Reason,
+    }, { additionalProperties: false }), async (p) => store.updateTaskFlow(actorId(), p as any)),
     tool("company_task_start", "开始任务", "负责人将 assigned 任务转为 in_progress。", TaskId,
       async (p) => store.startTask(actorId(), p.taskId)),
     tool("company_task_progress", "任务进度", "负责人记录进度并刷新任务活动时间。", Type.Object({
@@ -212,9 +231,12 @@ export function createCompanyOsTools(options: {
     tool("company_task_unblock", "解除阻塞", "负责人或派发者解除阻塞并回到 in_progress。", Type.Object({
       taskId: Id, reason: Reason,
     }, { additionalProperties: false }), async (p) => service.unblockTask(actorId(), p.taskId, p.reason)),
-    tool("company_task_submit", "提交验收", "负责人提交摘要和至少一项 proof/artifact；所有直接子任务必须先终结。", Type.Object({
-      taskId: Id, summary: Id, evidence: Type.Array(Evidence, { minItems: 1 }),
-    }, { additionalProperties: false }), async (p) => service.submitTask(actorId(), p.taskId, p.summary, p.evidence)),
+    tool("company_task_submit", "提交验收", "负责人完成本人可执行交付后，提交摘要、至少一项 proof/artifact 和已推送且通过远端校验的 Git 分支定位；所有直接子任务必须先终结。Boss/派发者亲测等验收人专属动作留在 review 阶段，不要求提交前完成。", Type.Object({
+      taskId: Id,
+      summary: Id,
+      evidence: Type.Array(Evidence, { minItems: 1 }),
+      gitLocation: GitLocation,
+    }, { additionalProperties: false }), async (p) => service.submitTask(actorId(), p.taskId, p.summary, p.evidence, p.gitLocation)),
     tool("company_task_review", "任务验收", "派发者读取当前提交后逐项核验证据，并用结构化报告批准或驳回任务。", Type.Object({
       taskId: Id,
       decision: Type.Union([Type.Literal("accept"), Type.Literal("reject")]),

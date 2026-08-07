@@ -63,7 +63,7 @@ async function handleApi(service: CompanyOsService, req: IncomingMessage, res: S
   const result = await executeBossApi(service, {
     method: req.method ?? "GET",
     path: route,
-    body: req.method === "POST" ? await readJson(req) : undefined,
+    body: req.method === "POST" || req.method === "PUT" ? await readJson(req) : undefined,
   });
   sendJson(res, result.status, result.data);
   return true;

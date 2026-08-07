@@ -104,6 +104,12 @@ describe("Boss root-task review email", () => {
       submittedAt: "2026-08-06T06:30:00.000Z",
       summary: "根任务已经完成",
       evidence: [{ type: "proof", label: "tests", command: "npm test" }],
+      gitLocation: {
+        remoteUrl: "https://git.example.test/company/company-os.git",
+        branch: "agents/root-task",
+        commit: "a".repeat(40),
+        verifiedAt: "2026-08-06T06:29:00.000Z",
+      },
     });
 
     expect(text).toContain("一级员工已提交根任务验收");
@@ -111,6 +117,11 @@ describe("Boss root-task review email", () => {
     expect(text).toContain("CTO (cto)");
     expect(text).toContain("完整构建和测试通过");
     expect(text).toContain("根任务已经完成");
+    expect(text).toContain("https://git.example.test/company/company-os.git");
+    expect(text).toContain("agents/root-task");
+    expect(text).toContain("a".repeat(40));
+    expect(text).toContain("应由 Boss 在本验收阶段执行");
+    expect(text).toContain("不是负责人提交前的前置条件");
     expect(text).toContain("[proof] tests — npm test");
     expect(text).toContain("批准或驳回");
   });

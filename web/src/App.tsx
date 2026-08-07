@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-import { deleteNotice, getMeeting, getSnapshot, getTask, post, subscribeToChanges } from "./api";
+import { deleteNotice, getMeeting, getSnapshot, getTask, post, put, subscribeToChanges } from "./api";
 import { BossMeetingGate } from "./BossMeetingGate";
 import { AgentAvatar, memberIdentity, memberName, useMemberIdentities, type MemberIdentityMap } from "./member-identity";
 import { MeetingHistory } from "./MeetingHistory";
@@ -246,7 +246,7 @@ function MeetingRoomPage({ snapshot, reload }: { snapshot: Snapshot; reload: (qu
         <aside className="meeting-side">
           <section className="panel compact"><div className="panel-title">参会角色</div><div className="people-list">{meeting.bossParticipates ? <Person id="boss" role={meeting.awaitingBossStart ? "待入场 · 最终决策者" : "直接参会 · 最终决策者"} identities={identities} /> : null}<Person id={meeting.hostId} role="主持人" identities={identities} />{meeting.participants.map((p) => <Person key={p.agentId} id={p.agentId} role={p.role === "worker" ? "执行者" : "顾问"} identities={identities} fallbackName={p.name} />)}</div></section>
           {closing ? <MeetingCloseoutMemberList meeting={meeting} /> : null}
-          <section className="panel compact"><div className="panel-title">任务草案 <span>{meeting.taskDrafts.length}</span></div>{meeting.type === "discussion" ? <p className="muted">普通讨论会不能生成任务。</p> : meeting.taskDrafts.length ? meeting.taskDrafts.map((draft) => <div className="draft" key={draft.id}><b>{draft.title}</b><span>→ {memberName(identities, draft.assigneeId)}</span><small>{draft.acceptanceCriteria}</small></div>) : <p className="muted">主持人尚未提交任务草案。</p>}</section>
+          <section className="panel compact"><div className="panel-title">分阶段任务流 <span>{meeting.taskDraftStages.length}</span></div>{meeting.type === "discussion" ? <p className="muted">普通讨论会不能生成任务。</p> : meeting.taskDraftStages.length ? meeting.taskDraftStages.map((stage) => <div className="draft-stage" key={stage.id}><b>阶段 {stage.position + 1} · {stage.name}</b><p>{stage.objective}</p>{stage.tasks.map((draft) => <div className="draft" key={draft.id}><b>{draft.title}</b><span>→ {memberName(identities, draft.assigneeId)}</span><small>{draft.acceptanceCriteria}</small></div>)}</div>) : <p className="muted">主持人尚未提交分阶段任务草案。</p>}</section>
         </aside>
       </div>}
     <QueueSection queue={snapshot.meetings.queue} history={snapshot.meetings.history} reorder={reorder} cancel={cancel} identities={identities} />
@@ -296,11 +296,12 @@ function TasksPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: 
   const visible = (task: Task) => (status === "all" || task.status === status) && (assignee === "all" || task.assigneeId === assignee) && (!search || `${task.title} ${task.description}`.toLowerCase().includes(search.toLowerCase()));
   const createRoot = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
-    try { const task = await post<Task>("/tasks", Object.fromEntries(data)); form.reset(); await reload(true); setSelectedId(task.id); } catch (error) { window.alert(messageOf(error)); }
+    const values = Object.fromEntries(data);
+    try { const task = await post<Task>("/tasks", { ...values, requireTaskMeeting: data.get("requireTaskMeeting") === "true" }); form.reset(); await reload(true); setSelectedId(task.id); } catch (error) { window.alert(messageOf(error)); }
   };
   return <>
     <PageHeader eyebrow="STRICT HIERARCHY · BOTTOM-UP CLOSURE" title="多级任务系统" summary="每个任务只有一名负责人。子任务全部终结后，上一级才有资格提交验收。" />
-    <TaskRollingPoolPanel summary={snapshot.taskPromptPool} />
+    <TaskRollingPoolPanel summary={snapshot.taskPromptPool} reload={reload} />
     <div className="task-toolbar panel"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索任务标题或说明" /><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="all">全部状态</option>{["assigned", "in_progress", "review", "blocked", "closed", "canceled"].map((value) => <option key={value}>{value}</option>)}</select><select value={assignee} onChange={(e) => setAssignee(e.target.value)}><option value="all">全部负责人</option>{snapshot.organization.filter((m) => m.active && m.kind === "agent").map((m) => <option value={m.id} key={m.id}>{m.name} · {m.id}</option>)}</select></div>
     <div className="tasks-layout">
       <section className="task-tree panel">
@@ -337,13 +338,13 @@ export function TaskCheckinPanel({ summary }: { summary: TaskHourlyCheckinSummar
   </section>;
 }
 
-export function TaskRollingPoolPanel({ summary }: { summary: Snapshot["taskPromptPool"] }) {
+export function TaskRollingPoolPanel({ summary, reload }: { summary: Snapshot["taskPromptPool"]; reload?: (quiet?: boolean) => Promise<void> }) {
   const busySkips = summary.queues.filter((queue) => queue.lastDispatch?.status === "skipped_busy").length;
   const failures = summary.queues.filter((queue) => queue.lastDispatch?.status === "failed").length;
   return <section className="task-checkin-panel panel">
     <div className="task-checkin-heading">
       <div><span className="eyebrow">ROLLING TASK PROMPT POOL</span><h2>任务回转提示池</h2></div>
-      <Badge tone={summary.enabled ? "completed" : "canceled"}>{summary.enabled ? `${String(summary.startHour).padStart(2, "0")}:00–${String(summary.endHour).padStart(2, "0")}:40 · 每 20 分钟` : "已关闭"}</Badge>
+      <Badge tone={summary.enabled ? "completed" : "canceled"}>{summary.enabled ? `${String(summary.startHour).padStart(2, "0")}:00–${String((summary.endHour + 1) % 24).padStart(2, "0")}:00 · 个人倒计时` : "已关闭"}</Badge>
     </div>
     <div className="task-checkin-stats">
       <TaskCheckinMetric label="队列员工" value={String(summary.totals.employees)} />
@@ -354,13 +355,44 @@ export function TaskRollingPoolPanel({ summary }: { summary: Snapshot["taskPromp
       <TaskCheckinMetric label="忙碌跳过 / 失败" value={`${busySkips} / ${failures}`} tone={failures ? "danger" : busySkips ? "warning" : undefined} />
     </div>
     <div className="task-checkin-footer">
-      <span>下一时间点：{formatTime(summary.nextTickAt)}</span>
+      <span>全员最近到期：{formatTime(summary.nextDueAt)}</span>
       {summary.queues.filter((queue) => queue.count > 0).map((queue) => <span key={queue.memberId}>
-        {queue.memberName}：{queue.count} 项 · 池首 {queue.head ? `${taskPromptKind(queue.head.kind)}「${queue.head.title}」` : "—"}
+        {queue.memberName}：{queue.count} 项 · {queue.intervalMinutes ?? queue.defaultIntervalMinutes ?? 20} 分钟 · 剩余 {formatRemainingMinutes(queue.remainingWorkMinutes)} · 池首 {queue.head ? `${taskPromptKind(queue.head.kind)}「${queue.head.title}」` : "—"}
         {queue.lastDispatch ? ` · 最近 ${taskPromptStatus(queue.lastDispatch.status)}` : ""}
       </span>)}
     </div>
+    {summary.queues.length ? <div className="task-prompt-queue-details">
+      {summary.queues.map((queue) => <section key={queue.memberId}>
+        <div className="task-prompt-queue-heading"><b>{queue.memberName} · FIFO 队列</b><span>层级默认 {queue.defaultIntervalMinutes ?? queue.intervalMinutes ?? 20} 分钟{queue.intervalOverrideMinutes != null ? ` · Boss 覆盖 ${queue.intervalOverrideMinutes} 分钟` : ""}</span>{reload ? <TaskPromptIntervalControl queue={queue} reload={reload} /> : null}</div>
+        {queue.items.map((item, index) => <div className={`task-prompt-queue-item is-${item.kind}`} key={`${item.kind}:${item.taskId}`}>
+          <span>{index + 1}</span><Badge tone={item.kind === "blocked_review" ? "blocked" : item.kind === "review" ? "review" : "in_progress"}>{taskPromptKind(item.kind)}</Badge>
+          <strong>{item.title}</strong>{item.parentTitle ? <small>父任务：{item.parentTitle}</small> : null}
+        </div>)}{queue.items.length === 0 ? <small className="task-prompt-empty">当前队列为空，倒计时已停止。</small> : null}
+      </section>)}
+    </div> : null}
   </section>;
+}
+
+function TaskPromptIntervalControl({ queue, reload }: { queue: Snapshot["taskPromptPool"]["queues"][number]; reload: (quiet?: boolean) => Promise<void> }) {
+  const [value, setValue] = useState(String(queue.intervalMinutes));
+  const [saving, setSaving] = useState(false);
+  useEffect(() => setValue(String(queue.intervalMinutes)), [queue.intervalMinutes]);
+  const save = async (intervalMinutes: number | null) => {
+    setSaving(true);
+    try {
+      await put(`/task-prompt-settings/${encodeURIComponent(queue.memberId)}`, { intervalMinutes });
+      await reload(true);
+    } catch (error) {
+      window.alert(messageOf(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <div className="task-prompt-interval-control">
+    <input type="number" min={1} max={600} value={value} disabled={saving} aria-label={`${queue.memberName} 提醒间隔（分钟）`} onChange={(event) => setValue(event.target.value)} />
+    <button type="button" disabled={saving || !/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 600} onClick={() => void save(Number(value))}>应用</button>
+    <button type="button" className="ghost" disabled={saving || queue.intervalOverrideMinutes === null} onClick={() => void save(null)}>恢复层级默认</button>
+  </div>;
 }
 
 function TaskCheckinMetric({ label, value, tone }: { label: string; value: string; tone?: "danger" | "warning" }) {
@@ -369,15 +401,20 @@ function TaskCheckinMetric({ label, value, tone }: { label: string; value: strin
 
 function TaskNode({ task, all, visible, selectedId, select, depth }: { task: Task; all: Task[]; visible: (t: Task) => boolean; selectedId: string; select: (id: string) => void; depth: number }) {
   const children = all.filter((item) => item.parentId === task.id);
-  const subtreeVisible = visible(task) || children.some((child) => visible(child));
+  const subtreeVisible = taskSubtreeContainsVisible(task, all, visible);
   if (!subtreeVisible) return null;
   return <div className="task-branch">
     <button className={`task-row ${selectedId === task.id ? "selected" : ""}`} style={{ paddingLeft: 14 + depth * 22 }} onClick={() => select(task.id)}>
-      <span className="tree-joint">{depth ? "└" : "◆"}</span><span className="task-main"><b>{task.title}</b><small>{task.assigneeId} · v{task.revision} · {shortId(task.id)}</small></span><Badge tone={task.status}>{taskStatus(task.status)}</Badge>
+      <span className="tree-joint">{depth ? "└" : "◆"}</span><span className="task-main"><b>{task.title}</b><small>{task.assigneeId} · v{task.revision} · {shortId(task.id)}{task.flowStage ? ` · 阶段 ${task.flowStage.position + 1}` : ""}</small></span><Badge tone={task.status}>{taskStatus(task.status)}</Badge>{task.availability !== "active" ? <Badge tone="waiting">{taskAvailability(task.availability)}</Badge> : null}
       {task.risks.blockedDescendants ? <span className="risk blocked">阻塞 {task.risks.blockedDescendants}</span> : null}{task.risks.stale || task.risks.staleDescendants ? <span className="risk stale">停滞 {Number(task.risks.stale) + task.risks.staleDescendants}</span> : null}{task.childCounts.canceled ? <span className="risk canceled">取消 {task.childCounts.canceled}</span> : null}
     </button>
     {children.map((child) => <TaskNode key={child.id} task={child} all={all} visible={visible} selectedId={selectedId} select={select} depth={depth + 1} />)}
   </div>;
+}
+
+function taskSubtreeContainsVisible(task: Task, all: Task[], visible: (task: Task) => boolean): boolean {
+  return visible(task) || all.filter((item) => item.parentId === task.id)
+    .some((child) => taskSubtreeContainsVisible(child, all, visible));
 }
 
 export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail; members: Snapshot["organization"]; reload: (quiet?: boolean) => Promise<void> }) {
@@ -430,15 +467,19 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
     await action("correct", { action: actionName, reason });
   };
   const review = detail.status === "review" && detail.parentId === null;
-  const canRemind = (["assigned", "in_progress", "blocked"] as string[]).includes(detail.status);
+  const remindReviewer = detail.parentId !== null && (detail.status === "review" || detail.status === "blocked");
+  const canRemind = (["assigned", "in_progress"] as string[]).includes(detail.status) || remindReviewer;
   const reminderActive = detail.reminderDispatch?.status === "pending" || detail.reminderDispatch?.status === "running";
   return <div>
     <div className="detail-head"><Badge tone={detail.status}>{taskStatus(detail.status)}</Badge><code>{detail.id}</code></div>
     <h2>{detail.title}</h2><div className="detail-meta"><span>负责人 <b>{detail.assigneeId}</b></span><span>派发者 <b>{detail.issuerId}</b></span><span>版本 <b>v{detail.revision}</b></span></div>
+    {detail.taskMeetingRequirement ? <div className={`task-meeting-requirement is-${detail.taskMeetingRequirement.status}`}><b>任务拆解会要求：{taskMeetingRequirementStatus(detail.taskMeetingRequirement.status)}</b><span>{detail.taskMeetingRequirement.meetingId ? `关联会议 ${shortId(detail.taskMeetingRequirement.meetingId)}` : "等待任务轮转到负责人池首"}</span><small>会议必须由负责人主持、全体在职直属下属参与，Boss 参与；成功形成任务流后才算完成。</small></div> : null}
+    {detail.flowStage ? <div className="task-flow-context"><b>所属阶段 {detail.flowStage.position + 1} · {detail.flowStage.name}</b><span>{detail.flowStage.objective}</span><Badge tone={detail.flowStage.status}>{taskFlowStageStatus(detail.flowStage.status)}</Badge></div> : null}
+    {detail.childFlow ? <DetailBlock title={`分阶段任务流 · 修订 ${detail.childFlow.revision}`}><div className="task-flow-stages">{detail.childFlow.stages.map((stage) => <div className={`task-flow-stage is-${stage.status}`} key={stage.id}><div><Badge tone={stage.status}>{taskFlowStageStatus(stage.status)}</Badge><b>阶段 {stage.position + 1} · {stage.name}</b><span>{stage.closedTaskCount}/{stage.requiredTaskCount} 个必需任务已关闭</span></div><p>{stage.objective}</p></div>)}</div></DetailBlock> : null}
     {detail.childCounts.canceled ? <div className="warning">该任务包含 {detail.childCounts.canceled} 个已取消直接子任务。验收前请检查取消原因。</div> : null}
     <DetailBlock title="任务说明">{detail.description}</DetailBlock><DetailBlock title="验收标准">{detail.acceptanceCriteria}</DetailBlock>
     {detail.blockedReason ? <DetailBlock title="阻塞原因">{detail.blockedReason}</DetailBlock> : null}
-    {detail.submissions[0] ? <DetailBlock title="最近提交"><b>{detail.submissions[0].summary}</b>{detail.submissions[0].evidence.map((item, i) => <div className="evidence" key={i}><Badge tone={item.type}>{item.type}</Badge><span>{item.label}</span><code>{item.path ?? item.url ?? item.command ?? item.note}</code></div>)}</DetailBlock> : null}
+    {detail.submissions[0] ? <DetailBlock title="最近提交"><b>{detail.submissions[0].summary}</b>{detail.submissions[0].gitLocation ? <><div className="evidence"><Badge tone="artifact">Git</Badge><span>远端</span><code>{detail.submissions[0].gitLocation.remoteUrl}</code></div><div className="evidence"><Badge tone="artifact">Git</Badge><span>分支</span><code>{detail.submissions[0].gitLocation.branch}</code></div><div className="evidence"><Badge tone="artifact">Git</Badge><span>冻结 commit</span><code>{detail.submissions[0].gitLocation.commit}</code></div><small>远端验证于 {formatTime(detail.submissions[0].gitLocation.verifiedAt)}</small></> : <div className="warning">该历史提交没有 Git 远端定位。</div>}{detail.submissions[0].evidence.map((item, i) => <div className="evidence" key={i}><Badge tone={item.type}>{item.type}</Badge><span>{item.label}</span><code>{item.path ?? item.url ?? item.command ?? item.note}</code></div>)}</DetailBlock> : null}
     {detail.progress.length ? <DetailBlock title="进度记录">{detail.progress.map((item) => <div className="progress-entry" key={item.id}><span>{formatTime(item.createdAt)} · {item.authorId}</span><p>{item.body}</p></div>)}</DetailBlock> : null}
     {detail.versions.length > 1 ? <DetailBlock title="版本历史">{detail.versions.map((version) => <div className="version-entry" key={version.revision}><b>v{version.revision}</b><span>{version.changedBy} · {version.reason}</span><time>{formatTime(version.createdAt)}</time></div>)}</DetailBlock> : null}
     {detail.pendingCancelRequest ? <div className="warning"><b>等待 Boss 审批取消</b><p>{detail.pendingCancelRequest.requesterId}：{detail.pendingCancelRequest.reason}</p><div className="review-actions"><button className="danger-button" onClick={() => void reviewCancellation("accept")}>批准取消</button><button onClick={() => void reviewCancellation("reject")}>驳回申请</button></div></div> : null}
@@ -451,10 +492,10 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
       submit={() => void submitReview()}
       cancel={() => { setReviewMode(null); setReviewFeedback(""); }}
     /> : null}
-    {detail.reminderDispatch ? <div className={`reminder-status ${detail.reminderDispatch.status}`}><span>最近催办：{taskReminderStatus(detail.reminderDispatch.status)}</span><time>{formatTime(detail.reminderDispatch.completedAt ?? detail.reminderDispatch.startedAt ?? detail.reminderDispatch.createdAt)}</time>{detail.reminderDispatch.lastError ? <small>{detail.reminderDispatch.lastError}</small> : null}</div> : null}
+    {detail.reminderDispatch ? <div className={`reminder-status ${detail.reminderDispatch.status}`}><span>最近催办{detail.reminderDispatch.targetMemberId === detail.issuerId ? "审核人" : "负责人"}：{taskReminderStatus(detail.reminderDispatch.status)}</span><time>{formatTime(detail.reminderDispatch.completedAt ?? detail.reminderDispatch.startedAt ?? detail.reminderDispatch.createdAt)}</time>{detail.reminderDispatch.lastError ? <small>{detail.reminderDispatch.lastError}</small> : null}</div> : null}
     {detail.reviewNotificationDispatch ? <div className={`reminder-status review-notification ${detail.reviewNotificationDispatch.status}`}><span>最近验收通知：{taskReviewNotificationKind(detail.reviewNotificationDispatch.kind)} · {taskReminderStatus(detail.reviewNotificationDispatch.status)}</span><time>{formatTime(detail.reviewNotificationDispatch.completedAt ?? detail.reviewNotificationDispatch.startedAt ?? detail.reviewNotificationDispatch.createdAt)}</time>{detail.reviewNotificationDispatch.lastError ? <small>{detail.reviewNotificationDispatch.lastError}</small> : null}</div> : null}
     <details><summary>版本、进度与审计时间线</summary><div className="timeline">{detail.audit.map((item) => <div key={item.id}><i /><span>{formatTime(item.createdAt)}</span><b>{item.actorId}</b><code>{item.action}</code>{item.reason ? <small>{item.reason}</small> : null}</div>)}</div></details>
-    {!(["closed", "canceled"] as string[]).includes(detail.status) ? <div className="fallback-actions">{canRemind ? <button className="remind-button" disabled={reminding || reminderActive} onClick={() => void remind()}>{reminding || reminderActive ? "正在通知负责人…" : "催促负责人"}</button> : null}<button onClick={() => { const reason = window.prompt("取消原因："); if (reason) void action("cancel", { reason }); }}>带审计取消</button><button onClick={() => { const assigneeId = window.prompt(`新负责人（必须是 ${detail.issuerId} 的直属下属）：`, detail.assigneeId); const reason = assigneeId && window.prompt("重派原因："); if (assigneeId && reason) void action("reassign", { assigneeId, reason }); }}>全局重派</button></div> : null}
+    {!(["closed", "canceled"] as string[]).includes(detail.status) ? <div className="fallback-actions">{canRemind ? <button className="remind-button" disabled={reminding || reminderActive} onClick={() => void remind()}>{reminding || reminderActive ? `正在通知${remindReviewer ? "审核人" : "负责人"}…` : `催促${remindReviewer ? "审核人" : "负责人"}`}</button> : null}<button onClick={() => { const reason = window.prompt("取消原因："); if (reason) void action("cancel", { reason }); }}>带审计取消</button><button onClick={() => { const assigneeId = window.prompt(`新负责人（必须是 ${detail.issuerId} 的直属下属）：`, detail.assigneeId); const reason = assigneeId && window.prompt("重派原因："); if (assigneeId && reason) void action("reassign", { assigneeId, reason }); }}>全局重派</button></div> : null}
     {detail.status === "closed" ? <div className="fallback-actions"><button className="danger-button" onClick={() => void correctTerminal("revoke_acceptance")}>二次审查不通过</button></div> : null}
     {detail.status === "canceled" ? <div className="fallback-actions"><button onClick={() => void correctTerminal("restore_cancellation")}>恢复已取消任务</button></div> : null}
   </div>;
@@ -504,7 +545,7 @@ export function TaskReviewActions({
 }
 
 function RootTaskForm({ members, submit, compact = false }: { members: Snapshot["organization"]; submit: (e: FormEvent<HTMLFormElement>) => void; compact?: boolean }) {
-  return <form className={compact ? "root-form compact-form" : "root-form"} onSubmit={submit}><label>任务标题<input name="title" required placeholder="明确可验收的战略目标" /></label><label>负责人<select name="assigneeId" required><option value="">选择一级员工</option>{members.map((m) => <option value={m.id} key={m.id}>{m.name} · {m.title}</option>)}</select></label><label className="wide">任务说明<textarea name="description" rows={compact ? 2 : 5} required /></label><label className="wide">验收标准<textarea name="acceptanceCriteria" rows={compact ? 2 : 4} required /></label><button className="primary">创建根任务</button></form>;
+  return <form className={compact ? "root-form compact-form" : "root-form"} onSubmit={submit}><label>任务标题<input name="title" required placeholder="明确可验收的战略目标" /></label><label>负责人<select name="assigneeId" required><option value="">选择一级员工</option>{members.map((m) => <option value={m.id} key={m.id}>{m.name} · {m.title}</option>)}</select></label><label className="wide">任务说明<textarea name="description" rows={compact ? 2 : 5} required /></label><label className="wide">验收标准<textarea name="acceptanceCriteria" rows={compact ? 2 : 4} required /></label><label className="wide checkbox-label"><input type="checkbox" name="requireTaskMeeting" value="true" />要求负责人通过任务会完成拆解（Boss 参与）</label><button className="primary">创建根任务</button></form>;
 }
 
 function PageHeader({ eyebrow, title, summary, children }: { eyebrow: string; title: string; summary: string; children?: React.ReactNode }) { return <div className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{summary}</p></div><div>{children}</div></div>; }
@@ -515,15 +556,19 @@ function Empty({ title, body }: { title: string; body: string }) { return <div c
 function Loading() { return <div className="loading"><i /><span>正在载入公司运行状态…</span></div>; }
 export function routeFromPath(pathname = location.pathname): Route { const part = pathname.split("/").filter(Boolean).at(-1); return part === "notices" || part === "tasks" || part === "self-governance" ? part : "meeting-room"; }
 function formatTime(value?: string | null) { if (!value) return "—"; return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
+function formatRemainingMinutes(value?: number | null) { if (value === null || value === undefined) return "—"; return value < 1 ? "不足 1 分钟" : `${Math.ceil(value)} 分钟`; }
 function shortId(id: string) { return id.slice(0, 8); }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : String(error); }
 function noticeKind(kind: Notice["kind"]) { return ({ manual: "管理公告", meeting_report: "会议汇报", correction: "更正公告" })[kind]; }
 function meetingStatus(status: MeetingSummary["status"]) { return ({ queued: "排队", active: "进行中", completed: "完成", canceled: "取消", timed_out: "超时" })[status]; }
 function taskStatus(status: Task["status"]) { return ({ assigned: "已派发", in_progress: "进行中", review: "待验收", blocked: "阻塞", closed: "已关闭", canceled: "已取消" })[status]; }
+function taskAvailability(status: Task["availability"]) { return ({ active: "可执行", waiting_stage: "等待阶段", suspended_stage: "阶段冻结", retired: "已退役" })[status]; }
+function taskFlowStageStatus(status: NonNullable<Task["flowStage"]>["status"]) { return ({ waiting: "等待", active: "进行中", suspended: "已冻结", completed: "已完成", retired: "已退役" })[status]; }
+function taskMeetingRequirementStatus(status: NonNullable<TaskDetail["taskMeetingRequirement"]>["status"]) { return ({ required: "等待轮转发起", scheduled: "会议已排队", active: "会议进行中", fulfilled: "已完成" })[status]; }
 function taskReminderStatus(status: NonNullable<TaskDetail["reminderDispatch"]>["status"]) { return ({ pending: "等待发送", running: "正在通知负责人", succeeded: "已送达", failed: "发送失败", canceled: "已取消" })[status]; }
-function taskReviewNotificationKind(kind: NonNullable<TaskDetail["reviewNotificationDispatch"]>["kind"]) { return ({ boss_reminder: "催办", review_accepted: "验收通过", review_rejected: "验收驳回", block_escalated: "阻塞上报", block_guidance: "阻塞建议", cancel_request_accepted: "取消获批", cancel_request_rejected: "取消被驳回", acceptance_revoked: "二次审查不通过", cancellation_restored: "取消恢复" })[kind]; }
+function taskReviewNotificationKind(kind: NonNullable<TaskDetail["reviewNotificationDispatch"]>["kind"]) { return ({ boss_reminder: "催办", review_accepted: "验收通过", review_rejected: "验收驳回", block_escalated: "阻塞上报", block_guidance: "阻塞建议", cancel_request_accepted: "取消获批", cancel_request_rejected: "取消被驳回", acceptance_revoked: "二次审查不通过", cancellation_restored: "取消恢复", submission_git_required: "需补 Git 定位" })[kind]; }
 function taskPromptKind(kind: "execution" | "review" | "blocked_review") { return ({ execution: "执行", review: "验收", blocked_review: "阻塞审查" })[kind]; }
-function taskPromptStatus(status: "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "canceled") { return ({ running: "发送中", succeeded: "已送达", failed: "失败", skipped_busy: "会话忙碌跳过", skipped_empty: "空池跳过", canceled: "已取消" })[status]; }
+function taskPromptStatus(status: "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "skipped_offline" | "canceled") { return ({ running: "发送中", succeeded: "已送达", failed: "失败", skipped_busy: "会话忙碌跳过", skipped_empty: "空池跳过", skipped_offline: "离线错过", canceled: "已取消" })[status]; }
 function taskCheckinStatus(status: TaskHourlyCheckinSummary["boss"]["emailStatus"]) { return status ? ({ pending: "等待发送", running: "发送中", succeeded: "已送达", failed: "失败", skipped: "已跳过", canceled: "已取消" })[status] : "无待办"; }
 function taskCheckinAction(kind: "review" | "execute" | "boss_digest" | null) { return kind ? ({ review: "验收", execute: "执行", boss_digest: "Boss 汇总" })[kind] : "待递补"; }
 function closeoutDispatchStatus(status: MeetingDetail["closeoutDispatches"][number]["status"]) { return ({ pending: "等待同步", running: "正在同步", succeeded: "已送达" })[status]; }

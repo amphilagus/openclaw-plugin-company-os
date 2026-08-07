@@ -4,7 +4,7 @@ import path from "node:path";
 
 import nodemailer, { type Transporter } from "nodemailer";
 
-import type { EvidenceInput, ResolvedCompanyOsConfig } from "./types.js";
+import type { EvidenceInput, ResolvedCompanyOsConfig, VerifiedGitLocation } from "./types.js";
 
 export type MeetingEmailKind = "created" | "room_entered";
 
@@ -56,6 +56,7 @@ export type TaskReviewEmailNotification = {
   submittedAt: string;
   summary: string;
   evidence: EvidenceInput[];
+  gitLocation: VerifiedGitLocation;
 };
 
 export type BossTaskActionEmailNotification = {
@@ -231,6 +232,14 @@ export function buildTaskReviewEmailText(notification: TaskReviewEmailNotificati
     "",
     "提交摘要：",
     notification.summary,
+    "",
+    "Git 远端定位（验收对象）：",
+    `远端：${notification.gitLocation.remoteUrl}`,
+    `分支：${notification.gitLocation.branch}`,
+    `Commit：${notification.gitLocation.commit}`,
+    `验证时间：${formatShanghaiTime(notification.gitLocation.verifiedAt)}`,
+    "",
+    "任务现已进入 review。验收标准中的 Boss 亲测、扫码、真机体验或人工确认，应由 Boss 在本验收阶段执行，不是负责人提交前的前置条件。",
     "",
     `证据（${notification.evidence.length}）：`,
   ];

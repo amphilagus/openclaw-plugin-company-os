@@ -17,7 +17,8 @@ export type TaskAgentDispatchKind =
   | "cancel_request_accepted"
   | "cancel_request_rejected"
   | "acceptance_revoked"
-  | "cancellation_restored";
+  | "cancellation_restored"
+  | "submission_git_required";
 export type TaskCheckinActionKind = "review" | "execute" | "boss_digest";
 export type TaskCheckinChannel = "agent" | "boss_email";
 export type TaskCheckinDispatchStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "canceled";
@@ -25,7 +26,9 @@ export type NoticeReminderDispatchStatus = "pending" | "running" | "succeeded" |
 export type DailyAgentKind = "daily_self_improvement" | "daily_persona_audit";
 export type DailyAgentDispatchStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
 export type TaskPromptPoolItemKind = "execution" | "review" | "blocked_review";
-export type TaskPromptDispatchStatus = "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "canceled";
+export type TaskPromptDispatchStatus = "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "skipped_offline" | "canceled";
+export type TaskFlowStageStatus = "waiting" | "active" | "suspended" | "completed" | "retired";
+export type TaskAvailability = "active" | "waiting_stage" | "suspended_stage" | "retired";
 export type MeetingType = "task" | "discussion";
 export type MeetingStatus = "queued" | "active" | "completed" | "canceled" | "timed_out";
 export type MeetingCloseoutOutcome = "completed" | "canceled" | "timed_out";
@@ -89,7 +92,6 @@ export type ResolvedCompanyOsConfig = {
     enabled: boolean;
     startHour: number;
     endHour: number;
-    intervalMinutes: 20;
     timeZone: "Asia/Shanghai";
   };
   noticeUnreadReminders: {
@@ -128,6 +130,16 @@ export type EvidenceInput = {
   command?: string;
   url?: string;
   path?: string;
+};
+
+export type GitLocationInput = {
+  remoteUrl: string;
+  branch: string;
+  commit: string;
+};
+
+export type VerifiedGitLocation = GitLocationInput & {
+  verifiedAt: string;
 };
 
 export type TaskReviewCheck = {
@@ -185,11 +197,49 @@ export type TaskCorrection = {
   }>;
 };
 
-export type TaskDraftInput = {
+export type TaskFlowTaskInput = {
   title: string;
   description: string;
   acceptanceCriteria: string;
   assigneeId: string;
+};
+
+export type TaskFlowStageInput = {
+  name: string;
+  objective: string;
+  tasks: TaskFlowTaskInput[];
+};
+
+export type TaskFlowStage = {
+  id: string;
+  position: number;
+  name: string;
+  objective: string;
+  status: TaskFlowStageStatus;
+  taskIds: string[];
+  requiredTaskCount: number;
+  closedTaskCount: number;
+  createdAt: string;
+  activatedAt: string | null;
+  completedAt: string | null;
+  suspendedAt: string | null;
+  retiredAt: string | null;
+};
+
+export type TaskFlow = {
+  id: string;
+  parentTaskId: string;
+  revision: number;
+  stages: TaskFlowStage[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TaskMeetingRequirement = {
+  status: "required" | "scheduled" | "active" | "fulfilled";
+  meetingId: string | null;
+  requiredAt: string;
+  fulfilledAt: string | null;
 };
 
 export type MeetingParticipantInput = {
@@ -310,7 +360,7 @@ export type TaskPromptPoolItem = {
 
 export type TaskPromptDispatch = {
   id: string;
-  tickId: string;
+  cycleId: string;
   poolItemId: string | null;
   targetMemberId: string;
   targetAgentId: string;
@@ -331,8 +381,7 @@ export type TaskPromptPoolSummary = {
   timeZone: "Asia/Shanghai";
   startHour: number;
   endHour: number;
-  intervalMinutes: 20;
-  nextTickAt: string | null;
+  nextDueAt: string | null;
   totals: {
     employees: number;
     items: number;
@@ -343,6 +392,13 @@ export type TaskPromptPoolSummary = {
   queues: Array<{
     memberId: string;
     memberName: string;
+    level: number;
+    defaultIntervalMinutes: number;
+    intervalMinutes: number;
+    intervalOverrideMinutes: number | null;
+    intervalSource: "level_default" | "boss_override";
+    nextDueAt: string | null;
+    remainingWorkMinutes: number | null;
     count: number;
     head: null | {
       taskId: string;
@@ -354,6 +410,16 @@ export type TaskPromptPoolSummary = {
       lastPromptedAt: string | null;
       promptCount: number;
     };
+    items: Array<{
+      taskId: string;
+      parentTaskId: string | null;
+      title: string;
+      parentTitle: string | null;
+      kind: TaskPromptPoolItemKind;
+      enqueuedAt: string;
+      lastPromptedAt: string | null;
+      promptCount: number;
+    }>;
     lastDispatch: null | {
       status: TaskPromptDispatchStatus;
       taskId: string | null;
@@ -487,9 +553,6 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
   if (taskPromptStartHour > taskPromptEndHour) {
     throw new Error("taskRollingPrompts.startHour must not be later than endHour");
   }
-  if (taskRollingPrompts?.intervalMinutes !== undefined && taskRollingPrompts.intervalMinutes !== 20) {
-    throw new Error("taskRollingPrompts.intervalMinutes is fixed at 20");
-  }
   if (noticeReminderStartHour > noticeReminderEndHour) {
     throw new Error("noticeUnreadReminders.startHour must not be later than endHour");
   }
@@ -508,7 +571,6 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
       enabled: taskRollingPrompts?.enabled ?? taskCheckins?.enabled ?? true,
       startHour: taskPromptStartHour,
       endHour: taskPromptEndHour,
-      intervalMinutes: 20,
       timeZone: "Asia/Shanghai",
     },
     noticeUnreadReminders: {

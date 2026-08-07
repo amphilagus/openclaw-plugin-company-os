@@ -53,7 +53,10 @@ describe("meeting history UI", () => {
         { id: "message-0", sequence: 1, authorKind: "boss", authorId: "boss", targetId: null, body: "现在开始会议。", createdAt: summary.startedAt! },
         { id: "message-1", sequence: 2, authorKind: "member", authorId: "engineer", targetId: null, body: "建议优先完成任务树。", createdAt: summary.startedAt! },
       ],
-      taskDrafts: [{ id: "draft-1", position: 1, title: "实现任务树", description: "完成树形交互", acceptanceCriteria: "测试通过", assigneeId: "engineer" }],
+      taskDraftStages: [{
+        id: "stage-1", position: 0, name: "第一阶段", objective: "先完成任务树",
+        tasks: [{ id: "draft-1", position: 0, title: "实现任务树", description: "完成树形交互", acceptanceCriteria: "测试通过", assigneeId: "engineer" }],
+      }],
       currentTurn: null,
     };
     const html = renderToStaticMarkup(<MeetingHistoryDetail meeting={detail} identities={identities} close={vi.fn()} />);

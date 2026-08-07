@@ -2,7 +2,7 @@
   "id": "company-os",
   "name": "Company OS",
   "description": "公司级会议、多级任务和告示板治理系统。",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -70,7 +70,8 @@
           "intervalMinutes": {
             "type": "integer",
             "enum": [20],
-            "default": 20
+            "default": 20,
+            "description": "Deprecated: personal intervals are level defaults or Boss per-agent overrides."
           }
         },
         "additionalProperties": false
@@ -198,6 +199,7 @@
       "company_task_list",
       "company_task_read",
       "company_task_create",
+      "company_task_flow_update",
       "company_task_start",
       "company_task_progress",
       "company_task_revise",

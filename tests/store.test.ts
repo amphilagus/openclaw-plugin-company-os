@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { CompanyOsStore } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
+import { VERIFIED_GIT } from "./test-git.js";
 
 const AGENTS = ["main", "jia-goushi", "cto", "eng-a", "eng-b", "dev-a", "dev-b", "advisor", "new-hire"];
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
@@ -97,7 +98,7 @@ describe("hierarchical tasks", () => {
     expect(() => store.createChildTask("cto", { ...taskFields("跨级"), parentId: root.id, assigneeId: "dev-a" })).toThrow(/direct report/);
     const child = store.createChildTask("cto", { ...taskFields("子方向"), parentId: root.id, assigneeId: "eng-a" });
     store.startTask("eng-a", child.id);
-    expect(() => store.submitTask("eng-a", child.id, "done", [])).toThrow(/proof or artifact/);
+    expect(() => store.submitTask("eng-a", child.id, "done", [], VERIFIED_GIT)).toThrow(/proof or artifact/);
     expect(() => store.cancelTask("boss", root.id, "stop all")).toThrow(/cascade cancellation/);
   });
 
@@ -109,14 +110,14 @@ describe("hierarchical tasks", () => {
     store.startTask("cto", root.id);
     store.startTask("eng-a", branch.id);
     store.startTask("dev-a", leaf.id);
-    expect(() => store.submitTask("eng-a", branch.id, "too soon", PROOF)).toThrow(/child tasks/);
-    expect(() => store.submitTask("cto", root.id, "too soon", PROOF)).toThrow(/child tasks/);
+    expect(() => store.submitTask("eng-a", branch.id, "too soon", PROOF, VERIFIED_GIT)).toThrow(/child tasks/);
+    expect(() => store.submitTask("cto", root.id, "too soon", PROOF, VERIFIED_GIT)).toThrow(/child tasks/);
 
-    store.submitTask("dev-a", leaf.id, "leaf complete", PROOF);
+    store.submitTask("dev-a", leaf.id, "leaf complete", PROOF, VERIFIED_GIT);
     reviewAs("eng-a", leaf.id, "accept", "verified");
-    store.submitTask("eng-a", branch.id, "branch complete", PROOF);
+    store.submitTask("eng-a", branch.id, "branch complete", PROOF, VERIFIED_GIT);
     reviewAs("cto", branch.id, "accept");
-    store.submitTask("cto", root.id, "root complete", PROOF);
+    store.submitTask("cto", root.id, "root complete", PROOF, VERIFIED_GIT);
     store.reviewTask("boss", root.id, "accept", "company objective reached");
 
     expect(store.listTasks("boss").map((task) => task.status)).toEqual(["closed", "closed", "closed"]);
@@ -130,11 +131,11 @@ describe("hierarchical tasks", () => {
     store.startTask("cto", root.id);
     store.startTask("eng-a", child.id);
 
-    store.submitTask("eng-a", child.id, "子任务完成", PROOF);
+    store.submitTask("eng-a", child.id, "子任务完成", PROOF, VERIFIED_GIT);
     expect(store.pendingTaskReviewEmailNotifications()).toEqual([]);
     reviewAs("cto", child.id, "accept");
 
-    store.submitTask("cto", root.id, "根任务首次提交", PROOF);
+    store.submitTask("cto", root.id, "根任务首次提交", PROOF, VERIFIED_GIT);
     const first = store.pendingTaskReviewEmailNotifications();
     expect(first).toHaveLength(1);
     expect(first[0]).toMatchObject({
@@ -145,11 +146,12 @@ describe("hierarchical tasks", () => {
       assigneeName: "CTO",
       summary: "根任务首次提交",
       evidence: PROOF,
+      gitLocation: VERIFIED_GIT,
     });
     store.markTaskReviewEmailSent(first[0]!.id);
     store.reviewTask("boss", root.id, "reject", "继续整改");
 
-    store.submitTask("cto", root.id, "根任务再次提交", [{ type: "artifact", label: "report", path: "/tmp/report.md" }]);
+    store.submitTask("cto", root.id, "根任务再次提交", [{ type: "artifact", label: "report", path: "/tmp/report.md" }], VERIFIED_GIT);
     const second = store.pendingTaskReviewEmailNotifications();
     expect(second).toHaveLength(1);
     expect(second[0]).toMatchObject({ taskId: root.id, summary: "根任务再次提交" });
@@ -160,7 +162,7 @@ describe("hierarchical tasks", () => {
     ]));
   });
 
-  it("keeps blocked and stale as risks and permits parent review after an audited child cancellation", () => {
+  it("keeps blocked and stale as risks and requires a newly canceled child to be restored before parent review", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("根任务"), assigneeId: "cto" });
     const blocked = store.createChildTask("cto", { ...taskFields("阻塞分支"), parentId: root.id, assigneeId: "eng-a" });
@@ -170,12 +172,17 @@ describe("hierarchical tasks", () => {
     expect(store.readTask("boss", root.id, false).status).toBe("in_progress");
     expect(store.readTask("boss", root.id, false).risks.blockedDescendants).toBe(1);
     store.unblockTask("cto", blocked.id, "dependency ready");
-    store.submitTask("eng-a", blocked.id, "done", PROOF);
+    store.submitTask("eng-a", blocked.id, "done", PROOF, VERIFIED_GIT);
     reviewAs("cto", blocked.id, "accept");
     store.cancelTask("cto", canceled.id, "scope removed");
     const rootView = store.readTask("boss", root.id, false);
     expect(rootView.childCounts.canceled).toBe(1);
-    store.submitTask("cto", root.id, "done with canceled scope disclosed", PROOF);
+    expect(() => store.submitTask("cto", root.id, "cannot skip canceled scope", PROOF, VERIFIED_GIT)).toThrow(/task flow stages/);
+    store.correctTaskTerminalDecision("boss", canceled.id, "restore_cancellation", "新任务流中的取消项仍为必需项");
+    store.startTask("eng-b", canceled.id);
+    store.submitTask("eng-b", canceled.id, "restored branch complete", PROOF, VERIFIED_GIT);
+    reviewAs("cto", canceled.id, "accept");
+    store.submitTask("cto", root.id, "done after restored scope", PROOF, VERIFIED_GIT);
     expect(store.readTask("boss", root.id, false).status).toBe("review");
   });
 
@@ -208,6 +215,9 @@ describe("hierarchical tasks", () => {
     expect(queued.prompt).toContain("company_task_read");
     expect(queued.prompt).toContain("company_task_progress");
     expect(queued.prompt).toContain("company_task_submit");
+    expect(queued.prompt).toContain("Boss 只在任务进入 review 后介入验收");
+    expect(queued.prompt).toContain("不是 company_task_submit 的前置条件");
+    expect(queued.prompt).toContain("不要因为等待验收人操作而只记录 progress");
     expect(queued.prompt).toContain("不要只回复进度说明");
 
     const claimed = store.claimNextTaskDispatch();
@@ -227,13 +237,39 @@ describe("hierarchical tasks", () => {
     });
   });
 
+  it("routes review and blocked reminders to the task issuer", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("审核人催办父任务"), assigneeId: "cto" });
+    store.startTask("cto", root.id);
+    const child = store.createChildTask("cto", { ...taskFields("审核人催办子任务"), parentId: root.id, assigneeId: "eng-a" });
+    store.startTask("eng-a", child.id);
+    store.submitTask("eng-a", child.id, "等待验收", PROOF, VERIFIED_GIT);
+
+    const reviewReminder = store.queueTaskReminderByBoss(child.id);
+    expect(reviewReminder).toMatchObject({ targetMemberId: "cto", status: "pending" });
+    expect(reviewReminder.prompt).toContain("催促你验收子任务");
+    expect(reviewReminder.prompt).toContain("结构化 reviewReport");
+    expect(reviewReminder.prompt).toContain("应由你在当前验收阶段执行");
+    expect(store.claimNextTaskDispatch()).toMatchObject({ id: reviewReminder.id, targetMemberId: "cto" });
+    store.completeTaskDispatch(reviewReminder.id);
+
+    store.readTask("cto", child.id);
+    reviewAs("cto", child.id, "reject", "补充验证");
+    store.blockTask("eng-a", child.id, "外部服务不可用");
+    const blockedReminder = store.queueTaskReminderByBoss(child.id);
+    expect(blockedReminder).toMatchObject({ targetMemberId: "cto", status: "pending" });
+    expect(blockedReminder.prompt).toContain("催促你审查被阻塞的子任务");
+    expect(blockedReminder.prompt).toContain("company_task_unblock");
+    expect(blockedReminder.prompt).toContain("company_task_cancel");
+  });
+
   it("enforces issuer-only review and durably notifies each task assignee", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("根任务验收通知"), assigneeId: "cto" });
     const child = store.createChildTask("cto", { ...taskFields("二级任务验收通知"), parentId: root.id, assigneeId: "eng-a" });
     store.startTask("cto", root.id);
     store.startTask("eng-a", child.id);
-    store.submitTask("eng-a", child.id, "first child submission", PROOF);
+    store.submitTask("eng-a", child.id, "first child submission", PROOF, VERIFIED_GIT);
 
     expect(() => store.reviewTask("boss", child.id, "accept")).toThrow(/only the task issuer/);
     const rejected = reviewAs("cto", child.id, "reject", "测试证据不完整");
@@ -245,7 +281,7 @@ describe("hierarchical tasks", () => {
         status: "pending",
       },
     });
-    store.submitTask("eng-a", child.id, "second child submission", PROOF);
+    store.submitTask("eng-a", child.id, "second child submission", PROOF, VERIFIED_GIT);
     const accepted = reviewAs("cto", child.id, "accept", "证据完整");
     expect(accepted).toMatchObject({
       status: "closed",
@@ -272,7 +308,7 @@ describe("hierarchical tasks", () => {
     expect(acceptedDispatch?.prompt).toContain("无需再次提交或修改该任务");
     expect(store.completeTaskDispatch(acceptedDispatch!.id)).toBe(true);
 
-    store.submitTask("cto", root.id, "root submission", PROOF);
+    store.submitTask("cto", root.id, "root submission", PROOF, VERIFIED_GIT);
     expect(() => store.reviewTask("cto", root.id, "accept")).toThrow(/only the task issuer/);
     const closedRoot = store.reviewTask("boss", root.id, "accept", "目标达成");
     expect(closedRoot.reviewNotificationDispatch).toMatchObject({
@@ -293,7 +329,7 @@ describe("hierarchical tasks", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("重启恢复验收通知"), assigneeId: "cto" });
     store.startTask("cto", root.id);
-    store.submitTask("cto", root.id, "首次提交", PROOF);
+    store.submitTask("cto", root.id, "首次提交", PROOF, VERIFIED_GIT);
     store.reviewTask("boss", root.id, "reject", "需要整改");
 
     const progressedDispatch = store.claimNextTaskDispatch();
@@ -304,7 +340,7 @@ describe("hierarchical tasks", () => {
       .toMatchObject({ id: progressedDispatch!.id, status: "succeeded", attempts: 1 });
     expect(store.claimNextTaskDispatch()).toBeNull();
 
-    store.submitTask("cto", root.id, "再次提交", PROOF);
+    store.submitTask("cto", root.id, "再次提交", PROOF, VERIFIED_GIT);
     store.reviewTask("boss", root.id, "reject", "仍需整改");
     const ambiguousDispatch = store.claimNextTaskDispatch();
     expect(ambiguousDispatch).toMatchObject({ kind: "review_rejected", attempts: 1 });
@@ -322,11 +358,11 @@ describe("hierarchical tasks", () => {
     store.readTask("cto", root.id);
     expect(store.inbox("cto").assignedOrChangedTasks.map((task) => task.id)).not.toContain(root.id);
     store.startTask("cto", root.id);
-    store.submitTask("cto", root.id, "first submission", PROOF);
+    store.submitTask("cto", root.id, "first submission", PROOF, VERIFIED_GIT);
     expect(store.inbox("main").tasksAwaitingReview).toHaveLength(0);
     store.reviewTask("boss", root.id, "reject", "proof is incomplete");
     expect(store.inbox("cto").assignedOrChangedTasks.map((task) => task.id)).toContain(root.id);
-    store.submitTask("cto", root.id, "second submission", [{ type: "artifact", label: "report", path: "/tmp/report.md" }]);
+    store.submitTask("cto", root.id, "second submission", [{ type: "artifact", label: "report", path: "/tmp/report.md" }], VERIFIED_GIT);
     store.reviewTask("boss", root.id, "accept");
     expect(store.readTask("boss", root.id, false).submissions.map((item: any) => item.status)).toEqual(["accepted", "rejected"]);
   });
@@ -369,6 +405,8 @@ describe("meeting room", () => {
     expect(first.prompt).toContain("主持人：CTO（cto）");
     expect(first.prompt).toContain("你的身份：高工 A（eng-a）");
     expect(first.prompt).toContain("会议室已开放");
+    expect(first.prompt).toContain("【本轮表达要求】");
+    expect(first.prompt).toContain("删除客套、铺垫、重复总结");
     store.speakMeeting("eng-a", meeting.id, "第一轮意见", first.turnId);
 
     store.speakMeeting("cto", meeting.id, "主持人追加问题背景");
@@ -656,6 +694,9 @@ describe("meeting room", () => {
     const recovered = store.claimNextHostDispatch();
     expect(recovered).toMatchObject({ id: first?.id, status: "running", attempts: 2 });
     const context = store.buildMeetingContext(meeting.id, "cto", { role: "host", instruction: "恢复主持" });
+    expect(context.prompt).toContain("当前共识、尚存分歧、下一动作");
+    expect(context.prompt).toContain("点名时一次只提出一个");
+    expect(context.prompt).toContain("不继续空泛讨论");
     store.completeHostDispatch(recovered!.id, context.toSequence);
 
     expect(store.claimNextHostDispatch()).toBeNull();
@@ -815,7 +856,8 @@ describe("meeting room", () => {
     store = openStore();
     const recovered = store.meetingView(meeting.id);
     expect(recovered.status).toBe("active");
-    expect(recovered.taskDrafts).toHaveLength(1);
+    expect(recovered.taskDraftStages).toHaveLength(1);
+    expect(recovered.taskDraftStages[0]?.tasks).toHaveLength(1);
     expect(recovered.currentTurn?.speakerId).toBe("eng-a");
     expect(store.recoveryAdvance()?.hostDispatchId).toBeTruthy();
     expect(store.meetingView(meeting.id).currentTurn).toBeNull();
@@ -862,13 +904,13 @@ describe("meeting room", () => {
     deliverAllMeetingCloseouts();
 
     store.startTask("dev-a", leaf.id);
-    store.submitTask("dev-a", leaf.id, "状态机测试通过", PROOF);
+    store.submitTask("dev-a", leaf.id, "状态机测试通过", PROOF, VERIFIED_GIT);
     reviewAs("eng-a", leaf.id, "accept");
     store.startTask("eng-a", seniorTask.id);
-    store.submitTask("eng-a", seniorTask.id, "任务引擎完成", PROOF);
+    store.submitTask("eng-a", seniorTask.id, "任务引擎完成", PROOF, VERIFIED_GIT);
     reviewAs("cto", seniorTask.id, "accept");
     store.startTask("cto", root.id);
-    store.submitTask("cto", root.id, "Company OS 已交付", PROOF);
+    store.submitTask("cto", root.id, "Company OS 已交付", PROOF, VERIFIED_GIT);
     store.reviewTask("boss", root.id, "accept");
 
     expect(store.listTasks("boss").every((task) => task.status === "closed")).toBe(true);

@@ -37,13 +37,22 @@ export type Task = {
   updatedAt: string;
   lastActivityAt: string;
   sourceMeetingId?: string | null;
+  availability: "active" | "waiting_stage" | "suspended_stage" | "retired";
+  flowStage: null | {
+    flowId: string;
+    stageId: string;
+    position: number;
+    name: string;
+    objective: string;
+    status: "waiting" | "active" | "suspended" | "completed" | "retired";
+  };
 };
 
 export type TaskAgentDispatch = {
   id: string;
   targetMemberId: string;
   targetAgentId: string;
-  kind: "boss_reminder" | "review_accepted" | "review_rejected" | "block_escalated" | "block_guidance" | "cancel_request_accepted" | "cancel_request_rejected" | "acceptance_revoked" | "cancellation_restored";
+  kind: "boss_reminder" | "review_accepted" | "review_rejected" | "block_escalated" | "block_guidance" | "cancel_request_accepted" | "cancel_request_rejected" | "acceptance_revoked" | "cancellation_restored" | "submission_git_required";
   status: "pending" | "running" | "succeeded" | "failed" | "canceled";
   attempts: number;
   lastError: string | null;
@@ -118,7 +127,13 @@ export type MeetingDetail = MeetingSummary & {
     body: string;
     createdAt: string;
   }>;
-  taskDrafts: Array<{ id: string; position: number; title: string; description: string; acceptanceCriteria: string; assigneeId: string }>;
+  taskDraftStages: Array<{
+    id: string;
+    position: number;
+    name: string;
+    objective: string;
+    tasks: Array<{ id: string; position: number; title: string; description: string; acceptanceCriteria: string; assigneeId: string }>;
+  }>;
   currentTurn: { speakerId: string; prompt: string; startedAt: string } | null;
   hostDispatchStatus: {
     id: string;
@@ -148,6 +163,34 @@ export type MeetingDetail = MeetingSummary & {
 };
 
 export type TaskDetail = Task & {
+  childFlow: null | {
+    id: string;
+    parentTaskId: string;
+    revision: number;
+    createdAt: string;
+    updatedAt: string;
+    stages: Array<{
+      id: string;
+      position: number;
+      name: string;
+      objective: string;
+      status: "waiting" | "active" | "suspended" | "completed" | "retired";
+      taskIds: string[];
+      requiredTaskCount: number;
+      closedTaskCount: number;
+      createdAt: string;
+      activatedAt: string | null;
+      completedAt: string | null;
+      suspendedAt: string | null;
+      retiredAt: string | null;
+    }>;
+  };
+  taskMeetingRequirement: null | {
+    status: "required" | "scheduled" | "active" | "fulfilled";
+    meetingId: string | null;
+    requiredAt: string;
+    fulfilledAt: string | null;
+  };
   versions: Array<{ revision: number; changedBy: string; reason: string; createdAt: string }>;
   progress: Array<{ id: string; authorId: string; body: string; createdAt: string }>;
   submissions: Array<{
@@ -160,6 +203,7 @@ export type TaskDetail = Task & {
       checks: Array<{ criterion: string; outcome: "pass" | "fail"; evidenceIndexes: number[]; finding: string; remediation?: string }>;
       conclusion: string;
     } | null;
+    gitLocation: null | { remoteUrl: string; branch: string; commit: string; verifiedAt: string };
     createdAt: string;
   }>;
   reminderDispatch: TaskAgentDispatch | null;
@@ -196,15 +240,22 @@ export type TaskPromptPoolSummary = {
   timeZone: "Asia/Shanghai";
   startHour: number;
   endHour: number;
-  intervalMinutes: 20;
-  nextTickAt: string | null;
+  nextDueAt: string | null;
   totals: { employees: number; items: number; execution: number; review: number; blockedReview: number };
   queues: Array<{
     memberId: string;
     memberName: string;
+    level: number;
+    defaultIntervalMinutes: number;
+    intervalMinutes: number;
+    intervalOverrideMinutes: number | null;
+    intervalSource: "level_default" | "boss_override";
+    nextDueAt: string | null;
+    remainingWorkMinutes: number | null;
     count: number;
     head: null | { taskId: string; title: string; parentTitle: string | null; kind: "execution" | "review" | "blocked_review"; enqueuedAt: string; lastPromptedAt: string | null; promptCount: number };
-    lastDispatch: null | { status: "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "canceled"; taskId: string | null; kind: "execution" | "review" | "blocked_review" | null; scheduledAt: string; completedAt: string | null; lastError: string | null };
+    items: Array<{ taskId: string; parentTaskId: string | null; title: string; parentTitle: string | null; kind: "execution" | "review" | "blocked_review"; enqueuedAt: string; lastPromptedAt: string | null; promptCount: number }>;
+    lastDispatch: null | { status: "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "skipped_offline" | "canceled"; taskId: string | null; kind: "execution" | "review" | "blocked_review" | null; scheduledAt: string; completedAt: string | null; lastError: string | null };
   }>;
 };
 

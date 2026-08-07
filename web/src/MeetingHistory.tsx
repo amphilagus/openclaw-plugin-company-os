@@ -101,7 +101,7 @@ export function MeetingHistoryDetail({ meeting, identities = {}, close }: { meet
 
         <aside className="history-sidebar">
           <section><h3>参会角色</h3><HistoryPerson id={meeting.hostId} role="主持人" identities={identities} />{meeting.participants.map((participant) => <HistoryPerson id={participant.agentId} role={participant.role === "worker" ? "执行者" : "顾问"} identities={identities} fallbackName={participant.name} key={participant.agentId} />)}</section>
-          <section><h3>任务草案 <span>{meeting.taskDrafts.length}</span></h3>{meeting.taskDrafts.length ? meeting.taskDrafts.map((draft) => <div className="history-draft" key={draft.id}><b>{draft.title}</b><span>负责人 {memberName(identities, draft.assigneeId)}</span><p>{draft.description}</p><small>验收：{draft.acceptanceCriteria}</small></div>) : <p className="history-empty">本次会议没有任务草案。</p>}</section>
+          <section><h3>分阶段任务流 <span>{meeting.taskDraftStages.length}</span></h3>{meeting.taskDraftStages.length ? meeting.taskDraftStages.map((stage) => <div className="history-draft-stage" key={stage.id}><b>阶段 {stage.position + 1} · {stage.name}</b><p>{stage.objective}</p>{stage.tasks.map((draft) => <div className="history-draft" key={draft.id}><b>{draft.title}</b><span>负责人 {memberName(identities, draft.assigneeId)}</span><p>{draft.description}</p><small>验收：{draft.acceptanceCriteria}</small></div>)}</div>) : <p className="history-empty">本次会议没有任务草案。</p>}</section>
         </aside>
       </div>
     </section>

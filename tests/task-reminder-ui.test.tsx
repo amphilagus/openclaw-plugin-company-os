@@ -61,7 +61,7 @@ describe("Boss task reminder control", () => {
     />);
 
     expect(html).toContain("正在通知负责人…");
-    expect(html).toContain("最近催办：等待发送");
+    expect(html).toContain("最近催办负责人：等待发送");
     expect(html).toContain("disabled");
   });
 
@@ -104,6 +104,18 @@ describe("Boss task reminder control", () => {
     expect(html).toContain("最近验收通知：验收驳回 · 发送失败");
     expect(html).toContain("agent session unavailable");
     expect(html).not.toContain("验收并关闭");
+    expect(html).toContain("催促审核人");
+  });
+
+  it("targets the issuer when reminding about a blocked child task", () => {
+    const html = renderToStaticMarkup(<TaskDetailView
+      detail={{ ...task, parentId: "root-task", issuerId: "cto", assigneeId: "eng-a", status: "blocked", blockedReason: "等待依赖" }}
+      members={[]}
+      reload={vi.fn()}
+    />);
+
+    expect(html).toContain("催促审核人");
+    expect(html).not.toContain("催促负责人");
   });
 
   it("keeps Boss review controls on root tasks awaiting review", () => {
@@ -111,6 +123,32 @@ describe("Boss task reminder control", () => {
 
     expect(html).toContain("验收并关闭");
     expect(html).toContain("驳回");
+  });
+
+  it("renders the frozen Git remote location for the latest submission", () => {
+    const commit = "a".repeat(40);
+    const html = renderToStaticMarkup(<TaskDetailView detail={{
+      ...task,
+      status: "review",
+      submissions: [{
+        id: "submission-1",
+        summary: "已推送并提交",
+        evidence: [{ type: "proof", label: "tests", command: "npm test" }],
+        status: "pending",
+        gitLocation: {
+          remoteUrl: "https://git.example.test/company/company-os.git",
+          branch: "agents/root-task",
+          commit,
+          verifiedAt: "2026-08-06T06:29:00.000Z",
+        },
+        createdAt: "2026-08-06T06:30:00.000Z",
+      }],
+    }} members={[]} reload={vi.fn()} />);
+
+    expect(html).toContain("https://git.example.test/company/company-os.git");
+    expect(html).toContain("agents/root-task");
+    expect(html).toContain(commit);
+    expect(html).toContain("冻结 commit");
   });
 
   it("renders an inline required rejection form without relying on browser prompts", () => {

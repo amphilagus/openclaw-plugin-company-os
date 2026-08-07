@@ -9,6 +9,7 @@ import { executeBossApi } from "../src/boss-api.js";
 import type { SessionContextAppender } from "../src/session-context.js";
 import { CompanyOsService } from "../src/service.js";
 import { resolveConfig } from "../src/types.js";
+import { VERIFIED_GIT } from "./test-git.js";
 
 const directories: string[] = [];
 
@@ -24,6 +25,9 @@ describe("synchronous meeting orchestration", () => {
       invoke: vi.fn(async ({ agentId, prompt }) => {
         expect(agentId).toBe("eng-a");
         expect(prompt).toContain("你现在拥有发言权");
+        expect(prompt).toContain("结论 + 最多 3 条关键依据 + 明确下一步/风险");
+        expect(prompt).toContain("默认控制在 300 字以内");
+        expect(prompt).toContain("不要复述完整背景");
         expect(prompt).not.toContain("当前轮次 ID");
         expect(prompt).not.toContain("meetingId=");
         expect(prompt).not.toContain("company_meeting_speak 成功后");
@@ -423,7 +427,7 @@ describe("synchronous meeting orchestration", () => {
     });
     service.store.startTask("cto", root.id);
     service.store.startTask("eng-a", child.id);
-    service.store.submitTask("eng-a", child.id, "child done", [{ type: "proof", label: "tests", command: "npm test" }]);
+    service.store.submitTask("eng-a", child.id, "child done", [{ type: "proof", label: "tests", command: "npm test" }], VERIFIED_GIT);
 
     service.store.readTask("cto", child.id);
     service.reviewTask("cto", child.id, "accept", "子任务证据完整", {
@@ -431,7 +435,7 @@ describe("synchronous meeting orchestration", () => {
       conclusion: "子任务满足验收标准",
     });
     await waitFor(() => expect(service.store.readTask("boss", child.id, false).reviewNotificationDispatch?.status).toBe("succeeded"));
-    service.store.submitTask("cto", root.id, "root ready", [{ type: "artifact", label: "report", path: "/tmp/report.md" }]);
+    service.store.submitTask("cto", root.id, "root ready", [{ type: "artifact", label: "report", path: "/tmp/report.md" }], VERIFIED_GIT);
     service.reviewTask("boss", root.id, "reject", "根任务报告需要补充");
     await waitFor(() => expect(service.store.readTask("boss", root.id, false).reviewNotificationDispatch?.status).toBe("succeeded"));
 
@@ -472,13 +476,13 @@ describe("synchronous meeting orchestration", () => {
     });
     taskId = task.id;
     service.store.startTask("cto", task.id);
-    service.store.submitTask("cto", task.id, "首次提交", [{ type: "proof", label: "tests", command: "npm test" }]);
+    service.store.submitTask("cto", task.id, "首次提交", [{ type: "proof", label: "tests", command: "npm test" }], VERIFIED_GIT);
 
     service.reviewTask("boss", task.id, "reject", "需要补充证据");
     await waitFor(() => expect(service.store.readTask("boss", task.id, false).reviewNotificationDispatch)
       .toMatchObject({ kind: "review_rejected", status: "succeeded", attempts: 1 }));
 
-    service.store.submitTask("cto", task.id, "整改后重新提交", [{ type: "proof", label: "tests", command: "npm test" }]);
+    service.store.submitTask("cto", task.id, "整改后重新提交", [{ type: "proof", label: "tests", command: "npm test" }], VERIFIED_GIT);
     service.reviewTask("boss", task.id, "accept", "验收通过");
     await waitFor(() => expect(service.store.readTask("boss", task.id, false).reviewNotificationDispatch)
       .toMatchObject({ kind: "review_accepted", status: "succeeded", attempts: 1 }));
@@ -504,7 +508,7 @@ describe("synchronous meeting orchestration", () => {
       assigneeId: "cto",
     });
     service.store.startTask("cto", task.id);
-    service.store.submitTask("cto", task.id, "提交验收", [{ type: "proof", label: "tests", command: "npm test" }]);
+    service.store.submitTask("cto", task.id, "提交验收", [{ type: "proof", label: "tests", command: "npm test" }], VERIFIED_GIT);
 
     service.reviewTask("boss", task.id, "reject", "需要整改");
     await waitFor(() => expect(service.store.readTask("boss", task.id, false).reviewNotificationDispatch)

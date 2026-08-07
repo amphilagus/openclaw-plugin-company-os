@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { CompanyOsStore, nextTaskCheckinRunAt } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
+import { VERIFIED_GIT } from "./test-git.js";
 
 const AGENTS = ["main", "cto", "eng-a"];
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
@@ -68,6 +69,7 @@ describe("hourly task check-in store", () => {
 
     const first = store.claimNextTaskCheckinDispatch(Date.parse(TEN_AM));
     expect(first).toMatchObject({ targetMemberId: "cto", taskId: tasks[0]!.id, actionKind: "execute" });
+    expect(first?.prompt).toContain("不是 company_task_submit 的前置条件");
     expect(first?.prompt).toContain("本次只推进下面这一项任务");
     store.completeTaskCheckinDispatch(first!.id);
 
@@ -97,7 +99,7 @@ describe("hourly task check-in store", () => {
       assigneeId: "eng-a",
     });
     store.startTask("eng-a", child.id);
-    store.submitTask("eng-a", child.id, "完成", PROOF);
+    store.submitTask("eng-a", child.id, "完成", PROOF, VERIFIED_GIT);
     store.db.prepare("UPDATE tasks SET submitted_at = ?, last_activity_at = ? WHERE id = ?")
       .run("2029-12-30T00:00:00.000Z", "2029-12-30T00:00:00.000Z", child.id);
     store.db.prepare("UPDATE tasks SET last_activity_at = ? WHERE id = ?")
@@ -113,6 +115,7 @@ describe("hourly task check-in store", () => {
     expect(dispatch).toMatchObject({ taskId: child.id, actionKind: "review" });
     expect(dispatch?.prompt).toContain("本次只处理下面这一项任务验收");
     expect(dispatch?.prompt).toContain("company_task_review");
+    expect(dispatch?.prompt).toContain(VERIFIED_GIT.commit);
     expect(dispatch?.prompt).not.toContain(parent.id);
   });
 
@@ -174,7 +177,7 @@ describe("Boss task check-in digest", () => {
 
     const review = root("待 Boss 验收");
     store.startTask("cto", review.id);
-    store.submitTask("cto", review.id, "完成", PROOF);
+    store.submitTask("cto", review.id, "完成", PROOF, VERIFIED_GIT);
     const risk = root("异常根任务");
     const child = store.createChildTask("cto", {
       title: "阻塞子任务",

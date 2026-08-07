@@ -6,11 +6,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import { CompanyOsService } from "../src/service.js";
 import { resolveConfig } from "../src/types.js";
+import { VERIFIED_GIT } from "./test-git.js";
 
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
 
-describe("legacy task check-in delivery and rolling prompt scheduler", () => {
-  it("starts the next future Beijing 20-minute tick without creating legacy hourly runs", async () => {
+describe("legacy task check-in delivery and personal prompt scheduler", () => {
+  it("starts the level-one employee's ten-minute countdown without creating legacy global ticks or hourly runs", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-06T02:30:00.000Z")); // 10:30 in Shanghai
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-checkin-timer-"));
@@ -23,11 +24,15 @@ describe("legacy task check-in delivery and rolling prompt scheduler", () => {
       agentInvoker: { invoke: vi.fn(async () => ({ ok: true as const, text: "handled" })) },
     });
     try {
+      service.store.createRootTask({
+        title: "个人倒计时", description: "十分钟后提醒", acceptanceCriteria: "完成一次投递", assigneeId: "main",
+      });
       await service.start();
       expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_checkin_runs").get()).toMatchObject({ count: 0 });
       await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
-      expect(service.store.db.prepare("SELECT scheduled_at FROM task_prompt_ticks").get())
-        .toMatchObject({ scheduled_at: "2026-08-06T02:40:00.000Z" });
+      expect(service.store.db.prepare("SELECT scheduled_at, interval_minutes FROM task_prompt_cycles").get())
+        .toMatchObject({ scheduled_at: "2026-08-06T02:40:00.000Z", interval_minutes: 10 });
+      expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_prompt_ticks").get()).toMatchObject({ count: 0 });
       expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_checkin_runs").get()).toMatchObject({ count: 0 });
     } finally {
       await service.stop();
@@ -128,7 +133,7 @@ describe("legacy task check-in delivery and rolling prompt scheduler", () => {
       }));
       for (const task of roots) {
         service.store.startTask("main", task.id);
-        service.store.submitTask("main", task.id, "完成", PROOF);
+        service.store.submitTask("main", task.id, "完成", PROOF, VERIFIED_GIT);
       }
 
       const scheduledAt = pastShanghaiTen();
@@ -171,7 +176,7 @@ describe("legacy task check-in delivery and rolling prompt scheduler", () => {
         assigneeId: "main",
       });
       service.store.startTask("main", task.id);
-      service.store.submitTask("main", task.id, "完成", PROOF);
+      service.store.submitTask("main", task.id, "完成", PROOF, VERIFIED_GIT);
       const run = service.dispatchTaskCheckinRun(pastShanghaiTen());
 
       await waitFor(() => expect(service.store.db.prepare("SELECT status, attempts FROM task_checkin_dispatches WHERE run_id = ? AND channel = 'boss_email'").get(run.id))

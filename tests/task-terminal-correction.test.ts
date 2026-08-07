@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { CompanyOsStore } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
+import { VERIFIED_GIT } from "./test-git.js";
 
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
 const PASS_REPORT = {
@@ -56,7 +57,7 @@ describe("structured reviews and terminal correction", () => {
     const { root, child } = createSubmittedChild();
     store.readTask("cto", child.id);
     store.reviewTask("cto", child.id, "accept", "子任务通过", PASS_REPORT);
-    store.submitTask("cto", root.id, "根任务完成", PROOF);
+    store.submitTask("cto", root.id, "根任务完成", PROOF, VERIFIED_GIT);
     store.reviewTask("boss", root.id, "accept", "根任务通过");
 
     const corrected = store.correctTaskTerminalDecision("boss", child.id, "revoke_acceptance", "发现关键失败路径未覆盖");
@@ -86,7 +87,7 @@ describe("structured reviews and terminal correction", () => {
     const { root, child } = createSubmittedChild();
     store.readTask("cto", child.id);
     store.reviewTask("cto", child.id, "accept", "子任务通过", PASS_REPORT);
-    store.submitTask("cto", root.id, "根任务待验收", PROOF);
+    store.submitTask("cto", root.id, "根任务待验收", PROOF, VERIFIED_GIT);
 
     store.correctTaskTerminalDecision("boss", child.id, "revoke_acceptance", "子任务证据后来失效");
     const parent = store.readTask("boss", root.id, false);
@@ -123,6 +124,24 @@ describe("structured reviews and terminal correction", () => {
     expect(store.reviewTaskCancellationRequest("boss", child.id, request.id, "accept", "批准").task.status).toBe("canceled");
     expect(store.correctTaskTerminalDecision("boss", child.id, "restore_cancellation", "依赖已经恢复").status).toBe("blocked");
   });
+
+  it("restores a pre-v13 cancellation by reconstructing its event from the durable audit", () => {
+    const { child } = createSubmittedChild();
+    store.cancelTask("cto", child.id, "旧版本取消");
+    store.db.prepare("DELETE FROM task_cancellation_events WHERE task_id = ?").run(child.id);
+
+    expect(store.correctTaskTerminalDecision("boss", child.id, "restore_cancellation", "Boss 恢复历史任务").status)
+      .toBe("review");
+    expect(store.readTask("boss", child.id, false).cancellationEvents[0]).toMatchObject({
+      actorId: "cto",
+      statusBefore: "review",
+      restoredBy: "boss",
+    });
+    expect(store.db.prepare(`
+      SELECT action FROM audit_events
+      WHERE entity_id = ? AND action = 'task.cancellation_event_backfilled'
+    `).get(child.id)).toMatchObject({ action: "task.cancellation_event_backfilled" });
+  });
 });
 
 function createSubmittedChild(submit = true) {
@@ -141,6 +160,6 @@ function createSubmittedChild(submit = true) {
     assigneeId: "eng-a",
   });
   store.startTask("eng-a", child.id);
-  if (submit) store.submitTask("eng-a", child.id, "子任务完成", PROOF);
+  if (submit) store.submitTask("eng-a", child.id, "子任务完成", PROOF, VERIFIED_GIT);
   return { root, child };
 }

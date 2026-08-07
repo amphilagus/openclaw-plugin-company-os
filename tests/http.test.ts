@@ -53,6 +53,7 @@ describe("Company OS HTTP route isolation", () => {
       store: {
         bossSnapshot: () => ({ source: "protected-api" }),
       },
+      setTaskPromptInterval: (memberId: string, intervalMinutes: number | null) => ({ memberId, intervalMinutes }),
     } as unknown as CompanyOsService;
     const handler = createCompanyOsApiHttpHandler({ getService: () => service });
     const baseUrl = await listen(async (req, res) => {
@@ -64,6 +65,14 @@ describe("Company OS HTTP route isolation", () => {
     const api = await fetch(`${baseUrl}/plugins/company-os/api/v1/snapshot`);
     expect(api.status).toBe(200);
     expect(await api.json()).toEqual({ source: "protected-api" });
+
+    const updated = await fetch(`${baseUrl}/plugins/company-os/api/v1/task-prompt-settings/cto`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ intervalMinutes: 15 }),
+    });
+    expect(updated.status).toBe(200);
+    expect(await updated.json()).toEqual({ memberId: "cto", intervalMinutes: 15 });
 
     const page = await fetch(`${baseUrl}/plugins/company-os-ui/meeting-room`);
     expect(page.status).toBe(404);

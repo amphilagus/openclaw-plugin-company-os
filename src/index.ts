@@ -36,7 +36,7 @@ const ConfigSchema = Type.Object({
     enabled: Type.Optional(Type.Boolean({ default: true })),
     startHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 8 })),
     endHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 17 })),
-    intervalMinutes: Type.Optional(Type.Literal(20, { default: 20 })),
+    intervalMinutes: Type.Optional(Type.Literal(20, { default: 20, description: "Deprecated: personal intervals are level defaults or Boss per-agent overrides." })),
   }, { additionalProperties: false })),
   noticeUnreadReminders: Type.Optional(Type.Object({
     enabled: Type.Optional(Type.Boolean({ default: true })),

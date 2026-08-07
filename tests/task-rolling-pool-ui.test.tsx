@@ -13,12 +13,18 @@ describe("rolling task prompt pool Boss panel", () => {
       timeZone: "Asia/Shanghai",
       startHour: 8,
       endHour: 17,
-      intervalMinutes: 20,
-      nextTickAt: "2026-08-06T02:40:00.000Z",
+      nextDueAt: "2026-08-06T02:40:00.000Z",
       totals: { employees: 2, items: 3, execution: 1, review: 1, blockedReview: 1 },
       queues: [{
         memberId: "cto",
         memberName: "CTO",
+        level: 1,
+        defaultIntervalMinutes: 10,
+        intervalMinutes: 15,
+        intervalOverrideMinutes: 15,
+        intervalSource: "boss_override",
+        nextDueAt: "2026-08-06T02:40:00.000Z",
+        remainingWorkMinutes: 15,
         count: 2,
         head: {
           taskId: "child-b",
@@ -29,6 +35,25 @@ describe("rolling task prompt pool Boss panel", () => {
           lastPromptedAt: null,
           promptCount: 0,
         },
+        items: [{
+          taskId: "child-b",
+          parentTaskId: "task-a",
+          title: "子任务 b",
+          parentTitle: "任务 A",
+          kind: "review",
+          enqueuedAt: "2026-08-06T02:00:00.000Z",
+          lastPromptedAt: null,
+          promptCount: 0,
+        }, {
+          taskId: "child-c",
+          parentTaskId: "task-a",
+          title: "子任务 c",
+          parentTitle: "任务 A",
+          kind: "blocked_review",
+          enqueuedAt: "2026-08-06T02:05:00.000Z",
+          lastPromptedAt: null,
+          promptCount: 0,
+        }],
         lastDispatch: {
           status: "skipped_busy",
           taskId: null,
@@ -42,10 +67,13 @@ describe("rolling task prompt pool Boss panel", () => {
 
     const html = renderToStaticMarkup(<TaskRollingPoolPanel summary={summary} />);
     expect(html).toContain("任务回转提示池");
-    expect(html).toContain("08:00–17:40 · 每 20 分钟");
+    expect(html).toContain("08:00–18:00 · 个人倒计时");
     expect(html).toContain("池内事项");
     expect(html).toContain(">3<");
-    expect(html).toContain("CTO：2 项 · 池首 验收「子任务 b」");
+    expect(html).toContain("CTO：2 项 · 15 分钟 · 剩余 15 分钟 · 池首 验收「子任务 b」");
+    expect(html).toContain("Boss 覆盖 15 分钟");
+    expect(html).toContain("子任务 c");
+    expect(html).toContain("阻塞审查");
     expect(html).toContain("会话忙碌跳过");
   });
 });
