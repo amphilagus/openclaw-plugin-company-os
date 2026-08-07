@@ -276,6 +276,14 @@ export class CompanyOsService {
     return { outcome: "canceled" as const, task };
   }
 
+  async abortTaskByBoss(taskId: string, reason: string) {
+    const result = this.store.abortTaskByBoss(taskId, reason);
+    this.kickTaskDispatches();
+    await this.dispatchAdvance(result.advance);
+    const { advance: _advance, ...response } = result;
+    return response;
+  }
+
   reviewTaskCancellationRequest(taskId: string, requestId: string, decision: "accept" | "reject", feedback?: string) {
     const result = this.store.reviewTaskCancellationRequest("boss", taskId, requestId, decision, feedback);
     this.kickTaskDispatches();
@@ -511,6 +519,12 @@ export class CompanyOsService {
 
   setTaskPromptInterval(memberId: string, intervalMinutes: number | null) {
     const result = this.store.setTaskPromptInterval(memberId, intervalMinutes);
+    this.scheduleNextTaskPromptCountdown();
+    return result;
+  }
+
+  setTaskPromptWorkHours(startHour: number | null, endHour: number | null) {
+    const result = this.store.setTaskPromptWorkHours(startHour, endHour);
     this.scheduleNextTaskPromptCountdown();
     return result;
   }

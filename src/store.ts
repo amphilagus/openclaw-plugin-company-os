@@ -57,7 +57,7 @@ type Row = Record<string, any>;
 type TaskCheckinCandidate = { taskId: string; actionKind: "review" | "execute"; actionAt: string };
 type BossTaskCheckinCandidate = { taskId: string; review: boolean; anomaly: boolean };
 
-const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(["closed", "canceled"]);
+const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(["closed", "canceled", "aborted"]);
 const ACTIVE_TASK_STATUSES = new Set<TaskStatus>(["assigned", "in_progress", "review", "blocked"]);
 const OPEN_MEETING_STATUSES = new Set<MeetingStatus>(["queued", "active"]);
 export const DAILY_SELF_AUDIT_SESSION_NAME = "self-audit";
@@ -131,10 +131,10 @@ export class CompanyOsStore {
     const schemaRow = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as Row | undefined;
     const currentVersion = schemaRow ? Number(schemaRow.value) : 0;
     if (!Number.isInteger(currentVersion) || currentVersion < 0) throw new Error("company-os schema version is invalid");
-    if (currentVersion > 15) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
-    if (currentVersion === 15) return;
+    if (currentVersion > 16) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
+    if (currentVersion === 16) return;
     if (currentVersion > 0) {
-      for (let version = currentVersion; version < 15; version += 1) {
+      for (let version = currentVersion; version < 16; version += 1) {
         switch (version) {
           case 1: this.migrateSchemaV2(); break;
           case 2: this.migrateSchemaV3(); break;
@@ -150,6 +150,7 @@ export class CompanyOsStore {
           case 12: this.migrateSchemaV13(); break;
           case 13: this.migrateSchemaV14(); break;
           case 14: this.migrateSchemaV15(); break;
+          case 15: this.migrateSchemaV16(); break;
           default: throw new Error(`company-os database schema ${version} has no migration path`);
         }
       }
@@ -208,7 +209,9 @@ export class CompanyOsStore {
         started_at TEXT,
         submitted_at TEXT,
         closed_at TEXT,
-        canceled_at TEXT
+        canceled_at TEXT,
+        aborted_at TEXT,
+        aborted_reason TEXT
       );
 
       CREATE TABLE IF NOT EXISTS task_versions (
@@ -718,7 +721,7 @@ export class CompanyOsStore {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meeting ON meetings(status) WHERE status = 'active';
       `);
       this.createSchemaV15Tables();
-      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '15')").run();
+      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '16')").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1567,6 +1570,23 @@ export class CompanyOsStore {
         });
       }
       this.db.prepare("UPDATE schema_meta SET value = '15' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV16() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (!this.columnExists("tasks", "aborted_at")) {
+        this.db.exec("ALTER TABLE tasks ADD COLUMN aborted_at TEXT");
+      }
+      if (!this.columnExists("tasks", "aborted_reason")) {
+        this.db.exec("ALTER TABLE tasks ADD COLUMN aborted_reason TEXT");
+      }
+      this.db.prepare("UPDATE schema_meta SET value = '16' WHERE key = 'schema_version'").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -2619,6 +2639,20 @@ export class CompanyOsStore {
     };
   }
 
+  private taskPromptWorkHours() {
+    const startOverride = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'task_prompt_work_start_hour'").get() as Row | undefined;
+    const endOverride = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'task_prompt_work_end_hour'").get() as Row | undefined;
+    const startHour = startOverride ? Number(startOverride.value) : this.taskPromptConfig.startHour;
+    const endHour = endOverride ? Number(endOverride.value) : this.taskPromptConfig.endHour;
+    const validOverride = Number.isInteger(startHour) && Number.isInteger(endHour)
+      && startHour >= 0 && endHour <= 23 && startHour <= endHour;
+    return {
+      startHour: validOverride ? startHour : this.taskPromptConfig.startHour,
+      endHour: validOverride ? endHour : this.taskPromptConfig.endHour,
+      workHoursSource: startOverride && endOverride && validOverride ? "boss_override" as const : "config_default" as const,
+    };
+  }
+
   private reconcileTaskPromptSchedules(now = Date.now()) {
     if (!this.tableExists("task_prompt_schedules")) return;
     const createdAt = new Date(now).toISOString();
@@ -2640,8 +2674,10 @@ export class CompanyOsStore {
         continue;
       }
       if (!schedule.next_due_at && this.taskPromptConfig.enabled) {
-        const interval = this.taskPromptInterval(member.id).intervalMinutes;
-        const nextDueAt = addShanghaiWorkMinutes(now, interval, this.taskPromptConfig.startHour, this.taskPromptConfig.endHour);
+        // An empty active queue has no countdown. Its first newly eligible item is
+        // immediately due; later rotations and busy/offline skips reset the full
+        // personal interval in createTaskPromptCycleDispatch/recovery.
+        const nextDueAt = new Date(now).toISOString();
         this.db.prepare("UPDATE task_prompt_schedules SET next_due_at = ?, updated_at = ? WHERE member_id = ?")
           .run(nextDueAt, createdAt, member.id);
       }
@@ -2666,8 +2702,9 @@ export class CompanyOsStore {
         SELECT 1 AS ok FROM task_prompt_pool_items WHERE member_id = ? AND paused_at IS NULL LIMIT 1
       `).get(memberId);
       const effective = this.taskPromptInterval(memberId);
+      const workHours = this.taskPromptWorkHours();
       const nextDueAt = queue && this.taskPromptConfig.enabled
-        ? addShanghaiWorkMinutes(now, effective.intervalMinutes, this.taskPromptConfig.startHour, this.taskPromptConfig.endHour)
+        ? addShanghaiWorkMinutes(now, effective.intervalMinutes, workHours.startHour, workHours.endHour)
         : null;
       this.db.prepare("UPDATE task_prompt_schedules SET next_due_at = ? WHERE member_id = ?").run(nextDueAt, memberId);
       this.audit({
@@ -2678,6 +2715,57 @@ export class CompanyOsStore {
         after: { intervalOverrideMinutes: intervalMinutes, effectiveIntervalMinutes: effective.intervalMinutes, nextDueAt },
       });
       return { memberId, ...effective, nextDueAt };
+    });
+  }
+
+  setTaskPromptWorkHours(startHour: number | null, endHour: number | null, now = Date.now()) {
+    const restoring = startHour === null && endHour === null;
+    if (!restoring && (startHour === null || endHour === null)) {
+      throw new Error("startHour and endHour must both be integers or both be null");
+    }
+    if (!restoring && (!Number.isInteger(startHour) || !Number.isInteger(endHour)
+      || startHour! < 0 || endHour! > 23 || startHour! > endHour!)) {
+      throw new Error("work hours must be integer hours between 0 and 23 with startHour no later than endHour");
+    }
+    this.reconcileTaskPromptPool();
+    return this.transaction(() => {
+      const before = this.taskPromptWorkHours();
+      if (restoring) {
+        this.db.prepare("DELETE FROM schema_meta WHERE key IN ('task_prompt_work_start_hour', 'task_prompt_work_end_hour')").run();
+      } else {
+        this.db.prepare(`
+          INSERT INTO schema_meta (key, value) VALUES ('task_prompt_work_start_hour', ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `).run(String(startHour));
+        this.db.prepare(`
+          INSERT INTO schema_meta (key, value) VALUES ('task_prompt_work_end_hour', ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `).run(String(endHour));
+      }
+      const effective = this.taskPromptWorkHours();
+      const updatedAt = new Date(now).toISOString();
+      const schedules = this.db.prepare("SELECT member_id FROM task_prompt_schedules ORDER BY member_id").all() as Row[];
+      for (const schedule of schedules) {
+        const active = this.db.prepare(`
+          SELECT 1 AS ok FROM task_prompt_pool_items
+          WHERE member_id = ? AND paused_at IS NULL LIMIT 1
+        `).get(schedule.member_id);
+        const interval = this.taskPromptInterval(schedule.member_id).intervalMinutes;
+        const nextDueAt = active && this.taskPromptConfig.enabled
+          ? addShanghaiWorkMinutes(now, interval, effective.startHour, effective.endHour)
+          : null;
+        this.db.prepare("UPDATE task_prompt_schedules SET next_due_at = ?, updated_at = ? WHERE member_id = ?")
+          .run(nextDueAt, updatedAt, schedule.member_id);
+      }
+      this.audit({
+        actorId: "boss",
+        action: "task.prompt_work_hours_updated",
+        entityType: "task_prompt_settings",
+        entityId: "global",
+        before,
+        after: effective,
+      });
+      return effective;
     });
   }
 
@@ -2706,6 +2794,7 @@ export class CompanyOsStore {
       `).all(new Date(now).toISOString()) as Row[];
       for (const schedule of due) {
         const interval = this.taskPromptInterval(schedule.member_id).intervalMinutes;
+        const workHours = this.taskPromptWorkHours();
         const cycleId = randomUUID();
         const completedAt = new Date(now).toISOString();
         this.db.prepare(`
@@ -2719,7 +2808,7 @@ export class CompanyOsStore {
             last_error, created_at, completed_at
           ) VALUES (?, ?, ?, ?, 'skipped_offline', 0, 'Gateway was offline at the persisted due time', ?, ?)
         `).run(randomUUID(), cycleId, schedule.member_id, schedule.next_due_at, completedAt, completedAt);
-        const nextDueAt = addShanghaiWorkMinutes(now, interval, this.taskPromptConfig.startHour, this.taskPromptConfig.endHour);
+        const nextDueAt = addShanghaiWorkMinutes(now, interval, workHours.startHour, workHours.endHour);
         this.db.prepare(`
           UPDATE task_prompt_schedules SET last_due_at = ?, next_due_at = ?, updated_at = ? WHERE member_id = ?
         `).run(schedule.next_due_at, nextDueAt, completedAt, schedule.member_id);
@@ -2746,9 +2835,10 @@ export class CompanyOsStore {
       const schedule = this.db.prepare("SELECT * FROM task_prompt_schedules WHERE member_id = ?").get(memberId) as Row | undefined;
       if (!schedule?.next_due_at || Date.parse(schedule.next_due_at) > now) throw new Error("task prompt countdown is not due");
       const interval = this.taskPromptInterval(memberId).intervalMinutes;
+      const workHours = this.taskPromptWorkHours();
       const cycleId = randomUUID();
       const createdAt = new Date(now).toISOString();
-      const nextDueAt = addShanghaiWorkMinutes(now, interval, this.taskPromptConfig.startHour, this.taskPromptConfig.endHour);
+      const nextDueAt = addShanghaiWorkMinutes(now, interval, workHours.startHour, workHours.endHour);
       this.db.prepare(`
         INSERT INTO task_prompt_cycles (id, member_id, scheduled_at, interval_minutes, status, created_at)
         VALUES (?, ?, ?, ?, 'running', ?)
@@ -2878,6 +2968,7 @@ export class CompanyOsStore {
 
   taskPromptPoolSummary(now = Date.now()): TaskPromptPoolSummary {
     this.reconcileTaskPromptPool();
+    const workHours = this.taskPromptWorkHours();
     const members = this.taskPromptTickMembers();
     const items = this.db.prepare("SELECT * FROM task_prompt_pool_items ORDER BY member_id, queue_seq").all() as Row[];
     const byMember = new Map<string, Row[]>();
@@ -2917,7 +3008,7 @@ export class CompanyOsStore {
         ...interval,
         nextDueAt: schedule?.next_due_at ?? null,
         remainingWorkMinutes: schedule?.next_due_at
-          ? remainingShanghaiWorkMinutes(now, Date.parse(schedule.next_due_at), this.taskPromptConfig.startHour, this.taskPromptConfig.endHour)
+          ? remainingShanghaiWorkMinutes(now, Date.parse(schedule.next_due_at), workHours.startHour, workHours.endHour)
           : null,
         count: queue.length,
         head: activeHeadIndex >= 0 ? queueItems[activeHeadIndex] ?? null : null,
@@ -2935,8 +3026,9 @@ export class CompanyOsStore {
     return {
       enabled: this.taskPromptConfig.enabled,
       timeZone: "Asia/Shanghai",
-      startHour: this.taskPromptConfig.startHour,
-      endHour: this.taskPromptConfig.endHour,
+      startHour: workHours.startHour,
+      endHour: workHours.endHour,
+      workHoursSource: workHours.workHoursSource,
       nextDueAt: this.taskPromptConfig.enabled
         ? queues.map((queue) => queue.nextDueAt).filter(Boolean).sort()[0] ?? null
         : null,
@@ -3738,8 +3830,20 @@ export class CompanyOsStore {
       throw new Error("the parent task already has direct child tasks");
     }
     const requirement = this.taskMeetingRequirementRow(parentId);
-    if (requirement && requirement.status !== "fulfilled" && !sourceMeetingId) {
-      throw new Error("this root task must be decomposed by its required Boss-participating task meeting");
+    if (requirement && requirement.status !== "fulfilled") {
+      const lockMessage = "子任务派发已锁定：该任务勾选了“要求负责人通过任务会完成拆解（Boss 参与）”。请先发起并成功完成一次绑定本任务、Boss 参与的任务会议；会议产出分阶段任务流后才能调用 company_task_create。";
+      if (!sourceMeetingId) throw new Error(lockMessage);
+      const meeting = this.db.prepare("SELECT * FROM meetings WHERE id = ?").get(sourceMeetingId) as Row | undefined;
+      const validRequiredMeeting = meeting
+        && requirement.meeting_id === sourceMeetingId
+        && meeting.type === "task"
+        && meeting.parent_task_id === parentId
+        && meeting.host_id === parent.assignee_id
+        && Boolean(meeting.boss_participates)
+        && Boolean(meeting.boss_started_at)
+        && meeting.status === "active"
+        && Boolean(meeting.end_requested_at);
+      if (!validRequiredMeeting) throw new Error(lockMessage);
     }
     const stages = this.normalizeTaskFlowStages(actorId as string, stagesInput);
     return this.transaction(() => {
@@ -4273,6 +4377,167 @@ export class CompanyOsStore {
     return this.performTaskCancellation(actorId, before, reason);
   }
 
+  abortTaskByBoss(taskId: string, reason: string) {
+    const target = this.getTaskRow(taskId);
+    if (target.aborted_at) throw new Error("task has already been aborted");
+    const normalizedReason = required(reason, "reason");
+    const subtree = this.db.prepare(`
+      WITH RECURSIVE subtree(id, depth) AS (
+        SELECT id, 0 FROM tasks WHERE id = ?
+        UNION ALL
+        SELECT child.id, subtree.depth + 1
+        FROM tasks child JOIN subtree ON child.parent_id = subtree.id
+      )
+      SELECT task.*, subtree.depth FROM subtree JOIN tasks task ON task.id = subtree.id
+      ORDER BY subtree.depth DESC, task.created_at DESC, task.rowid DESC
+    `).all(taskId) as Row[];
+    const taskIds = subtree.map((task) => task.id as string);
+    const placeholders = taskIds.map(() => "?").join(", ");
+    const requirement = this.taskMeetingRequirementRow(taskId);
+    const draft = {
+      sourceTaskId: taskId,
+      title: target.title as string,
+      description: target.description as string,
+      acceptanceCriteria: target.acceptance_criteria as string,
+      assigneeId: this.isDirectReport("boss", target.assignee_id) ? target.assignee_id as string : "",
+      requireTaskMeeting: Boolean(requirement),
+    };
+
+    return this.transaction(() => {
+      const abortedAt = nowIso();
+      const pendingSubmissions = this.db.prepare(`
+        SELECT id, task_id FROM task_submissions
+        WHERE task_id IN (${placeholders}) AND status = 'pending'
+      `).all(...taskIds) as Row[];
+      for (const submission of pendingSubmissions) {
+        this.db.prepare(`
+          UPDATE task_submissions SET status = 'invalidated', reviewer_id = 'boss',
+            feedback = ?, reviewed_at = ? WHERE id = ?
+        `).run(`Task tree aborted by Boss: ${normalizedReason}`, abortedAt, submission.id);
+        this.db.prepare("DELETE FROM task_review_email_notifications WHERE submission_id = ? AND status != 'sent'")
+          .run(submission.id);
+      }
+
+      this.db.prepare(`
+        UPDATE task_agent_dispatches SET status = 'canceled', completed_at = ?, lease_expires_at = NULL,
+          last_error = 'task tree was aborted by Boss'
+        WHERE task_id IN (${placeholders}) AND status IN ('pending', 'running')
+      `).run(abortedAt, ...taskIds);
+      this.db.prepare(`DELETE FROM task_prompt_pool_items WHERE task_id IN (${placeholders})`).run(...taskIds);
+      this.db.prepare(`
+        UPDATE task_prompt_dispatches SET status = 'canceled', completed_at = ?,
+          last_error = 'task tree was aborted by Boss'
+        WHERE task_id IN (${placeholders}) AND status = 'running'
+      `).run(abortedAt, ...taskIds);
+      this.db.prepare(`
+        UPDATE task_checkin_dispatches SET status = 'canceled', completed_at = ?, lease_expires_at = NULL,
+          last_error = 'task tree was aborted by Boss'
+        WHERE task_id IN (${placeholders}) AND status IN ('pending', 'running')
+      `).run(abortedAt, ...taskIds);
+      this.db.prepare(`DELETE FROM task_review_email_notifications WHERE task_id IN (${placeholders}) AND status != 'sent'`)
+        .run(...taskIds);
+      this.db.prepare(`DELETE FROM boss_task_action_email_notifications WHERE task_id IN (${placeholders}) AND status != 'sent'`)
+        .run(...taskIds);
+      this.db.prepare(`
+        UPDATE task_cancel_requests SET status = 'canceled', reviewer_id = 'boss',
+          feedback = ?, reviewed_at = ?
+        WHERE task_id IN (${placeholders}) AND status = 'pending'
+      `).run(`Task tree aborted by Boss: ${normalizedReason}`, abortedAt, ...taskIds);
+
+      this.db.prepare(`
+        UPDATE task_flow_stage_tasks SET completion_required = 0
+        WHERE task_id IN (${placeholders})
+      `).run(...taskIds);
+      this.db.prepare(`
+        UPDATE task_flow_stages SET status = 'retired', retired_at = COALESCE(retired_at, ?),
+          suspended_at = NULL
+        WHERE flow_id IN (
+          SELECT id FROM task_flows WHERE parent_task_id IN (${placeholders})
+        ) AND status != 'retired'
+      `).run(abortedAt, ...taskIds);
+
+      let canceledActiveMeeting = false;
+      const meetings = this.db.prepare(`
+        SELECT * FROM meetings
+        WHERE parent_task_id IN (${placeholders}) AND status IN ('queued', 'active')
+        ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at
+      `).all(...taskIds) as Row[];
+      for (const meeting of meetings) {
+        canceledActiveMeeting ||= meeting.status === "active";
+        if (meeting.current_turn_id) {
+          this.db.prepare(`
+            UPDATE meeting_turns SET status = 'failed', completed_at = ?, error = ?
+            WHERE id = ? AND status = 'waiting'
+          `).run(abortedAt, "bound task tree was aborted by Boss", meeting.current_turn_id);
+        }
+        this.db.prepare(`
+          UPDATE meetings SET status = 'canceled', canceled_reason = ?, current_turn_id = NULL,
+            waiting_on_host_since = NULL, ended_at = ? WHERE id = ?
+        `).run(`绑定任务已中止：${normalizedReason}`, abortedAt, meeting.id);
+        this.cancelOpenHostDispatches(meeting.id);
+        this.db.prepare("DELETE FROM meeting_email_notifications WHERE meeting_id = ? AND status != 'sent'").run(meeting.id);
+        this.addMeetingMessage(meeting.id, "system", null, null, `绑定任务已由 Boss 中止，本会议同时废止：${normalizedReason}`);
+        this.audit({
+          actorId: "boss",
+          action: "meeting.aborted_with_task",
+          entityType: "meeting",
+          entityId: meeting.id,
+          reason: normalizedReason,
+          before: { status: meeting.status, parentTaskId: meeting.parent_task_id },
+          after: { status: "canceled", abortedTaskId: taskId },
+        });
+      }
+
+      for (const task of subtree) {
+        this.db.prepare(`
+          UPDATE tasks SET status = 'canceled', submitted_at = NULL, canceled_at = ?,
+            aborted_at = ?, aborted_reason = ?, updated_at = ?, last_activity_at = ?
+          WHERE id = ?
+        `).run(abortedAt, abortedAt, normalizedReason, abortedAt, abortedAt, task.id);
+        this.audit({
+          actorId: "boss",
+          action: task.id === taskId ? "task.aborted" : "task.aborted_by_ancestor",
+          entityType: "task",
+          entityId: task.id,
+          reason: normalizedReason,
+          before: mapTaskRow(task),
+          after: { status: "aborted", abortedAt, rootTaskId: taskId },
+        });
+      }
+
+      const notice = this.insertNotice({
+        actorId: "boss",
+        authorId: "boss",
+        kind: "manual",
+        title: `任务中止：${target.title}`,
+        body: [
+          `Boss 已中止任务「${target.title}」（任务 ID：${taskId}）。`,
+          `中止原因：${normalizedReason}`,
+          `本次共废止 ${taskIds.length} 项任务（含全部后代任务）；原任务流、未完成工作和待验收提交不再有效。`,
+          "任何成员不得继续执行、验收或恢复该任务树。后续如有新的任务派发，以新任务及新任务流为准。",
+        ].join("\n"),
+      });
+      this.audit({
+        actorId: "boss",
+        action: "task.abort_completed",
+        entityType: "task",
+        entityId: taskId,
+        reason: normalizedReason,
+        after: { affectedTaskIds: taskIds, invalidatedSubmissionIds: pendingSubmissions.map((item) => item.id), noticeId: notice.id },
+      });
+      this.normalizeMeetingQueue();
+      this.reconcileTaskPromptPool();
+      const advance = canceledActiveMeeting ? this.activateNextMeeting() : {};
+      return {
+        task: this.readTask("boss", taskId, false),
+        affectedTaskIds: taskIds,
+        notice,
+        draft,
+        advance,
+      };
+    });
+  }
+
   requestTaskCancellation(actorId: string, taskId: string, reason: string) {
     this.requireAgentMember(actorId);
     const task = this.getTaskRow(taskId);
@@ -4458,11 +4723,13 @@ export class CompanyOsStore {
   ) {
     if (actorId !== "boss") this.requireAgentMember(actorId);
     const task = this.getTaskRow(taskId);
+    if (task.aborted_at) throw new Error("an aborted task is permanently retired and cannot be restored or reviewed again");
     const normalizedReason = required(reason, "reason");
     const ancestors: Row[] = [];
     let parentId = task.parent_id as string | null;
     while (parentId) {
       const parent = this.getTaskRow(parentId);
+      if (parent.aborted_at) throw new Error(`task belongs to permanently aborted ancestor: ${parent.id}`);
       ancestors.push(parent);
       parentId = parent.parent_id as string | null;
     }
@@ -4778,6 +5045,8 @@ export class CompanyOsStore {
   }
 
   private taskAvailability(taskId: string, visiting = new Set<string>()): "active" | "waiting_stage" | "suspended_stage" | "retired" {
+    const task = this.db.prepare("SELECT aborted_at FROM tasks WHERE id = ?").get(taskId) as Row | undefined;
+    if (task?.aborted_at) return "retired";
     if (visiting.has(taskId)) return "suspended_stage";
     visiting.add(taskId);
     const stage = this.taskStageRow(taskId);
@@ -7917,7 +8186,7 @@ function mapTaskRow(row: Row) {
     title: row.title,
     description: row.description,
     acceptanceCriteria: row.acceptance_criteria,
-    status: row.status as TaskStatus,
+    status: (row.aborted_at ? "aborted" : row.status) as TaskStatus,
     revision: Number(row.revision),
     blockedReason: row.blocked_reason,
     blockedAt: row.blocked_at ?? null,
@@ -7929,6 +8198,8 @@ function mapTaskRow(row: Row) {
     submittedAt: row.submitted_at,
     closedAt: row.closed_at,
     canceledAt: row.canceled_at,
+    abortedAt: row.aborted_at ?? null,
+    abortedReason: row.aborted_reason ?? null,
   };
 }
 

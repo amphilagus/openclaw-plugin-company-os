@@ -5,6 +5,7 @@ export const TASK_STATUSES = [
   "blocked",
   "closed",
   "canceled",
+  "aborted",
 ] as const;
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
@@ -381,6 +382,7 @@ export type TaskPromptPoolSummary = {
   timeZone: "Asia/Shanghai";
   startHour: number;
   endHour: number;
+  workHoursSource: "config_default" | "boss_override";
   nextDueAt: string | null;
   totals: {
     employees: number;

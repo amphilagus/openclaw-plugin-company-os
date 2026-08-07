@@ -91,6 +91,69 @@ describe("organization", () => {
 });
 
 describe("hierarchical tasks", () => {
+  it("lets Boss reassign a task anywhere in the tree while preserving the issuer's direct-report review chain", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("全局重派根"), assigneeId: "cto" });
+    const child = store.createChildTask("cto", { ...taskFields("待重派子任务"), parentId: root.id, assigneeId: "eng-a" });
+
+    const reassigned = store.reassignTask("boss", child.id, "eng-b", "Boss 调整执行分工");
+    expect(reassigned).toMatchObject({ id: child.id, issuerId: "cto", assigneeId: "eng-b", status: "assigned" });
+    expect(reassigned.audit).toEqual(expect.arrayContaining([
+      expect.objectContaining({ actorId: "boss", action: "task.reassigned", reason: "Boss 调整执行分工" }),
+    ]));
+    expect(() => store.reassignTask("boss", child.id, "dev-a", "不能破坏逐级验收链")).toThrow(/direct report/);
+  });
+
+  it("lets Boss irreversibly abort an entire task tree, publishes one notice, and returns a reusable root draft", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("错误拆解的根任务"), assigneeId: "cto" });
+    const branch = store.createChildTask("cto", { ...taskFields("错误分支"), parentId: root.id, assigneeId: "eng-a" });
+    const leaf = store.createChildTask("eng-a", { ...taskFields("已提交叶子"), parentId: branch.id, assigneeId: "dev-a" });
+    store.startTask("dev-a", leaf.id);
+    store.submitTask("dev-a", leaf.id, "已完成但整棵树需要作废", PROOF, VERIFIED_GIT);
+
+    const result = store.abortTaskByBoss(root.id, "CTO 拆解方向错误，必须重新派发");
+
+    expect(result.affectedTaskIds).toEqual(expect.arrayContaining([root.id, branch.id, leaf.id]));
+    expect(result.task).toMatchObject({ id: root.id, status: "aborted", availability: "retired" });
+    expect(result.draft).toEqual({
+      sourceTaskId: root.id,
+      ...taskFields("错误拆解的根任务"),
+      assigneeId: "cto",
+      requireTaskMeeting: false,
+    });
+    for (const taskId of [root.id, branch.id, leaf.id]) {
+      expect(store.readTask("boss", taskId, false)).toMatchObject({
+        status: "aborted",
+        availability: "retired",
+        abortedReason: "CTO 拆解方向错误，必须重新派发",
+      });
+    }
+    expect(store.readTask("boss", leaf.id, false).submissions[0]).toMatchObject({ status: "invalidated" });
+    expect(store.taskPromptPoolSummary().totals.items).toBe(0);
+    expect(store.listNotices("boss")).toEqual([
+      expect.objectContaining({
+        id: result.notice.id,
+        title: "任务中止：错误拆解的根任务",
+        body: expect.stringContaining("本次共废止 3 项任务"),
+      }),
+    ]);
+    expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_cancellation_events").get()).toMatchObject({ count: 0 });
+    expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_agent_dispatches WHERE status IN ('pending', 'running')").get()).toMatchObject({ count: 0 });
+    expect(() => store.correctTaskTerminalDecision("boss", root.id, "restore_cancellation", "不能恢复")).toThrow(/permanently retired/);
+  });
+
+  it("preserves the required task-meeting flag in the draft returned after abort", () => {
+    addOrg();
+    const root = store.createRootTask({
+      ...taskFields("需重新开会的任务"),
+      assigneeId: "cto",
+      requireTaskMeeting: true,
+    });
+    const result = store.abortTaskByBoss(root.id, "重新审题后再派发");
+    expect(result.draft.requireTaskMeeting).toBe(true);
+  });
+
   it("rejects agent roots, cross-level delegation, empty proof, and cascade cancellation", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("战略目标"), assigneeId: "cto" });

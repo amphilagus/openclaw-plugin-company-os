@@ -25,7 +25,7 @@ export type Task = {
   title: string;
   description: string;
   acceptanceCriteria: string;
-  status: "assigned" | "in_progress" | "review" | "blocked" | "closed" | "canceled";
+  status: "assigned" | "in_progress" | "review" | "blocked" | "closed" | "canceled" | "aborted";
   revision: number;
   blockedReason: string | null;
   blockedAt: string | null;
@@ -36,6 +36,8 @@ export type Task = {
   createdAt: string;
   updatedAt: string;
   lastActivityAt: string;
+  abortedAt: string | null;
+  abortedReason: string | null;
   sourceMeetingId?: string | null;
   availability: "active" | "waiting_stage" | "suspended_stage" | "retired";
   flowStage: null | {
@@ -46,6 +48,15 @@ export type Task = {
     objective: string;
     status: "waiting" | "active" | "suspended" | "completed" | "retired";
   };
+};
+
+export type TaskAbortDraft = {
+  sourceTaskId: string;
+  title: string;
+  description: string;
+  acceptanceCriteria: string;
+  assigneeId: string;
+  requireTaskMeeting: boolean;
 };
 
 export type TaskAgentDispatch = {
@@ -240,6 +251,7 @@ export type TaskPromptPoolSummary = {
   timeZone: "Asia/Shanghai";
   startHour: number;
   endHour: number;
+  workHoursSource?: "config_default" | "boss_override";
   nextDueAt: string | null;
   totals: { employees: number; items: number; execution: number; review: number; blockedReview: number };
   queues: Array<{

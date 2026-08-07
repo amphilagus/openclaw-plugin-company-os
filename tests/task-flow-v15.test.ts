@@ -130,7 +130,9 @@ describe("schema v15 staged task flows", () => {
     expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_agent_dispatches WHERE task_id = ?").get(root.id)).toMatchObject({ count: 0 });
     const originalSequence = (store.db.prepare("SELECT queue_seq FROM task_prompt_pool_items WHERE task_id = ?").get(root.id) as { queue_seq: number }).queue_seq;
     expect(() => store.createTaskFlow("cto", { parentId: root.id, stages: [{ name: "绕过", objective: "不允许", tasks: [task("A", "eng-a")] }] }))
-      .toThrow(/required Boss-participating task meeting/);
+      .toThrow(/子任务派发已锁定.*要求负责人通过任务会完成拆解（Boss 参与）.*company_task_create/);
+    expect(() => store.createChildTask("cto", { parentId: root.id, ...task("旧单任务入口也不能绕过", "eng-a") }))
+      .toThrow(/子任务派发已锁定/);
 
     const tick = store.queueTaskPromptTick("2030-01-01T02:00:00.000Z");
     const prompt = store.createTaskPromptDispatch(tick.id, "cto", false);
@@ -268,6 +270,25 @@ describe("personal task prompt countdowns", () => {
 
     const restored = store.setTaskPromptInterval("cto", null, Date.parse("2026-08-08T00:06:00.000Z"));
     expect(restored).toMatchObject({ intervalOverrideMinutes: null, intervalMinutes: 10, nextDueAt: "2026-08-08T00:16:00.000Z" });
+
+    const workHours = store.setTaskPromptWorkHours(9, 16, Date.parse("2026-08-08T00:06:00.000Z"));
+    expect(workHours).toEqual({ startHour: 9, endHour: 16, workHoursSource: "boss_override" });
+    expect(store.taskPromptPoolSummary(Date.parse("2026-08-08T00:06:00.000Z"))).toMatchObject({
+      startHour: 9,
+      endHour: 16,
+      workHoursSource: "boss_override",
+      queues: expect.arrayContaining([expect.objectContaining({ memberId: "cto", intervalMinutes: 10, nextDueAt: "2026-08-08T01:10:00.000Z" })]),
+    });
+    store.close();
+    store = new CompanyOsStore({
+      databasePath: path.join(directory, "company-os.sqlite"),
+      allowedAgentIds: ["main", "cto", "eng-a", "eng-b", "dev-a"],
+      config: resolveConfig({ bossEmailNotifications: { enabled: false } }),
+    });
+    expect(store.taskPromptPoolSummary(Date.parse("2026-08-08T00:06:00.000Z")))
+      .toMatchObject({ startHour: 9, endHour: 16, workHoursSource: "boss_override" });
+    expect(store.setTaskPromptWorkHours(null, null, Date.parse("2026-08-08T00:06:00.000Z")))
+      .toEqual({ startHour: 8, endHour: 17, workHoursSource: "config_default" });
   });
 
   it("does not backfill an offline due point and records a skipped cycle before restarting a full interval", () => {

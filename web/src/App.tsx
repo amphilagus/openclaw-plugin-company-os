@@ -5,7 +5,9 @@ import { BossMeetingGate } from "./BossMeetingGate";
 import { AgentAvatar, memberIdentity, memberName, useMemberIdentities, type MemberIdentityMap } from "./member-identity";
 import { MeetingHistory } from "./MeetingHistory";
 import { SelfGovernancePage } from "./SelfGovernancePage";
-import type { MeetingDetail, MeetingSummary, Notice, Snapshot, Task, TaskDetail, TaskHourlyCheckinSummary } from "./types";
+import type { MeetingDetail, MeetingSummary, Notice, Snapshot, Task, TaskAbortDraft, TaskDetail, TaskHourlyCheckinSummary } from "./types";
+
+type TaskAbortResponse = { task: TaskDetail; affectedTaskIds: string[]; notice: Notice; draft: TaskAbortDraft };
 
 type Route = "notices" | "meeting-room" | "tasks" | "self-governance";
 
@@ -291,26 +293,33 @@ function TasksPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: 
   const [status, setStatus] = useState("all");
   const [assignee, setAssignee] = useState("all");
   const [search, setSearch] = useState("");
+  const [abortDraft, setAbortDraft] = useState<TaskAbortDraft | null>(null);
   const roots = snapshot.tasks.filter((task) => !task.parentId);
   useEffect(() => { if (selectedId) void getTask(selectedId).then(setDetail).catch((error) => window.alert(messageOf(error))); }, [selectedId, snapshot.generatedAt]);
   const visible = (task: Task) => (status === "all" || task.status === status) && (assignee === "all" || task.assigneeId === assignee) && (!search || `${task.title} ${task.description}`.toLowerCase().includes(search.toLowerCase()));
   const createRoot = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); const form = event.currentTarget; const data = new FormData(form);
     const values = Object.fromEntries(data);
-    try { const task = await post<Task>("/tasks", { ...values, requireTaskMeeting: data.get("requireTaskMeeting") === "true" }); form.reset(); await reload(true); setSelectedId(task.id); } catch (error) { window.alert(messageOf(error)); }
+    try { const task = await post<Task>("/tasks", { ...values, requireTaskMeeting: data.get("requireTaskMeeting") === "true" }); form.reset(); setAbortDraft(null); await reload(true); setSelectedId(task.id); } catch (error) { window.alert(messageOf(error)); }
+  };
+  const taskAborted = async (result: TaskAbortResponse) => {
+    setAbortDraft(result.draft);
+    setDetail(result.task);
+    await reload(true);
+    requestAnimationFrame(() => document.getElementById("task-submission-registry")?.scrollIntoView({ behavior: "smooth", block: "center" }));
   };
   return <>
     <PageHeader eyebrow="STRICT HIERARCHY · BOTTOM-UP CLOSURE" title="多级任务系统" summary="每个任务只有一名负责人。子任务全部终结后，上一级才有资格提交验收。" />
-    <TaskRollingPoolPanel summary={snapshot.taskPromptPool} reload={reload} />
-    <div className="task-toolbar panel"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索任务标题或说明" /><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="all">全部状态</option>{["assigned", "in_progress", "review", "blocked", "closed", "canceled"].map((value) => <option key={value}>{value}</option>)}</select><select value={assignee} onChange={(e) => setAssignee(e.target.value)}><option value="all">全部负责人</option>{snapshot.organization.filter((m) => m.active && m.kind === "agent").map((m) => <option value={m.id} key={m.id}>{m.name} · {m.id}</option>)}</select></div>
+    <TaskRollingPoolPanel summary={snapshot.taskPromptPool} organization={snapshot.organization} reload={reload} />
+    <div className="task-toolbar panel"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索任务标题或说明" /><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="all">全部状态</option>{["assigned", "in_progress", "review", "blocked", "closed", "canceled", "aborted"].map((value) => <option key={value}>{value}</option>)}</select><select value={assignee} onChange={(e) => setAssignee(e.target.value)}><option value="all">全部负责人</option>{snapshot.organization.filter((m) => m.active && m.kind === "agent").map((m) => <option value={m.id} key={m.id}>{m.name} · {m.id}</option>)}</select></div>
     <div className="tasks-layout">
       <section className="task-tree panel">
         <div className="panel-title">任务树 <span>{snapshot.tasks.length}</span></div>
         {roots.length ? roots.map((root) => <TaskNode key={root.id} task={root} all={snapshot.tasks} visible={visible} selectedId={selectedId} select={setSelectedId} depth={0} />) : <Empty title="还没有根任务" body="Boss 可在右侧创建第一个战略根任务。" />}
       </section>
-      <aside className="task-detail panel">{detail ? <TaskDetailView detail={detail} members={snapshot.organization.filter((m) => m.active)} reload={reload} /> : <RootTaskForm members={snapshot.organization.filter((m) => m.active && m.managerId === "boss")} submit={createRoot} />}</aside>
+      <aside className="task-detail panel">{detail ? <TaskDetailView detail={detail} reload={reload} onAborted={taskAborted} /> : <RootTaskForm key={abortDraft?.sourceTaskId ?? "blank-side"} members={snapshot.organization.filter((m) => m.active && m.managerId === "boss")} submit={createRoot} draft={abortDraft} />}</aside>
     </div>
-    <section className="new-root panel"><div><span className="eyebrow">BOSS ONLY</span><h3>创建新的战略根任务</h3><p>根任务只能派给 Boss 的一级直属员工。</p></div><RootTaskForm members={snapshot.organization.filter((m) => m.active && m.managerId === "boss")} submit={createRoot} compact /></section>
+    <section className={`new-root panel ${abortDraft ? "has-abort-draft" : ""}`} id="task-submission-registry"><div><span className="eyebrow">BOSS ONLY · TASK REGISTRY</span><h3>任务提交注册表</h3><p>{abortDraft ? `已从中止任务「${abortDraft.title}」自动填入，可直接派发或修改后派发。` : "根任务只能派给 Boss 的一级直属员工。"}</p></div><RootTaskForm key={abortDraft?.sourceTaskId ?? "blank-compact"} members={snapshot.organization.filter((m) => m.active && m.managerId === "boss")} submit={createRoot} compact draft={abortDraft} /></section>
   </>;
 }
 
@@ -338,14 +347,27 @@ export function TaskCheckinPanel({ summary }: { summary: TaskHourlyCheckinSummar
   </section>;
 }
 
-export function TaskRollingPoolPanel({ summary, reload }: { summary: Snapshot["taskPromptPool"]; reload?: (quiet?: boolean) => Promise<void> }) {
-  const busySkips = summary.queues.filter((queue) => queue.lastDispatch?.status === "skipped_busy").length;
-  const failures = summary.queues.filter((queue) => queue.lastDispatch?.status === "failed").length;
+export function TaskRollingPoolPanel({ summary, organization = [], reload }: {
+  summary: Snapshot["taskPromptPool"];
+  organization?: Snapshot["organization"];
+  reload?: (quiet?: boolean) => Promise<void>;
+}) {
+  const [clockNow, setClockNow] = useState(() => Date.now());
+  const queues = summary.queues.map((queue) => normalizeTaskPromptQueue(queue, organization));
+  const busySkips = queues.filter((queue) => queue.lastDispatch?.status === "skipped_busy").length;
+  const failures = queues.filter((queue) => queue.lastDispatch?.status === "failed").length;
+  useEffect(() => {
+    if (!summary.enabled || !summary.queues.some((queue) => queue.nextDueAt)) return;
+    setClockNow(Date.now());
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [summary.enabled, summary.queues]);
   return <section className="task-checkin-panel panel">
     <div className="task-checkin-heading">
       <div><span className="eyebrow">ROLLING TASK PROMPT POOL</span><h2>任务回转提示池</h2></div>
-      <Badge tone={summary.enabled ? "completed" : "canceled"}>{summary.enabled ? `${String(summary.startHour).padStart(2, "0")}:00–${String((summary.endHour + 1) % 24).padStart(2, "0")}:00 · 个人倒计时` : "已关闭"}</Badge>
+      <Badge tone={summary.enabled ? "completed" : "canceled"}>{summary.enabled ? `${String(summary.startHour).padStart(2, "0")}:00–${String(summary.endHour + 1).padStart(2, "0")}:00 · 个人倒计时` : "已关闭"}</Badge>
     </div>
+    {reload ? <TaskPromptWorkHoursControl summary={summary} reload={reload} /> : null}
     <div className="task-checkin-stats">
       <TaskCheckinMetric label="队列员工" value={String(summary.totals.employees)} />
       <TaskCheckinMetric label="池内事项" value={String(summary.totals.items)} />
@@ -356,14 +378,15 @@ export function TaskRollingPoolPanel({ summary, reload }: { summary: Snapshot["t
     </div>
     <div className="task-checkin-footer">
       <span>全员最近到期：{formatTime(summary.nextDueAt)}</span>
-      {summary.queues.filter((queue) => queue.count > 0).map((queue) => <span key={queue.memberId}>
-        {queue.memberName}：{queue.count} 项 · {queue.intervalMinutes ?? queue.defaultIntervalMinutes ?? 20} 分钟 · 剩余 {formatRemainingMinutes(queue.remainingWorkMinutes)} · 池首 {queue.head ? `${taskPromptKind(queue.head.kind)}「${queue.head.title}」` : "—"}
+      {queues.filter((queue) => queue.count > 0).map((queue) => <span key={queue.memberId}>
+        {queue.memberName}：{queue.count} 项 · {queue.intervalMinutes} 分钟 · 剩余 {formatRemainingMinutes(queue.remainingWorkMinutes)} · 池首 {queue.head ? `${taskPromptKind(queue.head.kind)}「${queue.head.title}」` : "—"}
         {queue.lastDispatch ? ` · 最近 ${taskPromptStatus(queue.lastDispatch.status)}` : ""}
       </span>)}
     </div>
-    {summary.queues.length ? <div className="task-prompt-queue-details">
-      {summary.queues.map((queue) => <section key={queue.memberId}>
-        <div className="task-prompt-queue-heading"><b>{queue.memberName} · FIFO 队列</b><span>层级默认 {queue.defaultIntervalMinutes ?? queue.intervalMinutes ?? 20} 分钟{queue.intervalOverrideMinutes != null ? ` · Boss 覆盖 ${queue.intervalOverrideMinutes} 分钟` : ""}</span>{reload ? <TaskPromptIntervalControl queue={queue} reload={reload} /> : null}</div>
+    {queues.length ? <div className="task-prompt-queue-details">
+      {queues.map((queue) => <section key={queue.memberId}>
+        <div className="task-prompt-queue-heading"><b>{queue.memberName} · FIFO 队列</b><span>{queue.level} 级默认 {queue.defaultIntervalMinutes} 分钟{queue.intervalOverrideMinutes != null ? ` · Boss 覆盖 ${queue.intervalOverrideMinutes} 分钟` : ""}</span>{reload ? <TaskPromptIntervalControl queue={queue} reload={reload} /> : null}</div>
+        <TaskPromptCountdown summary={summary} queue={queue} now={clockNow} />
         {queue.items.map((item, index) => <div className={`task-prompt-queue-item is-${item.kind}`} key={`${item.kind}:${item.taskId}`}>
           <span>{index + 1}</span><Badge tone={item.kind === "blocked_review" ? "blocked" : item.kind === "review" ? "review" : "in_progress"}>{taskPromptKind(item.kind)}</Badge>
           <strong>{item.title}</strong>{item.parentTitle ? <small>父任务：{item.parentTitle}</small> : null}
@@ -371,6 +394,127 @@ export function TaskRollingPoolPanel({ summary, reload }: { summary: Snapshot["t
       </section>)}
     </div> : null}
   </section>;
+}
+
+function TaskPromptWorkHoursControl({ summary, reload }: {
+  summary: Snapshot["taskPromptPool"];
+  reload: (quiet?: boolean) => Promise<void>;
+}) {
+  const [startHour, setStartHour] = useState(String(summary.startHour));
+  const [endExclusiveHour, setEndExclusiveHour] = useState(String(summary.endHour + 1));
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setStartHour(String(summary.startHour));
+    setEndExclusiveHour(String(summary.endHour + 1));
+  }, [summary.startHour, summary.endHour]);
+  const save = async (restore = false) => {
+    setSaving(true);
+    try {
+      await put("/task-prompt-settings", restore
+        ? { startHour: null, endHour: null }
+        : { startHour: Number(startHour), endHour: Number(endExclusiveHour) - 1 });
+      await reload(true);
+    } catch (error) {
+      window.alert(messageOf(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const valid = Number(startHour) >= 0 && Number(endExclusiveHour) <= 24 && Number(startHour) < Number(endExclusiveHour);
+  return <div className="task-prompt-work-hours">
+    <div><b>上班时间</b><small>北京时间 · 修改后非空队列按新窗口重新计时</small></div>
+    <label>开始<select value={startHour} disabled={saving} onChange={(event) => setStartHour(event.target.value)}>{Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label>
+    <label>结束<select value={endExclusiveHour} disabled={saving} onChange={(event) => setEndExclusiveHour(event.target.value)}>{Array.from({ length: 24 }, (_, index) => index + 1).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label>
+    <button type="button" disabled={saving || !valid} onClick={() => void save(false)}>应用时间</button>
+    <button type="button" className="ghost" disabled={saving || summary.workHoursSource !== "boss_override"} onClick={() => void save(true)}>恢复配置默认</button>
+    <Badge tone={summary.workHoursSource === "boss_override" ? "review" : "completed"}>{summary.workHoursSource === "boss_override" ? "Boss 手动设置" : "配置默认"}</Badge>
+  </div>;
+}
+
+function normalizeTaskPromptQueue(
+  queue: Snapshot["taskPromptPool"]["queues"][number],
+  organization: Snapshot["organization"],
+) {
+  const organizationLevel = inferOrganizationLevel(queue.memberId, organization);
+  const rawLevel = Number(queue.level);
+  const level = Number.isInteger(rawLevel) && rawLevel > 0
+    ? rawLevel
+    : Number.isInteger(organizationLevel) && Number(organizationLevel) > 0 ? Number(organizationLevel) : 1;
+  const rawDefault = Number(queue.defaultIntervalMinutes);
+  const defaultIntervalMinutes = Number.isInteger(rawDefault) && rawDefault > 0 ? rawDefault : level * 10;
+  const rawOverride = queue.intervalOverrideMinutes == null ? null : Number(queue.intervalOverrideMinutes);
+  const intervalOverrideMinutes = rawOverride !== null && Number.isInteger(rawOverride) && rawOverride > 0 ? rawOverride : null;
+  const rawInterval = Number(queue.intervalMinutes);
+  const intervalMinutes = Number.isInteger(rawInterval) && rawInterval > 0
+    ? rawInterval
+    : intervalOverrideMinutes ?? defaultIntervalMinutes;
+  return {
+    ...queue,
+    level,
+    defaultIntervalMinutes,
+    intervalOverrideMinutes,
+    intervalMinutes,
+    intervalSource: intervalOverrideMinutes === null ? "level_default" as const : "boss_override" as const,
+  };
+}
+
+function inferOrganizationLevel(memberId: string, organization: Snapshot["organization"]) {
+  const member = organization.find((candidate) => candidate.id === memberId);
+  if (!member) return undefined;
+  const declared = Number(member.level);
+  if (Number.isInteger(declared) && declared > 0) return declared;
+  let level = 0;
+  let current: typeof member | undefined = member;
+  const visited = new Set<string>();
+  while (current && current.kind !== "boss" && !visited.has(current.id)) {
+    visited.add(current.id);
+    level += 1;
+    current = current.managerId ? organization.find((candidate) => candidate.id === current!.managerId) : undefined;
+  }
+  return level || undefined;
+}
+
+function TaskPromptCountdown({ summary, queue, now }: {
+  summary: Snapshot["taskPromptPool"];
+  queue: Snapshot["taskPromptPool"]["queues"][number];
+  now: number;
+}) {
+  const due = queue.nextDueAt ? Date.parse(queue.nextDueAt) : null;
+  const remainingMs = due === null ? null : remainingShanghaiWorkMilliseconds(now, due, summary.startHour, summary.endHour);
+  const inWorkWindow = isShanghaiWorkTime(now, summary.startHour, summary.endHour);
+  const state = !summary.enabled
+    ? { tone: "stopped", label: "调度已关闭", value: "已停止" }
+    : queue.count === 0
+      ? { tone: "stopped", label: "队列为空", value: "已停止" }
+      : remainingMs === null
+        ? queue.head
+          ? { tone: "due", label: "等待调度器建立倒计时", value: "待调度" }
+          : { tone: "paused", label: "暂无可投递池首", value: "已暂停" }
+        : remainingMs === 0
+          ? { tone: "due", label: "已到期", value: "00:00:00" }
+          : inWorkWindow
+            ? { tone: "running", label: "倒计时进行中", value: formatCountdown(remainingMs) }
+            : { tone: "paused", label: "非工作时间暂停", value: formatCountdown(remainingMs) };
+  const progress = remainingMs === null
+    ? 0
+    : Math.max(0, Math.min(100, (1 - remainingMs / (queue.intervalMinutes * 60_000)) * 100));
+  return <div className={`task-prompt-countdown is-${state.tone}`}>
+    <div className="task-prompt-countdown-main">
+      <div><small>个人倒计时</small><strong>{state.value}</strong></div>
+      <Badge tone={state.tone}>{state.label}</Badge>
+    </div>
+    <div className="task-prompt-countdown-track" aria-label={`${queue.memberName} 倒计时进度`}><i style={{ width: `${progress}%` }} /></div>
+    <div className="task-prompt-countdown-meta">
+      <span>下次到期 <time>{formatTimeWithSeconds(queue.nextDueAt)}</time></span>
+      <span>有效周期 {queue.intervalMinutes} 分钟 · {queue.intervalSource === "boss_override" ? "Boss 覆盖" : `${queue.level} 级默认`}</span>
+      <span>当前池首 {queue.head ? `${taskPromptKind(queue.head.kind)}「${queue.head.title}」` : "—"}</span>
+    </div>
+    {queue.lastDispatch ? <div className="task-prompt-countdown-last">
+      <span>最近调度：{taskPromptStatus(queue.lastDispatch.status)}</span>
+      <time>{formatTimeWithSeconds(queue.lastDispatch.completedAt ?? queue.lastDispatch.scheduledAt)}</time>
+      {queue.lastDispatch.lastError ? <small title={queue.lastDispatch.lastError}>{queue.lastDispatch.lastError}</small> : null}
+    </div> : <div className="task-prompt-countdown-last"><span>最近调度：暂无记录</span></div>}
+  </div>;
 }
 
 function TaskPromptIntervalControl({ queue, reload }: { queue: Snapshot["taskPromptPool"]["queues"][number]; reload: (quiet?: boolean) => Promise<void> }) {
@@ -417,11 +561,20 @@ function taskSubtreeContainsVisible(task: Task, all: Task[], visible: (task: Tas
     .some((child) => taskSubtreeContainsVisible(child, all, visible));
 }
 
-export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail; members: Snapshot["organization"]; reload: (quiet?: boolean) => Promise<void> }) {
+export function TaskDetailView({ detail, reload, onAborted }: { detail: TaskDetail; reload: (quiet?: boolean) => Promise<void>; onAborted?: (result: TaskAbortResponse) => void | Promise<void> }) {
   const [reminding, setReminding] = useState(false);
   const [reviewMode, setReviewMode] = useState<"accept" | "reject" | null>(null);
   const [reviewFeedback, setReviewFeedback] = useState("");
   const [reviewing, setReviewing] = useState(false);
+  const [abortOpen, setAbortOpen] = useState(false);
+  const [abortReason, setAbortReason] = useState("");
+  const [abortBusy, setAbortBusy] = useState(false);
+  const [abortError, setAbortError] = useState<string | null>(null);
+  useEffect(() => {
+    setAbortOpen(false);
+    setAbortReason("");
+    setAbortError(null);
+  }, [detail.id]);
   const action = async (name: string, body: Record<string, unknown>) => {
     try { await post(`/tasks/${detail.id}/${name}`, body); await reload(true); } catch (error) { window.alert(messageOf(error)); }
   };
@@ -466,6 +619,22 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
     if (!reason) return;
     await action("correct", { action: actionName, reason });
   };
+  const submitAbort = async () => {
+    if (!abortReason.trim()) return;
+    setAbortBusy(true);
+    setAbortError(null);
+    try {
+      const result = await post<TaskAbortResponse>("/tasks/" + detail.id + "/abort", { reason: abortReason.trim() });
+      setAbortOpen(false);
+      setAbortReason("");
+      if (onAborted) await onAborted(result);
+      else await reload(true);
+    } catch (error) {
+      setAbortError(messageOf(error));
+    } finally {
+      setAbortBusy(false);
+    }
+  };
   const review = detail.status === "review" && detail.parentId === null;
   const remindReviewer = detail.parentId !== null && (detail.status === "review" || detail.status === "blocked");
   const canRemind = (["assigned", "in_progress"] as string[]).includes(detail.status) || remindReviewer;
@@ -495,9 +664,48 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
     {detail.reminderDispatch ? <div className={`reminder-status ${detail.reminderDispatch.status}`}><span>最近催办{detail.reminderDispatch.targetMemberId === detail.issuerId ? "审核人" : "负责人"}：{taskReminderStatus(detail.reminderDispatch.status)}</span><time>{formatTime(detail.reminderDispatch.completedAt ?? detail.reminderDispatch.startedAt ?? detail.reminderDispatch.createdAt)}</time>{detail.reminderDispatch.lastError ? <small>{detail.reminderDispatch.lastError}</small> : null}</div> : null}
     {detail.reviewNotificationDispatch ? <div className={`reminder-status review-notification ${detail.reviewNotificationDispatch.status}`}><span>最近验收通知：{taskReviewNotificationKind(detail.reviewNotificationDispatch.kind)} · {taskReminderStatus(detail.reviewNotificationDispatch.status)}</span><time>{formatTime(detail.reviewNotificationDispatch.completedAt ?? detail.reviewNotificationDispatch.startedAt ?? detail.reviewNotificationDispatch.createdAt)}</time>{detail.reviewNotificationDispatch.lastError ? <small>{detail.reviewNotificationDispatch.lastError}</small> : null}</div> : null}
     <details><summary>版本、进度与审计时间线</summary><div className="timeline">{detail.audit.map((item) => <div key={item.id}><i /><span>{formatTime(item.createdAt)}</span><b>{item.actorId}</b><code>{item.action}</code>{item.reason ? <small>{item.reason}</small> : null}</div>)}</div></details>
-    {!(["closed", "canceled"] as string[]).includes(detail.status) ? <div className="fallback-actions">{canRemind ? <button className="remind-button" disabled={reminding || reminderActive} onClick={() => void remind()}>{reminding || reminderActive ? `正在通知${remindReviewer ? "审核人" : "负责人"}…` : `催促${remindReviewer ? "审核人" : "负责人"}`}</button> : null}<button onClick={() => { const reason = window.prompt("取消原因："); if (reason) void action("cancel", { reason }); }}>带审计取消</button><button onClick={() => { const assigneeId = window.prompt(`新负责人（必须是 ${detail.issuerId} 的直属下属）：`, detail.assigneeId); const reason = assigneeId && window.prompt("重派原因："); if (assigneeId && reason) void action("reassign", { assigneeId, reason }); }}>全局重派</button></div> : null}
+    {detail.status !== "aborted" ? <>
+      <div className="fallback-actions">{canRemind ? <button className="remind-button" disabled={reminding || reminderActive} onClick={() => void remind()}>{reminding || reminderActive ? `正在通知${remindReviewer ? "审核人" : "负责人"}…` : `催促${remindReviewer ? "审核人" : "负责人"}`}</button> : null}<button className={`danger-button ${abortOpen ? "active" : ""}`} onClick={() => { setAbortOpen(true); setAbortReason(""); setAbortError(null); }}>中止任务</button></div>
+      {abortOpen ? <TaskAbortActionForm
+        reason={abortReason}
+        busy={abortBusy}
+        error={abortError}
+        changeReason={setAbortReason}
+        submit={() => void submitAbort()}
+        cancel={() => { setAbortOpen(false); setAbortError(null); }}
+      /> : null}
+    </> : <div className="task-aborted-summary"><b>该任务树已被 Boss 中止并永久退役</b><span>{detail.abortedReason}</span><time>{formatTime(detail.abortedAt)}</time></div>}
     {detail.status === "closed" ? <div className="fallback-actions"><button className="danger-button" onClick={() => void correctTerminal("revoke_acceptance")}>二次审查不通过</button></div> : null}
     {detail.status === "canceled" ? <div className="fallback-actions"><button onClick={() => void correctTerminal("restore_cancellation")}>恢复已取消任务</button></div> : null}
+  </div>;
+}
+
+export function TaskAbortActionForm({
+  reason,
+  busy,
+  error,
+  changeReason,
+  submit,
+  cancel,
+}: {
+  reason: string;
+  busy: boolean;
+  error: string | null;
+  changeReason: (value: string) => void;
+  submit: () => void;
+  cancel: () => void;
+}) {
+  const disabled = busy || !reason.trim();
+  return <div className="task-management-form is-abort">
+    <span>BOSS FORCE ABORT</span>
+    <h3>中止并废除任务树</h3>
+    <p>该操作不受子任务状态限制：选中任务及全部后代会永久退役，待验收提交失效，未发送提醒撤销，相关任务会议废止。系统只发布一条公司公告，不单独通知任何人。</p>
+    <label>中止原因（必填）<textarea rows={3} value={reason} disabled={busy} onChange={(event) => changeReason(event.target.value)} placeholder="说明为什么整棵任务树不再有效" /></label>
+    {error ? <div className="task-management-error">{error}</div> : null}
+    <div className="task-review-form-actions">
+      <button type="button" className="danger-button" disabled={disabled} onClick={submit}>{busy ? "正在中止…" : "确认中止并发布公告"}</button>
+      <button type="button" className="ghost" disabled={busy} onClick={cancel}>关闭</button>
+    </div>
   </div>;
 }
 
@@ -544,8 +752,9 @@ export function TaskReviewActions({
   </div>;
 }
 
-function RootTaskForm({ members, submit, compact = false }: { members: Snapshot["organization"]; submit: (e: FormEvent<HTMLFormElement>) => void; compact?: boolean }) {
-  return <form className={compact ? "root-form compact-form" : "root-form"} onSubmit={submit}><label>任务标题<input name="title" required placeholder="明确可验收的战略目标" /></label><label>负责人<select name="assigneeId" required><option value="">选择一级员工</option>{members.map((m) => <option value={m.id} key={m.id}>{m.name} · {m.title}</option>)}</select></label><label className="wide">任务说明<textarea name="description" rows={compact ? 2 : 5} required /></label><label className="wide">验收标准<textarea name="acceptanceCriteria" rows={compact ? 2 : 4} required /></label><label className="wide checkbox-label"><input type="checkbox" name="requireTaskMeeting" value="true" />要求负责人通过任务会完成拆解（Boss 参与）</label><button className="primary">创建根任务</button></form>;
+function RootTaskForm({ members, submit, compact = false, draft = null }: { members: Snapshot["organization"]; submit: (e: FormEvent<HTMLFormElement>) => void; compact?: boolean; draft?: TaskAbortDraft | null }) {
+  const draftAssignee = members.some((member) => member.id === draft?.assigneeId) ? draft?.assigneeId : "";
+  return <form className={compact ? "root-form compact-form" : "root-form"} onSubmit={submit}><label>任务标题<input name="title" required placeholder="明确可验收的战略目标" defaultValue={draft?.title ?? ""} /></label><label>负责人<select name="assigneeId" required defaultValue={draftAssignee}><option value="">选择一级员工</option>{members.map((m) => <option value={m.id} key={m.id}>{m.name} · {m.title}</option>)}</select></label><label className="wide">任务说明<textarea name="description" rows={compact ? 2 : 5} required defaultValue={draft?.description ?? ""} /></label><label className="wide">验收标准<textarea name="acceptanceCriteria" rows={compact ? 2 : 4} required defaultValue={draft?.acceptanceCriteria ?? ""} /></label><label className="wide checkbox-label"><input type="checkbox" name="requireTaskMeeting" value="true" defaultChecked={draft?.requireTaskMeeting ?? false} />要求负责人通过任务会完成拆解（Boss 参与）</label><button className="primary">{draft ? "重新派发根任务" : "创建根任务"}</button></form>;
 }
 
 function PageHeader({ eyebrow, title, summary, children }: { eyebrow: string; title: string; summary: string; children?: React.ReactNode }) { return <div className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{summary}</p></div><div>{children}</div></div>; }
@@ -556,12 +765,42 @@ function Empty({ title, body }: { title: string; body: string }) { return <div c
 function Loading() { return <div className="loading"><i /><span>正在载入公司运行状态…</span></div>; }
 export function routeFromPath(pathname = location.pathname): Route { const part = pathname.split("/").filter(Boolean).at(-1); return part === "notices" || part === "tasks" || part === "self-governance" ? part : "meeting-room"; }
 function formatTime(value?: string | null) { if (!value) return "—"; return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
+function formatTimeWithSeconds(value?: string | null) { if (!value) return "—"; return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(value)); }
 function formatRemainingMinutes(value?: number | null) { if (value === null || value === undefined) return "—"; return value < 1 ? "不足 1 分钟" : `${Math.ceil(value)} 分钟`; }
+function formatCountdown(milliseconds: number) {
+  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1_000));
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  return [hours, minutes, seconds].map((value) => String(value).padStart(2, "0")).join(":");
+}
+function isShanghaiWorkTime(now: number, startHour: number, endHour: number) {
+  const local = new Date(now + 8 * 60 * 60 * 1_000);
+  const hour = local.getUTCHours();
+  return hour >= startHour && hour < endHour + 1;
+}
+function remainingShanghaiWorkMilliseconds(now: number, due: number, startHour: number, endHour: number) {
+  if (due <= now) return 0;
+  const offset = 8 * 60 * 60 * 1_000;
+  let cursor = now;
+  let total = 0;
+  while (cursor < due) {
+    const local = new Date(cursor + offset);
+    const start = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), startHour) - offset;
+    const end = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), endHour + 1) - offset;
+    const from = Math.max(cursor, start);
+    const to = Math.min(due, end);
+    if (to > from) total += to - from;
+    cursor = Math.max(cursor + 1, end);
+    if (cursor < due) cursor = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + 1, startHour) - offset;
+  }
+  return total;
+}
 function shortId(id: string) { return id.slice(0, 8); }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : String(error); }
 function noticeKind(kind: Notice["kind"]) { return ({ manual: "管理公告", meeting_report: "会议汇报", correction: "更正公告" })[kind]; }
 function meetingStatus(status: MeetingSummary["status"]) { return ({ queued: "排队", active: "进行中", completed: "完成", canceled: "取消", timed_out: "超时" })[status]; }
-function taskStatus(status: Task["status"]) { return ({ assigned: "已派发", in_progress: "进行中", review: "待验收", blocked: "阻塞", closed: "已关闭", canceled: "已取消" })[status]; }
+function taskStatus(status: Task["status"]) { return ({ assigned: "已派发", in_progress: "进行中", review: "待验收", blocked: "阻塞", closed: "已关闭", canceled: "已取消", aborted: "已中止" })[status]; }
 function taskAvailability(status: Task["availability"]) { return ({ active: "可执行", waiting_stage: "等待阶段", suspended_stage: "阶段冻结", retired: "已退役" })[status]; }
 function taskFlowStageStatus(status: NonNullable<Task["flowStage"]>["status"]) { return ({ waiting: "等待", active: "进行中", suspended: "已冻结", completed: "已完成", retired: "已退役" })[status]; }
 function taskMeetingRequirementStatus(status: NonNullable<TaskDetail["taskMeetingRequirement"]>["status"]) { return ({ required: "等待轮转发起", scheduled: "会议已排队", active: "会议进行中", fulfilled: "已完成" })[status]; }

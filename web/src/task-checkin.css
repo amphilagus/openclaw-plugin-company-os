@@ -70,6 +70,34 @@
   font-style: normal;
 }
 
+.task-prompt-work-hours {
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) auto auto auto auto auto;
+  align-items: end;
+  gap: 8px;
+  margin-top: 13px;
+  padding: 10px 11px;
+  border: 1px solid #d5e2da;
+  border-radius: 9px;
+  background: #f3f8f5;
+}
+
+.task-prompt-work-hours > div,
+.task-prompt-work-hours label { display: grid; gap: 4px; }
+.task-prompt-work-hours b { font-size: 11px; }
+.task-prompt-work-hours small,
+.task-prompt-work-hours label { color: var(--muted); font-size: 9px; }
+.task-prompt-work-hours select,
+.task-prompt-work-hours button {
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  font-size: 10px;
+}
+.task-prompt-work-hours .badge { align-self: center; white-space: nowrap; }
+
 .task-prompt-queue-details {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -92,6 +120,55 @@
 .task-prompt-interval-control button { padding: 5px 7px; font-size: 10px; }
 .task-prompt-interval-control button { border: 1px solid var(--line); border-radius: 6px; background: #fff; }
 .task-prompt-empty { display: block; padding: 7px 3px; color: var(--muted); font-size: 10px; }
+
+.task-prompt-countdown {
+  display: grid;
+  gap: 8px;
+  margin: 9px 0 7px;
+  padding: 10px;
+  border: 1px solid #d9e3dd;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.task-prompt-countdown-main,
+.task-prompt-countdown-meta,
+.task-prompt-countdown-last {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.task-prompt-countdown-main > div { display: grid; gap: 2px; }
+.task-prompt-countdown-main small { color: var(--muted); font-size: 9px; }
+.task-prompt-countdown-main strong { font: 700 22px/1 var(--mono); letter-spacing: .04em; }
+.task-prompt-countdown.is-running .task-prompt-countdown-main strong { color: var(--green); }
+.task-prompt-countdown.is-paused .task-prompt-countdown-main strong { color: var(--amber); }
+.task-prompt-countdown.is-due .task-prompt-countdown-main strong { color: var(--red); }
+
+.task-prompt-countdown-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e6ebe8;
+}
+
+.task-prompt-countdown-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green);
+  transition: width 1s linear;
+}
+
+.task-prompt-countdown.is-paused .task-prompt-countdown-track i { background: var(--amber); }
+.task-prompt-countdown.is-due .task-prompt-countdown-track i { background: var(--red); }
+.task-prompt-countdown-meta { align-items: flex-start; flex-direction: column; color: var(--muted); font-size: 9px; }
+.task-prompt-countdown-meta time { color: var(--ink); font: 600 9px var(--mono); }
+.task-prompt-countdown-last { padding-top: 7px; border-top: 1px dashed var(--line); color: var(--muted); font-size: 9px; }
+.task-prompt-countdown-last time { margin-left: auto; font-family: var(--mono); }
+.task-prompt-countdown-last small { max-width: 45%; overflow: hidden; color: var(--red); text-overflow: ellipsis; white-space: nowrap; }
 
 .draft-stage { margin: 10px 12px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
 .draft-stage > p { margin: 5px 0; color: var(--muted); font-size: 11px; }
@@ -141,10 +218,13 @@
   .task-checkin-stats {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+  .task-prompt-work-hours { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .task-prompt-work-hours > div { grid-column: 1 / -1; }
 }
 
 @media (max-width: 680px) {
   .task-checkin-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+  .task-prompt-work-hours { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

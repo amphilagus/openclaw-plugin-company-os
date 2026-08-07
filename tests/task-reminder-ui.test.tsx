@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { TaskDetailView, TaskReviewActions } from "../web/src/App.js";
+import { TaskAbortActionForm, TaskDetailView, TaskReviewActions } from "../web/src/App.js";
 import type { TaskDetail } from "../web/src/types.js";
 
 const task: TaskDetail = {
@@ -37,6 +37,9 @@ describe("Boss task reminder control", () => {
     const html = renderToStaticMarkup(<TaskDetailView detail={task} members={[]} reload={vi.fn()} />);
 
     expect(html).toContain("催促负责人");
+    expect(html).toContain("中止任务");
+    expect(html).not.toContain("带审计取消");
+    expect(html).not.toContain("全局重派");
   });
 
   it("disables duplicate reminders while a delivery is pending", () => {
@@ -182,5 +185,32 @@ describe("Boss task reminder control", () => {
     expect(html).toContain("验收意见（可选）");
     expect(html).toContain("确认验收并关闭");
     expect(html).not.toContain("disabled");
+  });
+
+  it("renders the irreversible task-tree abort form without browser prompts", () => {
+    const abort = renderToStaticMarkup(<TaskAbortActionForm
+      reason="错误任务树作废"
+      busy={false}
+      error={null}
+      changeReason={vi.fn()}
+      submit={vi.fn()}
+      cancel={vi.fn()}
+    />);
+    expect(abort).toContain("中止并废除任务树");
+    expect(abort).toContain("只发布一条公司公告");
+    expect(abort).toContain("确认中止并发布公告");
+    expect(abort).not.toContain("window.prompt");
+
+    const invalid = renderToStaticMarkup(<TaskAbortActionForm
+      reason=""
+      busy={false}
+      error="task has already been aborted"
+      changeReason={vi.fn()}
+      submit={vi.fn()}
+      cancel={vi.fn()}
+    />);
+    expect(invalid).toContain("中止原因（必填）");
+    expect(invalid).toContain("task has already been aborted");
+    expect(invalid).toContain("disabled");
   });
 });

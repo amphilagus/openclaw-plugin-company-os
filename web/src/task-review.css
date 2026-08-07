@@ -32,3 +32,38 @@
   display: flex;
   gap: 8px;
 }
+
+.task-management-form {
+  display: grid;
+  gap: 11px;
+  margin-top: 10px;
+  padding: 15px;
+  border: 1px solid #d8c49e;
+  border-radius: 10px;
+  background: #fffaf1;
+}
+
+.task-management-form.is-cancel {
+  border-color: #e2aaa6;
+  background: #fff5f4;
+}
+
+.task-management-form > span {
+  color: var(--amber);
+  font: 800 10px var(--mono);
+  letter-spacing: .1em;
+}
+
+.task-management-form.is-cancel > span { color: var(--red); }
+.task-management-form h3,
+.task-management-form p { margin: 0; }
+.task-management-form h3 { font-size: 15px; }
+.task-management-form p { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.task-management-error { padding: 8px 10px; border-radius: 7px; background: #fae9e7; color: var(--red); font-size: 10px; line-height: 1.5; }
+
+.tone-aborted { background: #f6dfdc; color: #8f2e27; }
+.new-root.has-abort-draft { border-color: #dca49f; box-shadow: 0 0 0 3px #f8e9e7; }
+.task-management-form.is-abort { border-color: #e2aaa6; background: #fff8f7; }
+.task-aborted-summary { display: grid; gap: 5px; margin-top: 18px; padding: 12px; border: 1px solid #e2aaa6; border-radius: 9px; background: #fff4f3; color: var(--red); font-size: 12px; }
+.task-aborted-summary time { color: var(--muted); font-size: 10px; }
+.fallback-actions button.active { border-color: #ba8d50; background: #fff5e6; color: #805117; }

@@ -40,6 +40,16 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 201, data: store.createRootTask(body as any) };
   }
 
+  if (method === "PUT" && route === "/task-prompt-settings") {
+    const restoring = body.startHour === null && body.endHour === null;
+    const startHour = restoring ? null : Number(body.startHour);
+    const endHour = restoring ? null : Number(body.endHour);
+    return {
+      status: 200,
+      data: service.setTaskPromptWorkHours(startHour, endHour),
+    };
+  }
+
   const taskPromptSetting = route.match(/^\/task-prompt-settings\/([^/]+)$/);
   if (method === "PUT" && taskPromptSetting) {
     const intervalMinutes = body.intervalMinutes === null ? null : Number(body.intervalMinutes);
@@ -78,7 +88,7 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     };
   }
 
-  const taskAction = route.match(/^\/tasks\/([^/]+)\/(review|revise|reassign|cancel|unblock|remind|correct)$/);
+  const taskAction = route.match(/^\/tasks\/([^/]+)\/(review|revise|unblock|remind|correct|abort)$/);
   if (method === "POST" && taskAction) {
     const taskId = decodeURIComponent(taskAction[1]!);
     const action = taskAction[2]!;
@@ -91,15 +101,14 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
         data: service.correctTaskTerminalDecision("boss", taskId, body.action, body.reason, body.reviewReport),
       };
     }
+    if (action === "abort") {
+      return { status: 200, data: await service.abortTaskByBoss(taskId, body.reason) };
+    }
     const data = action === "review"
       ? service.reviewTask("boss", taskId, body.decision, body.feedback)
       : action === "revise"
         ? store.reviseTask("boss", taskId, body, body.reason)
-        : action === "reassign"
-          ? store.reassignTask("boss", taskId, body.assigneeId, body.reason)
-          : action === "cancel"
-            ? service.cancelTask("boss", taskId, body.reason)
-            : service.unblockTask("boss", taskId, body.reason);
+        : service.unblockTask("boss", taskId, body.reason);
     return { status: 200, data };
   }
 
