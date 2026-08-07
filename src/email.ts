@@ -4,7 +4,7 @@ import path from "node:path";
 
 import nodemailer, { type Transporter } from "nodemailer";
 
-import type { ResolvedCompanyOsConfig } from "./types.js";
+import type { EvidenceInput, ResolvedCompanyOsConfig } from "./types.js";
 
 export type MeetingEmailKind = "created" | "room_entered";
 
@@ -44,7 +44,38 @@ export type TaskCheckinEmailNotification = {
   anomalies: TaskCheckinEmailItem[];
 };
 
-export type BossEmailNotification = MeetingEmailNotification | TaskCheckinEmailNotification;
+export type TaskReviewEmailNotification = {
+  id: string;
+  kind: "task_review_requested";
+  taskId: string;
+  submissionId: string;
+  title: string;
+  acceptanceCriteria: string;
+  assigneeId: string;
+  assigneeName: string;
+  submittedAt: string;
+  summary: string;
+  evidence: EvidenceInput[];
+};
+
+export type BossTaskActionEmailNotification = {
+  id: string;
+  kind: "task_block_escalated" | "task_cancel_requested";
+  taskId: string;
+  title: string;
+  assigneeId: string;
+  assigneeName: string;
+  issuerId: string;
+  createdAt: string;
+  reason: string;
+  blockedReason: string | null;
+  sourceId: string;
+  requesterId?: string;
+  parentTaskId?: string | null;
+  parentTitle?: string | null;
+};
+
+export type BossEmailNotification = MeetingEmailNotification | TaskCheckinEmailNotification | TaskReviewEmailNotification | BossTaskActionEmailNotification;
 
 export type MeetingEmailSender = {
   send(notification: BossEmailNotification): Promise<void>;
@@ -97,6 +128,28 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
       });
       return;
     }
+    if (notification.kind === "task_review_requested") {
+      await transporter.sendMail({
+        from: settings.from,
+        to: settings.recipient,
+        subject: `[Company OS] 根任务待验收：${notification.title}`,
+        text: buildTaskReviewEmailText(notification),
+      });
+      return;
+    }
+    if (notification.kind === "task_block_escalated" || notification.kind === "task_cancel_requested") {
+      const block = notification.kind === "task_block_escalated";
+      await transporter.sendMail({
+        from: settings.from,
+        to: settings.recipient,
+        subject: block
+          ? `[Company OS] 根任务阻塞升级：${notification.title}`
+          : `[Company OS] blocked 任务取消申请：${notification.title}`,
+        text: buildBossTaskActionEmailText(notification),
+      });
+      return;
+    }
+    if (notification.kind !== "created" && notification.kind !== "room_entered") return;
     const entered = notification.kind === "room_entered";
     const eventTime = entered ? notification.startedAt ?? notification.createdAt : notification.createdAt;
     await transporter.sendMail({
@@ -161,6 +214,51 @@ export function buildTaskCheckinEmailText(notification: TaskCheckinEmailNotifica
     });
   }
   lines.push("", "请打开 OpenClaw 的“公司 → 任务”页面完成验收或处理异常。");
+  return lines.join("\n");
+}
+
+export function buildTaskReviewEmailText(notification: TaskReviewEmailNotification) {
+  const lines = [
+    "一级员工已提交根任务验收，请 Boss 及时审查。",
+    "",
+    `任务：${notification.title}`,
+    `任务 ID：${notification.taskId}`,
+    `负责人：${notification.assigneeName} (${notification.assigneeId})`,
+    `提交时间：${formatShanghaiTime(notification.submittedAt)}`,
+    "",
+    "验收标准：",
+    notification.acceptanceCriteria,
+    "",
+    "提交摘要：",
+    notification.summary,
+    "",
+    `证据（${notification.evidence.length}）：`,
+  ];
+  notification.evidence.forEach((item, index) => {
+    const detail = item.command ?? item.url ?? item.path ?? item.note;
+    lines.push(`${index + 1}. [${item.type}] ${item.label}${detail ? ` — ${detail}` : ""}`);
+  });
+  lines.push("", "请打开 OpenClaw 的“公司 → 任务”页面，批准或驳回该根任务。");
+  return lines.join("\n");
+}
+
+export function buildBossTaskActionEmailText(notification: BossTaskActionEmailNotification) {
+  const block = notification.kind === "task_block_escalated";
+  const lines = [
+    block ? "一级员工已将根任务阻塞向 Boss 升级。" : "员工已为 blocked 任务提交取消审批申请。",
+    "",
+    `任务：${notification.title}`,
+    `任务 ID：${notification.taskId}`,
+    `负责人：${notification.assigneeName} (${notification.assigneeId})`,
+    `时间：${formatShanghaiTime(notification.createdAt)}`,
+    `原因：${notification.reason}`,
+  ];
+  if (notification.blockedReason) lines.push(`当前阻塞：${notification.blockedReason}`);
+  if (notification.requesterId) lines.push(`申请人：${notification.requesterId}`);
+  if (notification.parentTaskId) lines.push(`来源父任务：${notification.parentTitle ?? notification.parentTaskId} (${notification.parentTaskId})`);
+  lines.push("", block
+    ? "请打开 OpenClaw 的“公司 → 任务”页面协调根任务阻塞。"
+    : "请打开 OpenClaw 的“公司 → 任务”页面批准或驳回取消申请。");
   return lines.join("\n");
 }
 

@@ -69,6 +69,12 @@ describe("Boss task reminder control", () => {
     const html = renderToStaticMarkup(<TaskDetailView detail={{ ...task, status: "closed" }} members={[]} reload={vi.fn()} />);
 
     expect(html).not.toContain("催促负责人");
+    expect(html).toContain("二次审查不通过");
+  });
+
+  it("offers exact-state restoration for canceled tasks", () => {
+    const html = renderToStaticMarkup(<TaskDetailView detail={{ ...task, status: "canceled" }} members={[]} reload={vi.fn()} />);
+    expect(html).toContain("恢复已取消任务");
   });
 
   it("shows review notification delivery and hides Boss review controls on child tasks", () => {

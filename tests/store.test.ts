@@ -46,6 +46,20 @@ function taskFields(title: string) {
   return { title, description: `${title} 说明`, acceptanceCriteria: `${title} 验收标准` };
 }
 
+function reviewAs(actorId: string, taskId: string, decision: "accept" | "reject", feedback?: string) {
+  store.readTask(actorId, taskId);
+  return store.reviewTask(actorId, taskId, decision, feedback, {
+    checks: [{
+      criterion: "验收标准",
+      outcome: decision === "accept" ? "pass" : "fail",
+      evidenceIndexes: decision === "accept" ? [0] : [],
+      finding: decision === "accept" ? "证据有效且满足标准" : "现有证据不足以满足标准",
+      ...(decision === "reject" ? { remediation: feedback ?? "补充有效证据后重新提交" } : {}),
+    }],
+    conclusion: feedback ?? (decision === "accept" ? "验收通过" : "验收不通过"),
+  });
+}
+
 function deliverAllMeetingCloseouts() {
   let advance: Record<string, unknown> = {};
   while (true) {
@@ -99,14 +113,51 @@ describe("hierarchical tasks", () => {
     expect(() => store.submitTask("cto", root.id, "too soon", PROOF)).toThrow(/child tasks/);
 
     store.submitTask("dev-a", leaf.id, "leaf complete", PROOF);
-    store.reviewTask("eng-a", leaf.id, "accept", "verified");
+    reviewAs("eng-a", leaf.id, "accept", "verified");
     store.submitTask("eng-a", branch.id, "branch complete", PROOF);
-    store.reviewTask("cto", branch.id, "accept");
+    reviewAs("cto", branch.id, "accept");
     store.submitTask("cto", root.id, "root complete", PROOF);
     store.reviewTask("boss", root.id, "accept", "company objective reached");
 
     expect(store.listTasks("boss").map((task) => task.status)).toEqual(["closed", "closed", "closed"]);
     expect(() => store.startTask("cto", root.id)).toThrow(/assigned tasks/);
+  });
+
+  it("queues one Boss email for each root-task submission but never for child submissions", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("待 Boss 验收"), assigneeId: "cto" });
+    const child = store.createChildTask("cto", { ...taskFields("下级验收"), parentId: root.id, assigneeId: "eng-a" });
+    store.startTask("cto", root.id);
+    store.startTask("eng-a", child.id);
+
+    store.submitTask("eng-a", child.id, "子任务完成", PROOF);
+    expect(store.pendingTaskReviewEmailNotifications()).toEqual([]);
+    reviewAs("cto", child.id, "accept");
+
+    store.submitTask("cto", root.id, "根任务首次提交", PROOF);
+    const first = store.pendingTaskReviewEmailNotifications();
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({
+      kind: "task_review_requested",
+      taskId: root.id,
+      title: "待 Boss 验收",
+      assigneeId: "cto",
+      assigneeName: "CTO",
+      summary: "根任务首次提交",
+      evidence: PROOF,
+    });
+    store.markTaskReviewEmailSent(first[0]!.id);
+    store.reviewTask("boss", root.id, "reject", "继续整改");
+
+    store.submitTask("cto", root.id, "根任务再次提交", [{ type: "artifact", label: "report", path: "/tmp/report.md" }]);
+    const second = store.pendingTaskReviewEmailNotifications();
+    expect(second).toHaveLength(1);
+    expect(second[0]).toMatchObject({ taskId: root.id, summary: "根任务再次提交" });
+    expect(second[0]!.submissionId).not.toBe(first[0]!.submissionId);
+    expect(store.listAudit("task", root.id).map((event) => event.action)).toEqual(expect.arrayContaining([
+      "task.review_email_queued",
+      "task.review_email_sent",
+    ]));
   });
 
   it("keeps blocked and stale as risks and permits parent review after an audited child cancellation", () => {
@@ -120,7 +171,7 @@ describe("hierarchical tasks", () => {
     expect(store.readTask("boss", root.id, false).risks.blockedDescendants).toBe(1);
     store.unblockTask("cto", blocked.id, "dependency ready");
     store.submitTask("eng-a", blocked.id, "done", PROOF);
-    store.reviewTask("cto", blocked.id, "accept");
+    reviewAs("cto", blocked.id, "accept");
     store.cancelTask("cto", canceled.id, "scope removed");
     const rootView = store.readTask("boss", root.id, false);
     expect(rootView.childCounts.canceled).toBe(1);
@@ -185,7 +236,7 @@ describe("hierarchical tasks", () => {
     store.submitTask("eng-a", child.id, "first child submission", PROOF);
 
     expect(() => store.reviewTask("boss", child.id, "accept")).toThrow(/only the task issuer/);
-    const rejected = store.reviewTask("cto", child.id, "reject", "测试证据不完整");
+    const rejected = reviewAs("cto", child.id, "reject", "测试证据不完整");
     expect(rejected).toMatchObject({
       status: "in_progress",
       reviewNotificationDispatch: {
@@ -195,7 +246,7 @@ describe("hierarchical tasks", () => {
       },
     });
     store.submitTask("eng-a", child.id, "second child submission", PROOF);
-    const accepted = store.reviewTask("cto", child.id, "accept", "证据完整");
+    const accepted = reviewAs("cto", child.id, "accept", "证据完整");
     expect(accepted).toMatchObject({
       status: "closed",
       reviewNotificationDispatch: {
@@ -812,10 +863,10 @@ describe("meeting room", () => {
 
     store.startTask("dev-a", leaf.id);
     store.submitTask("dev-a", leaf.id, "状态机测试通过", PROOF);
-    store.reviewTask("eng-a", leaf.id, "accept");
+    reviewAs("eng-a", leaf.id, "accept");
     store.startTask("eng-a", seniorTask.id);
     store.submitTask("eng-a", seniorTask.id, "任务引擎完成", PROOF);
-    store.reviewTask("cto", seniorTask.id, "accept");
+    reviewAs("cto", seniorTask.id, "accept");
     store.startTask("cto", root.id);
     store.submitTask("cto", root.id, "Company OS 已交付", PROOF);
     store.reviewTask("boss", root.id, "accept");

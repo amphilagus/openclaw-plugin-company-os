@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { buildTaskCheckinEmailText, loadSmtpSettings } from "../src/email.js";
+import { buildTaskCheckinEmailText, buildTaskReviewEmailText, loadSmtpSettings } from "../src/email.js";
 import { resolveConfig } from "../src/types.js";
 
 const temporaryDirectories: string[] = [];
@@ -87,5 +87,31 @@ describe("Boss task check-in email", () => {
     expect(text).toContain("异常根任务（1）");
     expect(text).toContain("根任务停滞、阻塞后代 1、停滞后代 2");
     expect(text).toContain("公司 → 任务");
+  });
+});
+
+describe("Boss root-task review email", () => {
+  it("renders the submitter, acceptance criteria, summary, evidence, and review action", () => {
+    const text = buildTaskReviewEmailText({
+      id: "email-1",
+      kind: "task_review_requested",
+      taskId: "task-root",
+      submissionId: "submission-1",
+      title: "上线 Company OS",
+      acceptanceCriteria: "完整构建和测试通过",
+      assigneeId: "cto",
+      assigneeName: "CTO",
+      submittedAt: "2026-08-06T06:30:00.000Z",
+      summary: "根任务已经完成",
+      evidence: [{ type: "proof", label: "tests", command: "npm test" }],
+    });
+
+    expect(text).toContain("一级员工已提交根任务验收");
+    expect(text).toContain("上线 Company OS");
+    expect(text).toContain("CTO (cto)");
+    expect(text).toContain("完整构建和测试通过");
+    expect(text).toContain("根任务已经完成");
+    expect(text).toContain("[proof] tests — npm test");
+    expect(text).toContain("批准或驳回");
   });
 });

@@ -56,12 +56,31 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 201, data: result.meeting };
   }
 
-  const taskAction = route.match(/^\/tasks\/([^/]+)\/(review|revise|reassign|cancel|unblock|remind)$/);
+  const taskCancelReview = route.match(/^\/tasks\/([^/]+)\/cancel-requests\/([^/]+)\/review$/);
+  if (method === "POST" && taskCancelReview) {
+    return {
+      status: 200,
+      data: service.reviewTaskCancellationRequest(
+        decodeURIComponent(taskCancelReview[1]!),
+        decodeURIComponent(taskCancelReview[2]!),
+        body.decision,
+        body.feedback,
+      ),
+    };
+  }
+
+  const taskAction = route.match(/^\/tasks\/([^/]+)\/(review|revise|reassign|cancel|unblock|remind|correct)$/);
   if (method === "POST" && taskAction) {
     const taskId = decodeURIComponent(taskAction[1]!);
     const action = taskAction[2]!;
     if (action === "remind") {
       return { status: 202, data: service.remindTaskByBoss(taskId) };
+    }
+    if (action === "correct") {
+      return {
+        status: 200,
+        data: service.correctTaskTerminalDecision("boss", taskId, body.action, body.reason, body.reviewReport),
+      };
     }
     const data = action === "review"
       ? service.reviewTask("boss", taskId, body.decision, body.feedback)
@@ -70,8 +89,8 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
         : action === "reassign"
           ? store.reassignTask("boss", taskId, body.assigneeId, body.reason)
           : action === "cancel"
-            ? store.cancelTask("boss", taskId, body.reason)
-            : store.unblockTask("boss", taskId, body.reason);
+            ? service.cancelTask("boss", taskId, body.reason)
+            : service.unblockTask("boss", taskId, body.reason);
     return { status: 200, data };
   }
 

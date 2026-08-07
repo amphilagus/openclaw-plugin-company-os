@@ -9,8 +9,8 @@ import { resolveConfig } from "../src/types.js";
 
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
 
-describe("task check-in service delivery", () => {
-  it("starts the next future Beijing hourly run without backfilling the current hour", async () => {
+describe("legacy task check-in delivery and rolling prompt scheduler", () => {
+  it("starts the next future Beijing 20-minute tick without creating legacy hourly runs", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-06T02:30:00.000Z")); // 10:30 in Shanghai
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-checkin-timer-"));
@@ -25,9 +25,10 @@ describe("task check-in service delivery", () => {
     try {
       await service.start();
       expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_checkin_runs").get()).toMatchObject({ count: 0 });
-      await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
-      expect(service.store.db.prepare("SELECT scheduled_at FROM task_checkin_runs").get())
-        .toMatchObject({ scheduled_at: "2026-08-06T03:00:00.000Z" });
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+      expect(service.store.db.prepare("SELECT scheduled_at FROM task_prompt_ticks").get())
+        .toMatchObject({ scheduled_at: "2026-08-06T02:40:00.000Z" });
+      expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_checkin_runs").get()).toMatchObject({ count: 0 });
     } finally {
       await service.stop();
       vi.useRealTimers();

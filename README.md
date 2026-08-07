@@ -12,7 +12,7 @@
 - 未邀请 Boss 的会议也先提交结束申请，WebUI 显示 60 秒倒计时；到期后服务原子关会，Gateway 重启不会丢失倒计时。
 - 公告不可编辑；修正通过 `supersedesNoticeId` 发布新公告。Boss 还可在 WebUI 二次确认后审计删除公告。
 - Boss 写操作由服务端固定记录为 `actor=boss`；Agent 身份只读取可信的 `toolContext.agentId`。
-- 普通任务派发与公告发布不立即唤醒 Agent；Boss 催办、逐级验收结果、分时任务巡检和公告半点提醒会进入持久调度队列。会议点名由插件同步调用 `agent:<agentId>:main`，会议工具成功后结束当前 turn，编排器持久化回写记录并用新的主持人 turn 继续会议。
+- 任务状态事件与定时工作提示彻底分离：验收结果、阻塞上下行、取消审批和终态纠错进入即时 outbox；可执行、待验收和阻塞审查事项进入每名员工自己的持久 FIFO 回转池。公告发布仍不立即唤醒 Agent。所有 Company OS main-session 调用共享会话级协调器。
 - 会议进入完成、取消或超时终态后，编排器主动唤醒主持人及全部参会 Agent，同步各自水位之后的最终记录；曾占用会议室的会议必须等全员送达后才释放下一场。
 
 ## 技术结构
@@ -20,13 +20,13 @@
 ```text
 OpenClaw Gateway
 ├── CompanyOsService（同步会议编排、持久主持人/终局队列、自动关会、恢复、超时扫描、SSE）
-├── 28 个 company_* Agent 工具
+├── 29 个 company_* Agent 工具
 ├── /plugins/company-os/api/v1/*（Gateway 鉴权，仅 API）
 ├── /plugins/company-os-ui/*（无敏感数据的 WebUI 静态壳）
 ├── Control UI 标签页「公司」（operator.write）
 └── company-os.sqlite
     ├── organization + audit
-    ├── task tree + versions + proof
+    ├── task tree + versions + proof + root-review email outbox
     ├── notices + read marks + half-past reminder runs/dispatch outbox
     ├── task check-in runs + batches + dispatch outbox
     └── meeting queue + transcript + turns + context watermarks + session append/dispatch/email/closeout outbox
@@ -115,17 +115,21 @@ Boss 可在“已派发”“进行中”或“阻塞”的任务详情点击「
 
 ### 全层级任务验收通知
 
-每项任务只能由自己的派发者验收：Boss 验收根任务，一级员工验收自己派发的二级任务，依次类推，Boss 不能越级验收子任务。批准或驳回会和任务状态变更一起写入持久调度队列，并主动通知该任务负责人。批准通知说明任务已经关闭；驳回通知包含验收意见，并要求负责人读取任务、记录整改进度后重新提交。任务详情会独立显示最近一次验收通知的发送状态。完成但没有最终文本的 Agent turn、以及驳回后已经产生的有效任务操作都视为送达；只有 `launch_failed` / `in_flight` 这类明确未注入的失败才自动重试，模糊失败与 Gateway 中断不会重复注入同一通知。
+每项任务只能由自己的派发者验收：Boss 验收根任务，一级员工验收自己派发的二级任务，依次类推，Boss 不能越级验收子任务。非 Boss 验收人必须先用 `company_task_read` 读取当前 submission，再提交结构化 `reviewReport`；批准要求所有检查项通过并引用有效证据，驳回要求至少一个失败项和明确整改方案。批准或驳回会和状态变化一起写入即时 outbox，并主动通知该任务负责人。已经确认启动注入的通知不因空回复、异常退出、超时或 Gateway 中断重放。
+
+所有 `closed` 任务都保留「二次审查不通过」。Boss 可纠正任意层级，原验收人只能纠正自己的决定；任务恢复为 `in_progress`，原 accepted submission 和验收报告永久保留，closed 祖先同步重开，处于 review 的祖先 submission 标记为 `invalidated`。`canceled` 任务可由 Boss 或原取消人恢复到取消前精确状态；存在 canceled 祖先时必须先恢复最高层已取消祖先。blocked 任务的非 Boss 取消会转为 Boss 审批申请。
+
+一级员工每次调用 `company_task_submit` 把根任务提交给 Boss 验收时，系统会在同一事务内创建一封持久化待验收邮件，并立即触发发送；普通子任务提交只通知其实际派发者，不给 Boss 发邮件。驳回后的重新提交使用新的 submission ID，因此会产生一封新的提醒。邮件失败最多重试五次，Gateway 重启后继续处理，且不会因为重复刷新而为同一次提交重复建信。
 
 邮件默认复用 `~/.config/mail-skills/.env` 的默认 SMTP 账号，并发送到该账号自身。本机已有的 QQ 邮箱配置无需复制授权码。可以通过 `bossEmailNotifications.account` 选择命名账号，或用 `recipient`、`configPath` 覆盖收件地址和配置路径。
 
-### 分时任务巡检
+### 任务回转提示池
 
-任务巡检默认每天按北京时间 08:00–17:00 每个整点启动。系统在整点冻结每位员工当轮候选清单：本人派发的待验收任务，以及本人负责的 `assigned`、`in_progress`、`blocked` 任务。每位员工每轮最多收到三个单任务提示，计划时间固定为 `:00`、`:15`、`:30`；发送前若原候选已失效，会从同一整点快照中递补，整点后新增任务进入下一轮。
+每名员工拥有一个持久 FIFO 回转池，默认在北京时间 08:00–17:40 的 `:00`、`:20`、`:40` 各取池首一项。池中包含：没有活动直接子任务的本人执行任务、本人派发且待验收的直接子任务、本人派发且 blocked 的直接子任务。根任务验收与根任务阻塞不进入 Boss 池，继续使用即时邮件。新事项只进队尾，不设优先级或每轮三个任务上限；确认 Agent run 已开始后当前项立即移到队尾，不等待回复。池中只有一项时，下个 20 分钟点仍会再次提醒尚未处理的同一事项。
 
-候选统一按等待时间排序：待验收使用提交时间，执行任务使用最后活动时间。当天尚未成功提醒的任务优先；全部轮过后按最早一次成功提醒继续轮转，避免少数老任务永久占满三个名额。每次 Agent 只处理一个任务，并被要求实际调用读取、审批、进度、阻塞或提交工具。
+每个时间点都重新读取数据库生成真实 Prompt。执行项包含状态、验收标准、最近进度和直接子任务摘要；验收项包含 submission、证据与结构化审查要求；阻塞审查项要求派发者实际选择向上阻塞父任务、带具体建议解除子任务阻塞，或创建 Boss 取消审批申请。候选失效会从池中删除并继续检查新池首。
 
-Boss 每个整点收到一封不设任务上限的汇总邮件，包含全部根任务待验收和根任务树阻塞/停滞异常；未处理事项下个整点继续提醒。邮件账号完全复用 `bossEmailNotifications`。巡检运行、候选快照和三个分时槽位都持久化到 SQLite，每条 Agent 巡检带唯一调度 ID，并且严格只调用 Agent 一次：无论正常回复、空回复、报错、超时、`in_flight` 还是 Gateway 中断，同一 dispatch 都不会重新注入；已尝试过的旧待重试记录在重启恢复时直接封存。Boss SMTP 邮件是独立通道，仍最多重试三次。Gateway 重启不补建错过的整点，但会继续处理从未启动的历史槽位。可通过 `taskHourlyCheckins.enabled/startHour/endHour` 调整开关与整点窗口，时区固定为 `Asia/Shanghai`。
+所有 main-session 调度同时检查 OpenClaw active-run registry 和内部会话保留权。先发生的调度先取得会话；即时通知会持久等待，回转池时间点若发现 `agent:<id>:main` 忙碌，或员工是当前活动会议的主持人/参会者，则记录 `skipped_busy`，池首保持不动，也没有额外冷却期。明确未启动不会轮转；确认启动后的任何结果都不会重放该时间点。Gateway 离线期间不补建错过的时间点，恢复后从下一个正常时间点继续。配置项为 `taskRollingPrompts.enabled/startHour/endHour`，`intervalMinutes` 固定为 20；旧 `taskHourlyCheckins` 仅兼容读取，旧表保留为只读历史。
 
 ### 公告半点提醒与会议公告自动已读
 
@@ -135,6 +139,14 @@ Boss 每个整点收到一封不设任务上限的汇总邮件，包含全部根
 
 任务会议必定生成的 `meeting_report`，以及选择发布公告的讨论会，会自动把主持人与全部 worker/advisor 写入该公告的 read marks；同一成员集合也用于会议终局同步。Boss 即使直接参会也不计入 Agent 阅读覆盖，未参会员工仍保持未读。未发布公告、取消或超时会议不产生自动已读；后续人工更正是新的公告版本，不继承原会议成员的 read mark。系统用 `actor=system` 的 `notice.meeting_participants_marked_read` 审计记录这次自动处理，不伪装成 Agent 主动阅读。
 
+### 每日自省治理
+
+Company OS 默认在北京时间 05:00 建立每日经验沉淀任务、06:00 建立每日人设治理任务。每轮冻结当时所有在职 Agent，按组织层级升序、同级按 Agent ID 排序，并从基础时间开始每人错开一分钟。两类任务都进入每名 Agent 固定的 `agent:<agentId>:self-audit` custom session，跨天保留治理上下文；CLI 不启用 `--deliver`，最终回复不会自动发送到聊天渠道。
+
+调度记录持久化在 `daily_agent_runs` 与 `daily_agent_dispatches`。Gateway 不补建离线期间错过的每日轮次，但会恢复已经排队且从未尝试的 dispatch；已经领取过的任务不会自动重放，避免重复编辑 workspace。不同 Agent 可以并行执行，同一 Agent 的两类治理任务严格串行。可通过 `dailySelfImprovement.enabled/hour/minute` 与 `dailyPersonaAudit.enabled/hour/minute` 调整配置，时区固定为 `Asia/Shanghai`。
+
+Boss 可从顶部导航进入“自省治理”页面，查看两个机制的下一轮时间、今日队列、失败原因及最近七个北京时间自然日的执行历史。页面只读，配置仍由 OpenClaw 插件配置文件管理。
+
 ## Agent 工具
 
 | 模块 | 工具 |
@@ -143,15 +155,15 @@ Boss 每个整点收到一封不设任务上限的汇总邮件，包含全部根
 | 组织 | `company_org_list`、`company_org_add`、`company_org_update`、`company_org_deactivate` |
 | 告示板 | `company_notice_list`、`company_notice_read`、`company_notice_publish` |
 | 会议 | `company_meeting_request`、`company_meeting_list`、`company_meeting_status`、`company_meeting_speak`、`company_meeting_delegate`、`company_meeting_set_task_drafts`、`company_meeting_end`、`company_meeting_cancel` |
-| 任务 | `company_task_list`、`company_task_read`、`company_task_create`、`company_task_start`、`company_task_progress`、`company_task_revise`、`company_task_block`、`company_task_unblock`、`company_task_submit`、`company_task_review`、`company_task_reassign`、`company_task_cancel` |
+| 任务 | `company_task_list`、`company_task_read`、`company_task_create`、`company_task_start`、`company_task_progress`、`company_task_revise`、`company_task_block`、`company_task_unblock`、`company_task_submit`、`company_task_review`、`company_task_reassign`、`company_task_cancel`、`company_task_correct` |
 
 首次启动固定建立虚拟成员 `boss`，并以 OpenClaw 默认 Agent 的真实 ID 建立组织架构师；也可通过 `organizationAdminAgentId` 显式指定。只有该架构师能修改组织，新增员工的 Agent ID 必须已经存在于 `agents.list`。
 
 ## 测试
 
-`npm test` 覆盖组织环、真实 Agent ID 迁移、非法员工、跨级派发、proof、版本、阻塞/停滞风险、Boss 持久催办、分时任务巡检轮转/递补/单次投递恢复、Boss 巡检邮件、公告半点时区/快照/聚合/过滤/跨轮去重/单次投递恢复、会议公告自动已读和更正重置、取消分支、逐层关单、统一 inbox、单会议室、同步点名、可信发言校验、审计代录、固定消息号/全局轮次、第二人称 session 回写、幂等水位推进、先回写再恢复主持人的顺序、Boss `@` FIFO、Boss 参会开始/拒绝/结束闸门、普通会议自动结束与重启恢复、全终态的逐成员终局同步、严格散会屏障、失败重试/租约恢复、Boss 真人头像、持久主持人任务恢复、QQ SMTP 配置、数据库迁移、任务会议原子回滚、超时、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
+`npm test` 覆盖组织环、真实 Agent ID 迁移、非法员工、跨级派发、proof、版本、阻塞/停滞风险、Boss 持久催办、根任务提交验收邮件及重启恢复、分时任务巡检轮转/递补/单次投递恢复、Boss 巡检邮件、公告半点时区/快照/聚合/过滤/跨轮去重/单次投递恢复、每日自省治理的时区/排序/错峰/custom session/按 Agent 并发/单次投递恢复/七天历史页面、会议公告自动已读和更正重置、取消分支、逐层关单、统一 inbox、单会议室、同步点名、可信发言校验、审计代录、固定消息号/全局轮次、第二人称 session 回写、幂等水位推进、先回写再恢复主持人的顺序、Boss `@` FIFO、Boss 参会开始/拒绝/结束闸门、普通会议自动结束与重启恢复、全终态的逐成员终局同步、严格散会屏障、失败重试/租约恢复、Boss 真人头像、持久主持人任务恢复、QQ SMTP 配置、数据库迁移、任务会议原子回滚、超时、公告更正和完整的 Boss → CTO → 高工 → 工程师演练。
 
-`npm run plugin:validate` 还会验证构建产物、清单与 28 个工具契约、长驻服务、相互隔离的 WebUI/API 路由，以及 `operator.write` Control UI 标签页。
+`npm run plugin:validate` 还会验证构建产物、清单与 29 个工具契约、长驻服务、相互隔离的 WebUI/API 路由，以及 `operator.write` Control UI 标签页。
 
 ## 来源说明
 

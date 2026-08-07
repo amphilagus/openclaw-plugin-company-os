@@ -48,6 +48,33 @@
         },
         "additionalProperties": false
       },
+      "taskRollingPrompts": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "startHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 8
+          },
+          "endHour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 17
+          },
+          "intervalMinutes": {
+            "type": "integer",
+            "enum": [20],
+            "default": 20
+          }
+        },
+        "additionalProperties": false
+      },
       "noticeUnreadReminders": {
         "type": "object",
         "properties": {
@@ -66,6 +93,50 @@
             "minimum": 0,
             "maximum": 23,
             "default": 17
+          }
+        },
+        "additionalProperties": false
+      },
+      "dailySelfImprovement": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "hour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 5
+          },
+          "minute": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 59,
+            "default": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "dailyPersonaAudit": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "hour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23,
+            "default": 6
+          },
+          "minute": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 59,
+            "default": 0
           }
         },
         "additionalProperties": false
@@ -135,7 +206,8 @@
       "company_task_submit",
       "company_task_review",
       "company_task_reassign",
-      "company_task_cancel"
+      "company_task_cancel",
+      "company_task_correct"
     ]
   }
 }

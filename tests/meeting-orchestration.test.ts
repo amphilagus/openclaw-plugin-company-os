@@ -425,7 +425,11 @@ describe("synchronous meeting orchestration", () => {
     service.store.startTask("eng-a", child.id);
     service.store.submitTask("eng-a", child.id, "child done", [{ type: "proof", label: "tests", command: "npm test" }]);
 
-    service.reviewTask("cto", child.id, "accept", "子任务证据完整");
+    service.store.readTask("cto", child.id);
+    service.reviewTask("cto", child.id, "accept", "子任务证据完整", {
+      checks: [{ criterion: "通知编排", outcome: "pass", evidenceIndexes: [0], finding: "测试证据完整" }],
+      conclusion: "子任务满足验收标准",
+    });
     await waitFor(() => expect(service.store.readTask("boss", child.id, false).reviewNotificationDispatch?.status).toBe("succeeded"));
     service.store.submitTask("cto", root.id, "root ready", [{ type: "artifact", label: "report", path: "/tmp/report.md" }]);
     service.reviewTask("boss", root.id, "reject", "根任务报告需要补充");

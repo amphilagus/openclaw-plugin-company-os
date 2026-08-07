@@ -5,15 +5,19 @@ import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
 import { resolveAgentVisualIdentity, resolveStandaloneAvatar, type AgentVisualIdentity } from "./identity.js";
 import { OpenClawSessionContextAppender, type SessionContextAppender } from "./session-context.js";
-import { CompanyOsStore, nextNoticeReminderRunAt, nextTaskCheckinRunAt } from "./store.js";
+import { CompanyOsStore, nextDailyAgentRunAt, nextNoticeReminderRunAt, nextTaskCheckinRunAt, nextTaskPromptTickAt } from "./store.js";
 import type {
   Actor,
+  DailyAgentDispatch,
+  DailyAgentKind,
+  EvidenceInput,
   MeetingAdvance,
   MeetingToolSessionIdentity,
   MeetingTurnDelivery,
   MeetingTurnDispatch,
   ResolvedCompanyOsConfig,
   ServiceEvent,
+  TaskReviewReport,
 } from "./types.js";
 
 export class CompanyOsService {
@@ -38,8 +42,16 @@ export class CompanyOsService {
   private taskCheckinFlush?: Promise<void>;
   private taskCheckinRunTimer?: NodeJS.Timeout;
   private taskCheckinDispatchTimer?: NodeJS.Timeout;
+  private taskPromptTickTimer?: NodeJS.Timeout;
+  private readonly activeTaskPromptDeliveries = new Set<Promise<void>>();
+  private readonly reservedMainSessions = new Set<string>();
   private noticeReminderFlush?: Promise<void>;
   private noticeReminderRunTimer?: NodeJS.Timeout;
+  private dailySelfImprovementRunTimer?: NodeJS.Timeout;
+  private dailyPersonaAuditRunTimer?: NodeJS.Timeout;
+  private dailyAgentDispatchTimer?: NodeJS.Timeout;
+  private readonly activeDailyAgentIds = new Set<string>();
+  private readonly activeDailyAgentDeliveries = new Set<Promise<void>>();
   private contextAppendFlush?: Promise<void>;
   private contextAppendIdleTimer?: NodeJS.Timeout;
   private readonly contextAppendIdleQueue = new Map<string, { agentId: string; sessionKey: string; sessionId: string }>();
@@ -78,8 +90,9 @@ export class CompanyOsService {
     this.store.recoverAgentDispatches();
     this.store.recoverMeetingCloseoutDispatches();
     this.store.recoverTaskDispatches();
-    this.store.recoverTaskCheckinDispatches();
+    this.store.recoverTaskPromptDispatches();
     this.store.recoverNoticeReminderDispatches();
+    this.store.recoverDailyAgentDispatches();
     this.store.recoverSessionContextAppends();
     await this.recover();
     await this.flushSessionContextAppends();
@@ -87,10 +100,12 @@ export class CompanyOsService {
     this.kickHostDispatches();
     this.kickMeetingCloseoutDispatches();
     this.kickTaskDispatches();
-    this.kickTaskCheckinDispatches();
     this.kickNoticeReminderDispatches();
-    this.scheduleNextTaskCheckinRun();
+    this.kickDailyAgentDispatches();
+    this.scheduleNextTaskPromptTick();
     this.scheduleNextNoticeReminderRun();
+    this.scheduleNextDailySelfImprovementRun();
+    this.scheduleNextDailyPersonaAuditRun();
     this.scheduleNextAutomaticEnd();
     this.scanTimer = setInterval(() => {
       void this.scanTimeouts().catch((error) => this.logger.error(`company-os timeout scan failed: ${formatError(error)}`));
@@ -106,15 +121,22 @@ export class CompanyOsService {
     if (this.closeoutRetryTimer) clearTimeout(this.closeoutRetryTimer);
     if (this.taskCheckinRunTimer) clearTimeout(this.taskCheckinRunTimer);
     if (this.taskCheckinDispatchTimer) clearTimeout(this.taskCheckinDispatchTimer);
+    if (this.taskPromptTickTimer) clearTimeout(this.taskPromptTickTimer);
     if (this.noticeReminderRunTimer) clearTimeout(this.noticeReminderRunTimer);
+    if (this.dailySelfImprovementRunTimer) clearTimeout(this.dailySelfImprovementRunTimer);
+    if (this.dailyPersonaAuditRunTimer) clearTimeout(this.dailyPersonaAuditRunTimer);
+    if (this.dailyAgentDispatchTimer) clearTimeout(this.dailyAgentDispatchTimer);
     this.lifecycleAbort.abort();
     await Promise.allSettled([
       ...(this.dispatchFlush ? [this.dispatchFlush] : []),
       ...(this.closeoutDispatchFlush ? [this.closeoutDispatchFlush] : []),
       ...(this.taskDispatchFlush ? [this.taskDispatchFlush] : []),
       ...(this.taskCheckinFlush ? [this.taskCheckinFlush] : []),
+      ...this.activeTaskPromptDeliveries,
       ...(this.noticeReminderFlush ? [this.noticeReminderFlush] : []),
+      ...(this.emailFlush ? [this.emailFlush] : []),
       ...(this.contextAppendFlush ? [this.contextAppendFlush] : []),
+      ...this.activeDailyAgentDeliveries,
       ...this.activeTurnDeliveries,
     ]);
     this.listeners.clear();
@@ -194,8 +216,69 @@ export class CompanyOsService {
     };
   }
 
-  reviewTask(actorId: Actor, taskId: string, decision: "accept" | "reject", feedback?: string) {
-    const task = this.store.reviewTask(actorId, taskId, decision, feedback);
+  reviewTask(
+    actorId: Actor,
+    taskId: string,
+    decision: "accept" | "reject",
+    feedback?: string,
+    reviewReport?: TaskReviewReport,
+  ) {
+    const task = this.store.reviewTask(actorId, taskId, decision, feedback, reviewReport);
+    this.kickTaskDispatches();
+    return task;
+  }
+
+  submitTask(actorId: string, taskId: string, summary: string, evidence: EvidenceInput[]) {
+    const task = this.store.submitTask(actorId, taskId, summary, evidence);
+    void this.flushMeetingEmails().catch((error) => {
+      this.logger.error(`company-os task review email flush failed after submission ${taskId}: ${formatError(error)}`);
+    });
+    return task;
+  }
+
+  blockTask(actorId: string, taskId: string, reason: string) {
+    const task = this.store.blockTask(actorId, taskId, reason);
+    this.kickTaskDispatches();
+    void this.flushMeetingEmails().catch((error) => {
+      this.logger.error(`company-os blocked task email flush failed for ${taskId}: ${formatError(error)}`);
+    });
+    return task;
+  }
+
+  unblockTask(actorId: Actor, taskId: string, reason: string) {
+    const task = this.store.unblockTask(actorId, taskId, reason);
+    this.kickTaskDispatches();
+    return task;
+  }
+
+  cancelTask(actorId: Actor, taskId: string, reason: string) {
+    const current = this.store.readTask(actorId, taskId, false);
+    if (actorId !== "boss" && current.status === "blocked") {
+      const request = this.store.requestTaskCancellation(actorId, taskId, reason);
+      void this.flushMeetingEmails().catch((error) => {
+        this.logger.error(`company-os cancellation request email flush failed for ${taskId}: ${formatError(error)}`);
+      });
+      return { outcome: "approval_requested" as const, request, task: this.store.readTask(actorId, taskId, false) };
+    }
+    const task = this.store.cancelTask(actorId, taskId, reason);
+    this.kickTaskDispatches();
+    return { outcome: "canceled" as const, task };
+  }
+
+  reviewTaskCancellationRequest(taskId: string, requestId: string, decision: "accept" | "reject", feedback?: string) {
+    const result = this.store.reviewTaskCancellationRequest("boss", taskId, requestId, decision, feedback);
+    this.kickTaskDispatches();
+    return result;
+  }
+
+  correctTaskTerminalDecision(
+    actorId: Actor,
+    taskId: string,
+    action: "revoke_acceptance" | "restore_cancellation",
+    reason: string,
+    reviewReport?: TaskReviewReport,
+  ) {
+    const task = this.store.correctTaskTerminalDecision(actorId, taskId, action, reason, reviewReport);
     this.kickTaskDispatches();
     return task;
   }
@@ -206,10 +289,32 @@ export class CompanyOsService {
     return run;
   }
 
+  async dispatchTaskPromptTick(scheduledAt: string | number | Date) {
+    const tick = this.store.queueTaskPromptTick(scheduledAt);
+    const deliveries = this.store.taskPromptTickMembers().map((member) => {
+      let delivery!: Promise<void>;
+      delivery = this.deliverTaskPromptTickMember(tick.id, member.id)
+        .catch((error) => this.logger.error(`company-os rolling task prompt failed for ${member.id}: ${formatError(error)}`))
+        .finally(() => this.activeTaskPromptDeliveries.delete(delivery));
+      this.activeTaskPromptDeliveries.add(delivery);
+      return delivery;
+    });
+    await Promise.allSettled(deliveries);
+    return tick;
+  }
+
   dispatchNoticeReminderRun(scheduledAt: string | number | Date) {
     const run = this.store.queueNoticeReminderRun(scheduledAt);
     this.kickNoticeReminderDispatches();
     return run;
+  }
+
+  dispatchDailySelfImprovementRun(scheduledAt: string | number | Date) {
+    return this.dispatchDailyAgentRun("daily_self_improvement", scheduledAt);
+  }
+
+  dispatchDailyPersonaAuditRun(scheduledAt: string | number | Date) {
+    return this.dispatchDailyAgentRun("daily_persona_audit", scheduledAt);
   }
 
   async delegateMeeting(
@@ -325,6 +430,59 @@ export class CompanyOsService {
     this.scheduleIdleContextAppendCheck();
   }
 
+  private mainSessionKey(agentId: string) {
+    return `agent:${agentId}:main`;
+  }
+
+  private mainSessionIsBusy(agentId: string) {
+    const sessionKey = this.mainSessionKey(agentId);
+    if (this.reservedMainSessions.has(sessionKey)) return true;
+    try {
+      return this.isSessionActive(sessionKey);
+    } catch (error) {
+      this.logger.warn(`company-os could not read active-run registry for ${sessionKey}: ${formatError(error)}`);
+      return true;
+    }
+  }
+
+  private tryReserveMainSession(agentId: string) {
+    const sessionKey = this.mainSessionKey(agentId);
+    if (this.mainSessionIsBusy(agentId)) return false;
+    this.reservedMainSessions.add(sessionKey);
+    return true;
+  }
+
+  private async reserveMainSession(agentId: string, mode: "wait" | "skip") {
+    while (!this.stopping && !this.lifecycleAbort.signal.aborted) {
+      if (this.tryReserveMainSession(agentId)) return true;
+      if (mode === "skip") return false;
+      await shortWait(100, this.lifecycleAbort.signal);
+    }
+    return false;
+  }
+
+  private releaseMainSession(agentId: string) {
+    this.reservedMainSessions.delete(this.mainSessionKey(agentId));
+  }
+
+  private async invokeMainSession(input: {
+    agentId: string;
+    prompt: string;
+    timeoutSeconds: number;
+    maxInFlightRetries?: number;
+  }) {
+    const reserved = await this.reserveMainSession(input.agentId, "wait");
+    if (!reserved) throw new Error("Company OS is stopping before the main session could be reserved");
+    try {
+      return await this.agentInvoker.invoke({
+        ...input,
+        signal: this.lifecycleAbort.signal,
+      });
+    } finally {
+      this.releaseMainSession(input.agentId);
+    }
+  }
+
   private emit(event: ServiceEvent) {
     this.eventHistory.push(event);
     if (this.eventHistory.length > 500) this.eventHistory.splice(0, this.eventHistory.length - 500);
@@ -356,8 +514,7 @@ export class CompanyOsService {
     this.kickHostDispatches();
     this.kickMeetingCloseoutDispatches();
     this.kickTaskDispatches();
-    this.kickTaskCheckinDispatches();
-    this.scheduleNextTaskCheckinDispatch();
+    this.kickDailyAgentDispatches();
     this.scheduleNextAutomaticEnd();
   }
 
@@ -405,11 +562,10 @@ export class CompanyOsService {
   private async runTurnDelivery(turn: MeetingTurnDispatch): Promise<MeetingTurnDelivery> {
     let invoked;
     try {
-      invoked = await this.agentInvoker.invoke({
+      invoked = await this.invokeMainSession({
         agentId: turn.agentId,
         prompt: turn.prompt,
         timeoutSeconds: this.config.participantTurnTimeoutSeconds,
-        signal: this.lifecycleAbort.signal,
       });
     } catch (error) {
       const message = `agent invoker crashed: ${formatError(error)}`;
@@ -463,11 +619,10 @@ export class CompanyOsService {
           instruction: dispatch.reason,
         });
         this.store.setHostDispatchContext(dispatch.id, context);
-        const result = await this.agentInvoker.invoke({
+        const result = await this.invokeMainSession({
           agentId: dispatch.targetAgentId,
           prompt: context.prompt,
           timeoutSeconds: this.config.hostIdleTimeoutSeconds,
-          signal: this.lifecycleAbort.signal,
         });
         if (result.ok || this.store.hostDispatchHasProgress(dispatch.id)) {
           this.store.completeHostDispatch(dispatch.id, context.toSequence);
@@ -519,11 +674,10 @@ export class CompanyOsService {
       const dispatch = this.store.claimNextMeetingCloseoutDispatch();
       if (!dispatch) return;
       try {
-        const result = await this.agentInvoker.invoke({
+        const result = await this.invokeMainSession({
           agentId: dispatch.runtimeAgentId,
           prompt: dispatch.prompt,
           timeoutSeconds: this.config.participantTurnTimeoutSeconds,
-          signal: this.lifecycleAbort.signal,
         });
         if (result.ok || (result.code === "empty_reply" && result.completed)) {
           const advance = this.store.completeMeetingCloseoutDispatch(dispatch.id);
@@ -556,13 +710,26 @@ export class CompanyOsService {
 
   private async flushTaskDispatches() {
     while (!this.stopping) {
+      const target = this.store.nextTaskDispatchTarget();
+      if (!target) return;
+      const reserved = await this.reserveMainSession(target.agentId, "wait");
+      if (!reserved) return;
       const dispatch = this.store.claimNextTaskDispatch();
-      if (!dispatch) return;
+      if (!dispatch) {
+        this.releaseMainSession(target.agentId);
+        continue;
+      }
+      if (dispatch.targetAgentId !== target.agentId) {
+        this.releaseMainSession(target.agentId);
+        this.store.failTaskDispatch(dispatch.id, "dispatch target changed while reserving main session", true);
+        continue;
+      }
       try {
         const result = await this.agentInvoker.invoke({
           agentId: dispatch.targetAgentId,
           prompt: dispatch.prompt,
           timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+          maxInFlightRetries: 0,
           signal: this.lifecycleAbort.signal,
         });
         if (result.ok || (result.code === "empty_reply" && result.completed) || this.store.taskDispatchHasProgress(dispatch.id)) {
@@ -578,7 +745,78 @@ export class CompanyOsService {
       } catch (error) {
         this.store.failTaskDispatch(dispatch.id, formatError(error), false);
         this.logger.error(`company-os task ${dispatch.kind} dispatch ${dispatch.id} crashed: ${formatError(error)}`);
+      } finally {
+        this.releaseMainSession(dispatch.targetAgentId);
       }
+    }
+  }
+
+  private scheduleNextTaskPromptTick() {
+    if (this.taskPromptTickTimer) clearTimeout(this.taskPromptTickTimer);
+    this.taskPromptTickTimer = undefined;
+    if (this.stopping || !this.config.taskRollingPrompts.enabled) return;
+    const scheduledAt = nextTaskPromptTickAt(
+      Date.now(),
+      this.config.taskRollingPrompts.startHour,
+      this.config.taskRollingPrompts.endHour,
+    );
+    const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
+    this.taskPromptTickTimer = setTimeout(() => {
+      this.taskPromptTickTimer = undefined;
+      this.scheduleNextTaskPromptTick();
+      void this.dispatchTaskPromptTick(scheduledAt).catch((error) => {
+        this.logger.error(`company-os rolling task prompt tick ${scheduledAt} failed: ${formatError(error)}`);
+      });
+    }, delay);
+    this.taskPromptTickTimer.unref();
+    this.logger.info(`company-os scheduled rolling task prompt tick at ${scheduledAt} (Asia/Shanghai)`);
+  }
+
+  private async deliverTaskPromptTickMember(tickId: string, memberId: string) {
+    const member = this.store.listMembers(true).find((candidate) => candidate.id === memberId);
+    if (!member?.agentId) return;
+    const activeMeeting = this.store.activeMeetingForMember(memberId);
+    if (activeMeeting) {
+      const reason = `member is participating in active meeting ${activeMeeting.id}: ${activeMeeting.title}`;
+      this.store.createTaskPromptDispatch(tickId, memberId, true, reason);
+      this.logger.info(`company-os skipped rolling task prompt for ${memberId}: ${reason}`);
+      return;
+    }
+    const reserved = await this.reserveMainSession(member.agentId, "skip");
+    if (!reserved) {
+      this.store.createTaskPromptDispatch(tickId, memberId, true);
+      this.logger.info(`company-os skipped rolling task prompt for ${memberId}: main session is busy`);
+      return;
+    }
+    let dispatch;
+    try {
+      dispatch = this.store.createTaskPromptDispatch(tickId, memberId, false);
+      if (!dispatch.claimed || dispatch.status !== "running" || !dispatch.prompt) return;
+      const result = await this.agentInvoker.invoke({
+        agentId: dispatch.targetAgentId,
+        prompt: dispatch.prompt,
+        timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+        maxInFlightRetries: 0,
+        signal: this.lifecycleAbort.signal,
+      });
+      const started = invocationConfirmedStarted(result);
+      if (started) this.store.markTaskPromptDispatchStarted(dispatch.id);
+      if (result.ok || (!result.ok && result.code === "empty_reply" && result.completed)) {
+        this.store.finishTaskPromptDispatch(dispatch.id, { status: "succeeded" });
+        this.logger.info(`company-os delivered rolling task prompt ${dispatch.id} to ${this.mainSessionKey(dispatch.targetAgentId)}`);
+      } else if (!started && result.code === "in_flight") {
+        this.store.finishTaskPromptDispatch(dispatch.id, { status: "skipped_busy", error: result.error });
+      } else {
+        this.store.finishTaskPromptDispatch(dispatch.id, { status: "failed", error: result.error });
+        this.logger.error(`company-os rolling task prompt ${dispatch.id} failed: ${result.error}`);
+      }
+    } catch (error) {
+      if (dispatch?.status === "running") {
+        this.store.finishTaskPromptDispatch(dispatch.id, { status: "failed", error: formatError(error) });
+      }
+      throw error;
+    } finally {
+      this.releaseMainSession(member.agentId);
     }
   }
 
@@ -649,12 +887,11 @@ export class CompanyOsService {
           continue;
         }
         if (!dispatch.targetAgentId || !dispatch.prompt) throw new Error("agent task check-in dispatch is incomplete");
-        const result = await this.agentInvoker.invoke({
+        const result = await this.invokeMainSession({
           agentId: dispatch.targetAgentId,
           prompt: dispatch.prompt,
           timeoutSeconds: this.config.participantTurnTimeoutSeconds,
           maxInFlightRetries: 0,
-          signal: this.lifecycleAbort.signal,
         });
         if (result.ok || (result.code === "empty_reply" && result.completed) || this.store.taskCheckinDispatchHasProgress(dispatch.id)) {
           this.store.completeTaskCheckinDispatch(dispatch.id);
@@ -741,6 +978,120 @@ export class CompanyOsService {
     }
   }
 
+  private dispatchDailyAgentRun(kind: DailyAgentKind, scheduledAt: string | number | Date) {
+    const run = this.store.queueDailyAgentRun(kind, scheduledAt);
+    this.logger.info(`company-os queued ${dailyAgentLabel(kind)} run ${run.id} for ${run.planned} agents at ${run.scheduledAt}`);
+    this.kickDailyAgentDispatches();
+    return run;
+  }
+
+  private scheduleNextDailySelfImprovementRun() {
+    if (this.dailySelfImprovementRunTimer) clearTimeout(this.dailySelfImprovementRunTimer);
+    this.dailySelfImprovementRunTimer = undefined;
+    if (this.stopping || !this.config.dailySelfImprovement.enabled) return;
+    const scheduledAt = nextDailyAgentRunAt(
+      Date.now(),
+      this.config.dailySelfImprovement.hour,
+      this.config.dailySelfImprovement.minute,
+    );
+    const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
+    this.dailySelfImprovementRunTimer = setTimeout(() => {
+      this.dailySelfImprovementRunTimer = undefined;
+      try {
+        this.dispatchDailySelfImprovementRun(scheduledAt);
+      } catch (error) {
+        this.logger.error(`company-os daily self-improvement run ${scheduledAt} failed: ${formatError(error)}`);
+      } finally {
+        this.scheduleNextDailySelfImprovementRun();
+      }
+    }, delay);
+    this.dailySelfImprovementRunTimer.unref();
+    this.logger.info(`company-os scheduled daily self-improvement run at ${scheduledAt} (Asia/Shanghai)`);
+  }
+
+  private scheduleNextDailyPersonaAuditRun() {
+    if (this.dailyPersonaAuditRunTimer) clearTimeout(this.dailyPersonaAuditRunTimer);
+    this.dailyPersonaAuditRunTimer = undefined;
+    if (this.stopping || !this.config.dailyPersonaAudit.enabled) return;
+    const scheduledAt = nextDailyAgentRunAt(
+      Date.now(),
+      this.config.dailyPersonaAudit.hour,
+      this.config.dailyPersonaAudit.minute,
+    );
+    const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
+    this.dailyPersonaAuditRunTimer = setTimeout(() => {
+      this.dailyPersonaAuditRunTimer = undefined;
+      try {
+        this.dispatchDailyPersonaAuditRun(scheduledAt);
+      } catch (error) {
+        this.logger.error(`company-os daily persona-audit run ${scheduledAt} failed: ${formatError(error)}`);
+      } finally {
+        this.scheduleNextDailyPersonaAuditRun();
+      }
+    }, delay);
+    this.dailyPersonaAuditRunTimer.unref();
+    this.logger.info(`company-os scheduled daily persona-audit run at ${scheduledAt} (Asia/Shanghai)`);
+  }
+
+  private scheduleNextDailyAgentDispatch() {
+    if (this.dailyAgentDispatchTimer) clearTimeout(this.dailyAgentDispatchTimer);
+    this.dailyAgentDispatchTimer = undefined;
+    if (this.stopping) return;
+    const scheduledAt = this.store.nextPendingDailyAgentDispatchAt(this.activeDailyAgentIds);
+    if (!scheduledAt) return;
+    const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
+    this.dailyAgentDispatchTimer = setTimeout(() => {
+      this.dailyAgentDispatchTimer = undefined;
+      this.kickDailyAgentDispatches();
+    }, delay);
+    this.dailyAgentDispatchTimer.unref();
+  }
+
+  private kickDailyAgentDispatches() {
+    if (this.stopping) return;
+    if (this.dailyAgentDispatchTimer) clearTimeout(this.dailyAgentDispatchTimer);
+    this.dailyAgentDispatchTimer = undefined;
+    while (!this.stopping) {
+      const dispatch = this.store.claimNextDailyAgentDispatch(Date.now(), this.activeDailyAgentIds);
+      if (!dispatch) break;
+      this.activeDailyAgentIds.add(dispatch.targetMemberId);
+      let delivery!: Promise<void>;
+      delivery = this.deliverDailyAgentDispatch(dispatch)
+        .catch((error) => {
+          this.store.failDailyAgentDispatch(dispatch.id, formatError(error));
+          this.logger.error(`company-os ${dailyAgentLabel(dispatch.kind)} dispatch ${dispatch.id} crashed: ${formatError(error)}`);
+        })
+        .finally(() => {
+          this.activeDailyAgentIds.delete(dispatch.targetMemberId);
+          this.activeDailyAgentDeliveries.delete(delivery);
+          if (!this.stopping) this.kickDailyAgentDispatches();
+        });
+      this.activeDailyAgentDeliveries.add(delivery);
+    }
+    this.scheduleNextDailyAgentDispatch();
+  }
+
+  private async deliverDailyAgentDispatch(dispatch: DailyAgentDispatch) {
+    const result = await this.agentInvoker.invoke({
+      agentId: dispatch.targetAgentId,
+      sessionKey: dispatch.sessionKey,
+      prompt: dispatch.prompt,
+      timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+      maxInFlightRetries: 0,
+      signal: this.lifecycleAbort.signal,
+    });
+    if (result.ok || (result.code === "empty_reply" && result.completed)) {
+      this.store.completeDailyAgentDispatch(dispatch.id);
+      if (!result.ok) {
+        this.logger.warn(`company-os accepted ${dailyAgentLabel(dispatch.kind)} dispatch ${dispatch.id} after a completed empty Agent turn: ${result.error}`);
+      }
+      this.logger.info(`company-os delivered ${dailyAgentLabel(dispatch.kind)} dispatch ${dispatch.id} to ${dispatch.sessionKey}`);
+      return;
+    }
+    this.store.failDailyAgentDispatch(dispatch.id, result.error);
+    this.logger.error(`company-os ${dailyAgentLabel(dispatch.kind)} dispatch ${dispatch.id} failed for ${dispatch.sessionKey}: ${result.error}`);
+  }
+
   private async flushMeetingEmails(): Promise<void> {
     if (this.emailFlush) {
       await this.emailFlush;
@@ -758,6 +1109,28 @@ export class CompanyOsService {
           this.logger.error(`company-os failed to send Boss meeting email ${notification.kind} for ${notification.meetingId}: ${message}`);
         }
       }
+      for (const notification of this.store.pendingTaskReviewEmailNotifications()) {
+        try {
+          await this.meetingEmailSender.send(notification);
+          this.store.markTaskReviewEmailSent(notification.id);
+          this.logger.info(`company-os sent Boss task review email for ${notification.taskId} submission ${notification.submissionId}`);
+        } catch (error) {
+          const message = formatError(error);
+          this.store.markTaskReviewEmailFailed(notification.id, message);
+          this.logger.error(`company-os failed to send Boss task review email for ${notification.taskId}: ${message}`);
+        }
+      }
+      for (const notification of this.store.pendingBossTaskActionEmailNotifications()) {
+        try {
+          await this.meetingEmailSender.send(notification);
+          this.store.markBossTaskActionEmailSent(notification.id);
+          this.logger.info(`company-os sent Boss task action email ${notification.kind} for ${notification.taskId}`);
+        } catch (error) {
+          const message = formatError(error);
+          this.store.markBossTaskActionEmailFailed(notification.id, message);
+          this.logger.error(`company-os failed to send Boss task action email ${notification.kind} for ${notification.taskId}: ${message}`);
+        }
+      }
     })();
     try {
       await this.emailFlush;
@@ -773,6 +1146,32 @@ function formatError(error: unknown) {
 
 function definitelyUndelivered(code: string) {
   return code === "launch_failed" || code === "in_flight";
+}
+
+function invocationConfirmedStarted(result: Awaited<ReturnType<AgentInvoker["invoke"]>>) {
+  if (result.ok) return true;
+  return result.code !== "launch_failed" && result.code !== "in_flight" && result.code !== "aborted";
+}
+
+function shortWait(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = setTimeout(done, milliseconds);
+    timer.unref();
+    const abort = () => {
+      clearTimeout(timer);
+      done();
+    };
+    function done() {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function dailyAgentLabel(kind: DailyAgentKind) {
+  return kind === "daily_self_improvement" ? "daily self-improvement" : "daily persona-audit";
 }
 
 function requiredIdentity(value: string, field: string) {

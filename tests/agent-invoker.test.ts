@@ -79,6 +79,26 @@ describe("OpenClaw CLI agent invoker", () => {
     expect(wait).not.toHaveBeenCalled();
   });
 
+  it("targets an explicit custom session without enabling delivery", async () => {
+    const execFile: AgentExecFile = vi.fn(async (_file, args) => {
+      expect(args).toEqual(expect.arrayContaining([
+        "--agent", "engineer",
+        "--session-key", "agent:engineer:self-audit",
+      ]));
+      expect(args).not.toContain("--deliver");
+      return { stdout: JSON.stringify({ status: "ok", payloads: [{ text: "done" }] }), stderr: "" };
+    });
+    const invoker = new OpenClawCliAgentInvoker({ execFile });
+
+    await expect(invoker.invoke({
+      agentId: "engineer",
+      sessionKey: "agent:engineer:self-audit",
+      prompt: "daily audit",
+      timeoutSeconds: 60,
+    })).resolves.toMatchObject({ ok: true, text: "done" });
+    expect(execFile).toHaveBeenCalledTimes(1);
+  });
+
   it("distinguishes empty replies from abnormal CLI exits", async () => {
     const empty = new OpenClawCliAgentInvoker({
       execFile: async () => ({ stdout: JSON.stringify({ status: "ok", payloads: [] }), stderr: "" }),

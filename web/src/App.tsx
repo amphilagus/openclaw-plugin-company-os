@@ -4,9 +4,10 @@ import { deleteNotice, getMeeting, getSnapshot, getTask, post, subscribeToChange
 import { BossMeetingGate } from "./BossMeetingGate";
 import { AgentAvatar, memberIdentity, memberName, useMemberIdentities, type MemberIdentityMap } from "./member-identity";
 import { MeetingHistory } from "./MeetingHistory";
-import type { MeetingDetail, MeetingSummary, Notice, Snapshot, Task, TaskDetail } from "./types";
+import { SelfGovernancePage } from "./SelfGovernancePage";
+import type { MeetingDetail, MeetingSummary, Notice, Snapshot, Task, TaskDetail, TaskHourlyCheckinSummary } from "./types";
 
-type Route = "notices" | "meeting-room" | "tasks";
+type Route = "notices" | "meeting-room" | "tasks" | "self-governance";
 
 export default function App() {
   const [route, setRoute] = useState<Route>(routeFromPath());
@@ -53,6 +54,7 @@ export default function App() {
         <Nav active={route === "meeting-room"} onClick={() => navigate("meeting-room")} icon="◉">会议室</Nav>
         <Nav active={route === "tasks"} onClick={() => navigate("tasks")} icon="⌘">任务</Nav>
         <Nav active={route === "notices"} onClick={() => navigate("notices")} icon="◇">告示板</Nav>
+        <Nav active={route === "self-governance"} onClick={() => navigate("self-governance")} icon="↻">自省治理</Nav>
       </nav>
       <div className={`live ${live ? "online" : ""}`}><i />{live ? "实时连接" : "重连中"}</div>
     </header>
@@ -62,6 +64,7 @@ export default function App() {
       {snapshot && route === "notices" ? <NoticesPage snapshot={snapshot} reload={load} /> : null}
       {snapshot && route === "meeting-room" ? <MeetingRoomPage snapshot={snapshot} reload={load} /> : null}
       {snapshot && route === "tasks" ? <TasksPage snapshot={snapshot} reload={load} /> : null}
+      {snapshot && route === "self-governance" ? <SelfGovernancePage snapshot={snapshot} /> : null}
     </main>
   </div>;
 }
@@ -297,7 +300,7 @@ function TasksPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: 
   };
   return <>
     <PageHeader eyebrow="STRICT HIERARCHY · BOTTOM-UP CLOSURE" title="多级任务系统" summary="每个任务只有一名负责人。子任务全部终结后，上一级才有资格提交验收。" />
-    <TaskCheckinPanel summary={snapshot.taskHourlyCheckin} />
+    <TaskRollingPoolPanel summary={snapshot.taskPromptPool} />
     <div className="task-toolbar panel"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索任务标题或说明" /><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="all">全部状态</option>{["assigned", "in_progress", "review", "blocked", "closed", "canceled"].map((value) => <option key={value}>{value}</option>)}</select><select value={assignee} onChange={(e) => setAssignee(e.target.value)}><option value="all">全部负责人</option>{snapshot.organization.filter((m) => m.active && m.kind === "agent").map((m) => <option value={m.id} key={m.id}>{m.name} · {m.id}</option>)}</select></div>
     <div className="tasks-layout">
       <section className="task-tree panel">
@@ -310,7 +313,7 @@ function TasksPage({ snapshot, reload }: { snapshot: Snapshot; reload: (quiet?: 
   </>;
 }
 
-export function TaskCheckinPanel({ summary }: { summary: Snapshot["taskHourlyCheckin"] }) {
+export function TaskCheckinPanel({ summary }: { summary: TaskHourlyCheckinSummary }) {
   const run = summary.today.latestRun;
   return <section className="task-checkin-panel panel">
     <div className="task-checkin-heading">
@@ -330,6 +333,32 @@ export function TaskCheckinPanel({ summary }: { summary: Snapshot["taskHourlyChe
       <span>下一提醒：{summary.nextDispatch ? `${formatTime(summary.nextDispatch.scheduledAt)} · ${summary.nextDispatch.targetMemberId} · ${summary.nextDispatch.title}（${taskCheckinAction(summary.nextDispatch.actionKind)}）` : "—"}</span>
       <span>Boss：待验收 {summary.boss.reviewCount} · 异常 {summary.boss.anomalyCount} · 邮件 {taskCheckinStatus(summary.boss.emailStatus)}</span>
       {summary.boss.lastError ? <em>{summary.boss.lastError}</em> : null}
+    </div>
+  </section>;
+}
+
+export function TaskRollingPoolPanel({ summary }: { summary: Snapshot["taskPromptPool"] }) {
+  const busySkips = summary.queues.filter((queue) => queue.lastDispatch?.status === "skipped_busy").length;
+  const failures = summary.queues.filter((queue) => queue.lastDispatch?.status === "failed").length;
+  return <section className="task-checkin-panel panel">
+    <div className="task-checkin-heading">
+      <div><span className="eyebrow">ROLLING TASK PROMPT POOL</span><h2>任务回转提示池</h2></div>
+      <Badge tone={summary.enabled ? "completed" : "canceled"}>{summary.enabled ? `${String(summary.startHour).padStart(2, "0")}:00–${String(summary.endHour).padStart(2, "0")}:40 · 每 20 分钟` : "已关闭"}</Badge>
+    </div>
+    <div className="task-checkin-stats">
+      <TaskCheckinMetric label="队列员工" value={String(summary.totals.employees)} />
+      <TaskCheckinMetric label="池内事项" value={String(summary.totals.items)} />
+      <TaskCheckinMetric label="执行" value={String(summary.totals.execution)} />
+      <TaskCheckinMetric label="待验收" value={String(summary.totals.review)} />
+      <TaskCheckinMetric label="阻塞审查" value={String(summary.totals.blockedReview)} />
+      <TaskCheckinMetric label="忙碌跳过 / 失败" value={`${busySkips} / ${failures}`} tone={failures ? "danger" : busySkips ? "warning" : undefined} />
+    </div>
+    <div className="task-checkin-footer">
+      <span>下一时间点：{formatTime(summary.nextTickAt)}</span>
+      {summary.queues.filter((queue) => queue.count > 0).map((queue) => <span key={queue.memberId}>
+        {queue.memberName}：{queue.count} 项 · 池首 {queue.head ? `${taskPromptKind(queue.head.kind)}「${queue.head.title}」` : "—"}
+        {queue.lastDispatch ? ` · 最近 ${taskPromptStatus(queue.lastDispatch.status)}` : ""}
+      </span>)}
     </div>
   </section>;
 }
@@ -384,6 +413,22 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
       setReviewing(false);
     }
   };
+  const reviewCancellation = async (decision: "accept" | "reject") => {
+    if (!detail.pendingCancelRequest) return;
+    const feedback = decision === "reject"
+      ? window.prompt("驳回取消申请的理由：")
+      : window.prompt("批准取消的意见（可选）：", "") ?? "";
+    if (decision === "reject" && !feedback) return;
+    try {
+      await post(`/tasks/${detail.id}/cancel-requests/${detail.pendingCancelRequest.id}/review`, { decision, feedback });
+      await reload(true);
+    } catch (error) { window.alert(messageOf(error)); }
+  };
+  const correctTerminal = async (actionName: "revoke_acceptance" | "restore_cancellation") => {
+    const reason = window.prompt(actionName === "revoke_acceptance" ? "二次审查不通过的原因和整改方向：" : "恢复取消任务的原因：");
+    if (!reason) return;
+    await action("correct", { action: actionName, reason });
+  };
   const review = detail.status === "review" && detail.parentId === null;
   const canRemind = (["assigned", "in_progress", "blocked"] as string[]).includes(detail.status);
   const reminderActive = detail.reminderDispatch?.status === "pending" || detail.reminderDispatch?.status === "running";
@@ -396,6 +441,7 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
     {detail.submissions[0] ? <DetailBlock title="最近提交"><b>{detail.submissions[0].summary}</b>{detail.submissions[0].evidence.map((item, i) => <div className="evidence" key={i}><Badge tone={item.type}>{item.type}</Badge><span>{item.label}</span><code>{item.path ?? item.url ?? item.command ?? item.note}</code></div>)}</DetailBlock> : null}
     {detail.progress.length ? <DetailBlock title="进度记录">{detail.progress.map((item) => <div className="progress-entry" key={item.id}><span>{formatTime(item.createdAt)} · {item.authorId}</span><p>{item.body}</p></div>)}</DetailBlock> : null}
     {detail.versions.length > 1 ? <DetailBlock title="版本历史">{detail.versions.map((version) => <div className="version-entry" key={version.revision}><b>v{version.revision}</b><span>{version.changedBy} · {version.reason}</span><time>{formatTime(version.createdAt)}</time></div>)}</DetailBlock> : null}
+    {detail.pendingCancelRequest ? <div className="warning"><b>等待 Boss 审批取消</b><p>{detail.pendingCancelRequest.requesterId}：{detail.pendingCancelRequest.reason}</p><div className="review-actions"><button className="danger-button" onClick={() => void reviewCancellation("accept")}>批准取消</button><button onClick={() => void reviewCancellation("reject")}>驳回申请</button></div></div> : null}
     {review ? <TaskReviewActions
       mode={reviewMode}
       feedback={reviewFeedback}
@@ -409,6 +455,8 @@ export function TaskDetailView({ detail, members, reload }: { detail: TaskDetail
     {detail.reviewNotificationDispatch ? <div className={`reminder-status review-notification ${detail.reviewNotificationDispatch.status}`}><span>最近验收通知：{taskReviewNotificationKind(detail.reviewNotificationDispatch.kind)} · {taskReminderStatus(detail.reviewNotificationDispatch.status)}</span><time>{formatTime(detail.reviewNotificationDispatch.completedAt ?? detail.reviewNotificationDispatch.startedAt ?? detail.reviewNotificationDispatch.createdAt)}</time>{detail.reviewNotificationDispatch.lastError ? <small>{detail.reviewNotificationDispatch.lastError}</small> : null}</div> : null}
     <details><summary>版本、进度与审计时间线</summary><div className="timeline">{detail.audit.map((item) => <div key={item.id}><i /><span>{formatTime(item.createdAt)}</span><b>{item.actorId}</b><code>{item.action}</code>{item.reason ? <small>{item.reason}</small> : null}</div>)}</div></details>
     {!(["closed", "canceled"] as string[]).includes(detail.status) ? <div className="fallback-actions">{canRemind ? <button className="remind-button" disabled={reminding || reminderActive} onClick={() => void remind()}>{reminding || reminderActive ? "正在通知负责人…" : "催促负责人"}</button> : null}<button onClick={() => { const reason = window.prompt("取消原因："); if (reason) void action("cancel", { reason }); }}>带审计取消</button><button onClick={() => { const assigneeId = window.prompt(`新负责人（必须是 ${detail.issuerId} 的直属下属）：`, detail.assigneeId); const reason = assigneeId && window.prompt("重派原因："); if (assigneeId && reason) void action("reassign", { assigneeId, reason }); }}>全局重派</button></div> : null}
+    {detail.status === "closed" ? <div className="fallback-actions"><button className="danger-button" onClick={() => void correctTerminal("revoke_acceptance")}>二次审查不通过</button></div> : null}
+    {detail.status === "canceled" ? <div className="fallback-actions"><button onClick={() => void correctTerminal("restore_cancellation")}>恢复已取消任务</button></div> : null}
   </div>;
 }
 
@@ -465,7 +513,7 @@ function Person({ id, role, identities, fallbackName }: { id: string; role: stri
 function DetailBlock({ title, children }: { title: string; children: React.ReactNode }) { return <section className="detail-block"><h3>{title}</h3><div>{children}</div></section>; }
 function Empty({ title, body }: { title: string; body: string }) { return <div className="empty"><span>◎</span><h2>{title}</h2><p>{body}</p></div>; }
 function Loading() { return <div className="loading"><i /><span>正在载入公司运行状态…</span></div>; }
-function routeFromPath(): Route { const part = location.pathname.split("/").filter(Boolean).at(-1); return part === "notices" || part === "tasks" ? part : "meeting-room"; }
+export function routeFromPath(pathname = location.pathname): Route { const part = pathname.split("/").filter(Boolean).at(-1); return part === "notices" || part === "tasks" || part === "self-governance" ? part : "meeting-room"; }
 function formatTime(value?: string | null) { if (!value) return "—"; return new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
 function shortId(id: string) { return id.slice(0, 8); }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : String(error); }
@@ -473,7 +521,9 @@ function noticeKind(kind: Notice["kind"]) { return ({ manual: "管理公告", me
 function meetingStatus(status: MeetingSummary["status"]) { return ({ queued: "排队", active: "进行中", completed: "完成", canceled: "取消", timed_out: "超时" })[status]; }
 function taskStatus(status: Task["status"]) { return ({ assigned: "已派发", in_progress: "进行中", review: "待验收", blocked: "阻塞", closed: "已关闭", canceled: "已取消" })[status]; }
 function taskReminderStatus(status: NonNullable<TaskDetail["reminderDispatch"]>["status"]) { return ({ pending: "等待发送", running: "正在通知负责人", succeeded: "已送达", failed: "发送失败", canceled: "已取消" })[status]; }
-function taskReviewNotificationKind(kind: NonNullable<TaskDetail["reviewNotificationDispatch"]>["kind"]) { return ({ boss_reminder: "催办", review_accepted: "验收通过", review_rejected: "验收驳回" })[kind]; }
-function taskCheckinStatus(status: Snapshot["taskHourlyCheckin"]["boss"]["emailStatus"]) { return status ? ({ pending: "等待发送", running: "发送中", succeeded: "已送达", failed: "失败", skipped: "已跳过", canceled: "已取消" })[status] : "无待办"; }
+function taskReviewNotificationKind(kind: NonNullable<TaskDetail["reviewNotificationDispatch"]>["kind"]) { return ({ boss_reminder: "催办", review_accepted: "验收通过", review_rejected: "验收驳回", block_escalated: "阻塞上报", block_guidance: "阻塞建议", cancel_request_accepted: "取消获批", cancel_request_rejected: "取消被驳回", acceptance_revoked: "二次审查不通过", cancellation_restored: "取消恢复" })[kind]; }
+function taskPromptKind(kind: "execution" | "review" | "blocked_review") { return ({ execution: "执行", review: "验收", blocked_review: "阻塞审查" })[kind]; }
+function taskPromptStatus(status: "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "canceled") { return ({ running: "发送中", succeeded: "已送达", failed: "失败", skipped_busy: "会话忙碌跳过", skipped_empty: "空池跳过", canceled: "已取消" })[status]; }
+function taskCheckinStatus(status: TaskHourlyCheckinSummary["boss"]["emailStatus"]) { return status ? ({ pending: "等待发送", running: "发送中", succeeded: "已送达", failed: "失败", skipped: "已跳过", canceled: "已取消" })[status] : "无待办"; }
 function taskCheckinAction(kind: "review" | "execute" | "boss_digest" | null) { return kind ? ({ review: "验收", execute: "执行", boss_digest: "Boss 汇总" })[kind] : "待递补"; }
 function closeoutDispatchStatus(status: MeetingDetail["closeoutDispatches"][number]["status"]) { return ({ pending: "等待同步", running: "正在同步", succeeded: "已送达" })[status]; }

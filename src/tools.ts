@@ -32,6 +32,7 @@ export const COMPANY_TOOL_NAMES = [
   "company_task_review",
   "company_task_reassign",
   "company_task_cancel",
+  "company_task_correct",
 ] as const;
 
 type ToolName = (typeof COMPANY_TOOL_NAMES)[number];
@@ -60,6 +61,16 @@ const Evidence = Type.Object({
   command: Type.Optional(Type.String({ minLength: 1 })),
   url: Type.Optional(Type.String({ minLength: 1 })),
   path: Type.Optional(Type.String({ minLength: 1 })),
+}, { additionalProperties: false });
+const ReviewReport = Type.Object({
+  checks: Type.Array(Type.Object({
+    criterion: Id,
+    outcome: Type.Union([Type.Literal("pass"), Type.Literal("fail")]),
+    evidenceIndexes: Type.Array(Type.Integer({ minimum: 0 })),
+    finding: Id,
+    remediation: Type.Optional(Id),
+  }, { additionalProperties: false }), { minItems: 1 }),
+  conclusion: Id,
 }, { additionalProperties: false });
 
 export function createCompanyOsTools(options: {
@@ -197,24 +208,33 @@ export function createCompanyOsTools(options: {
     }, { additionalProperties: false }), async (p) => store.reviseTask(actorId(), p.taskId, p, p.reason)),
     tool("company_task_block", "报告阻塞", "负责人报告任务阻塞；父任务只显示风险，不自动变更状态。", Type.Object({
       taskId: Id, reason: Reason,
-    }, { additionalProperties: false }), async (p) => store.blockTask(actorId(), p.taskId, p.reason)),
+    }, { additionalProperties: false }), async (p) => service.blockTask(actorId(), p.taskId, p.reason)),
     tool("company_task_unblock", "解除阻塞", "负责人或派发者解除阻塞并回到 in_progress。", Type.Object({
       taskId: Id, reason: Reason,
-    }, { additionalProperties: false }), async (p) => store.unblockTask(actorId(), p.taskId, p.reason)),
+    }, { additionalProperties: false }), async (p) => service.unblockTask(actorId(), p.taskId, p.reason)),
     tool("company_task_submit", "提交验收", "负责人提交摘要和至少一项 proof/artifact；所有直接子任务必须先终结。", Type.Object({
       taskId: Id, summary: Id, evidence: Type.Array(Evidence, { minItems: 1 }),
-    }, { additionalProperties: false }), async (p) => store.submitTask(actorId(), p.taskId, p.summary, p.evidence)),
-    tool("company_task_review", "任务验收", "派发者验收关闭或带反馈驳回任务。", Type.Object({
+    }, { additionalProperties: false }), async (p) => service.submitTask(actorId(), p.taskId, p.summary, p.evidence)),
+    tool("company_task_review", "任务验收", "派发者读取当前提交后逐项核验证据，并用结构化报告批准或驳回任务。", Type.Object({
       taskId: Id,
       decision: Type.Union([Type.Literal("accept"), Type.Literal("reject")]),
       feedback: Type.Optional(Type.String()),
-    }, { additionalProperties: false }), async (p) => service.reviewTask(actorId(), p.taskId, p.decision, p.feedback)),
+      reviewReport: ReviewReport,
+    }, { additionalProperties: false }), async (p) => service.reviewTask(actorId(), p.taskId, p.decision, p.feedback, p.reviewReport)),
     tool("company_task_reassign", "重派任务", "派发者带原因重派给自己的另一名直属下属。", Type.Object({
       taskId: Id, assigneeId: Id, reason: Reason,
     }, { additionalProperties: false }), async (p) => store.reassignTask(actorId(), p.taskId, p.assigneeId, p.reason)),
-    tool("company_task_cancel", "取消任务", "派发者带原因取消任务；存在活动子任务时拒绝，永不级联。", Type.Object({
+    tool("company_task_cancel", "取消任务", "派发者带原因取消任务；blocked 任务会创建 Boss 审批申请，其他任务直接取消；存在活动子任务时拒绝。", Type.Object({
       taskId: Id, reason: Reason,
-    }, { additionalProperties: false }), async (p) => store.cancelTask(actorId(), p.taskId, p.reason)),
+    }, { additionalProperties: false }), async (p) => service.cancelTask(actorId(), p.taskId, p.reason)),
+    tool("company_task_correct", "任务终态纠错", "原验收人可二次审查不通过自己的已关闭任务，原取消人可恢复自己的已取消任务；Boss 可纠正任意层级。", Type.Object({
+      taskId: Id,
+      action: Type.Union([Type.Literal("revoke_acceptance"), Type.Literal("restore_cancellation")]),
+      reason: Reason,
+      reviewReport: Type.Optional(ReviewReport),
+    }, { additionalProperties: false }), async (p) => service.correctTaskTerminalDecision(
+      actorId(), p.taskId, p.action, p.reason, p.reviewReport,
+    )),
   ];
   return tools;
 }

@@ -5,6 +5,10 @@ import { DatabaseSync } from "node:sqlite";
 
 import type {
   Actor,
+  DailyAgentDispatch,
+  DailyAgentKind,
+  DailyAgentRunSummary,
+  DailySelfGovernanceSummary,
   EvidenceInput,
   MeetingAdvance,
   MeetingCloseoutDispatch,
@@ -22,12 +26,28 @@ import type {
   ResolvedCompanyOsConfig,
   ServiceEvent,
   TaskAgentDispatchKind,
+  TaskCancelRequest,
+  TaskCancellationEvent,
+  TaskCorrection,
+  TaskCorrectionAction,
   TaskCheckinActionKind,
   TaskCheckinDispatch,
   TaskDraftInput,
+  TaskPromptDispatch,
+  TaskPromptPoolItem,
+  TaskPromptPoolItemKind,
+  TaskPromptPoolSummary,
+  TaskReviewReport,
   TaskStatus,
 } from "./types.js";
-import type { MeetingEmailKind, MeetingEmailNotification, TaskCheckinEmailItem, TaskCheckinEmailNotification } from "./email.js";
+import type {
+  BossTaskActionEmailNotification,
+  MeetingEmailKind,
+  MeetingEmailNotification,
+  TaskCheckinEmailItem,
+  TaskCheckinEmailNotification,
+  TaskReviewEmailNotification,
+} from "./email.js";
 
 type Row = Record<string, any>;
 type TaskCheckinCandidate = { taskId: string; actionKind: "review" | "execute"; actionAt: string };
@@ -36,6 +56,23 @@ type BossTaskCheckinCandidate = { taskId: string; review: boolean; anomaly: bool
 const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(["closed", "canceled"]);
 const ACTIVE_TASK_STATUSES = new Set<TaskStatus>(["assigned", "in_progress", "review", "blocked"]);
 const OPEN_MEETING_STATUSES = new Set<MeetingStatus>(["queued", "active"]);
+export const DAILY_SELF_AUDIT_SESSION_NAME = "self-audit";
+
+const DAILY_AGENT_PROMPTS: Record<DailyAgentKind, string> = {
+  daily_self_improvement: `这是每日自我反思任务。回顾过去 24 小时的工作：
+1. 用 memory_search 搜索最近的相关内容
+2. 读取最近的 memory/YYYY-MM-DD.md 文件
+3. 用 sessions_history 检查最近的 session 消息
+4. 使用 self-improving-agent 技能，将有价值的经验教训记录到 .learnings/ 目录
+5. 如果有已验证的规则，promote 到 MEMORY.md
+只记录值得记住的内容，不记录日常噪音。完成后简要记录到 memory/YYYY-MM-DD.md。`,
+  daily_persona_audit: `这是每日人设文件治理任务。执行 persona-audit 技能：
+1. 读取你的 6 个 persona 文件（AGENTS/SOUL/IDENTITY/MEMORY/TOOLS/USER）
+2. 检查行数预算、Hook 重复、跨文件矛盾、workspace 清洁度
+3. 做 reality sync：检查最近 24h 的 session 和 memory，确保人设文件与真实状态匹配
+4. 直接编辑修复问题
+5. 报告改动摘要，记录到 memory/YYYY-MM-DD.md`,
+};
 
 export class CompanyOsStore {
   readonly db: DatabaseSync;
@@ -43,7 +80,10 @@ export class CompanyOsStore {
   private readonly staleAfterMs: number;
   private readonly automaticEndDelayMs: number;
   private readonly taskCheckinConfig: ResolvedCompanyOsConfig["taskHourlyCheckins"];
+  private readonly taskPromptConfig: ResolvedCompanyOsConfig["taskRollingPrompts"];
   private readonly noticeReminderConfig: ResolvedCompanyOsConfig["noticeUnreadReminders"];
+  private readonly dailySelfImprovementConfig: ResolvedCompanyOsConfig["dailySelfImprovement"];
+  private readonly dailyPersonaAuditConfig: ResolvedCompanyOsConfig["dailyPersonaAudit"];
   private readonly bossEmailEnabled: boolean;
   private readonly organizationAdminAgentId: string;
   private readonly onEvent?: (event: ServiceEvent) => void;
@@ -63,12 +103,16 @@ export class CompanyOsStore {
     this.staleAfterMs = options.config.taskStaleAfterHours * 60 * 60 * 1000;
     this.automaticEndDelayMs = options.config.meetingAutoEndDelaySeconds * 1000;
     this.taskCheckinConfig = options.config.taskHourlyCheckins;
+    this.taskPromptConfig = options.config.taskRollingPrompts;
     this.noticeReminderConfig = options.config.noticeUnreadReminders;
+    this.dailySelfImprovementConfig = options.config.dailySelfImprovement;
+    this.dailyPersonaAuditConfig = options.config.dailyPersonaAudit;
     this.bossEmailEnabled = options.config.bossEmailNotifications.enabled;
     this.onEvent = options.onEvent;
     this.initializeSchema();
     this.organizationAdminAgentId = this.resolveOrganizationAdminAgentId(options.organizationAdminAgentId);
     this.seedOrganization();
+    this.reconcileTaskPromptPool();
   }
 
   close() {
@@ -83,78 +127,26 @@ export class CompanyOsStore {
     const schemaRow = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as Row | undefined;
     const currentVersion = schemaRow ? Number(schemaRow.value) : 0;
     if (!Number.isInteger(currentVersion) || currentVersion < 0) throw new Error("company-os schema version is invalid");
-    if (currentVersion > 10) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
-    if (currentVersion === 10) return;
-    if (currentVersion === 9) {
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 8) {
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 1) {
-      this.migrateSchemaV2();
-      this.migrateSchemaV3();
-      this.migrateSchemaV4();
-      this.migrateSchemaV5();
-      this.migrateSchemaV6();
-      this.migrateSchemaV7();
-      this.migrateSchemaV8();
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 2) {
-      this.migrateSchemaV3();
-      this.migrateSchemaV4();
-      this.migrateSchemaV5();
-      this.migrateSchemaV6();
-      this.migrateSchemaV7();
-      this.migrateSchemaV8();
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 3) {
-      this.migrateSchemaV4();
-      this.migrateSchemaV5();
-      this.migrateSchemaV6();
-      this.migrateSchemaV7();
-      this.migrateSchemaV8();
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 4) {
-      this.migrateSchemaV5();
-      this.migrateSchemaV6();
-      this.migrateSchemaV7();
-      this.migrateSchemaV8();
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 5) {
-      this.migrateSchemaV6();
-      this.migrateSchemaV7();
-      this.migrateSchemaV8();
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 6) {
-      this.migrateSchemaV7();
-      this.migrateSchemaV8();
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
-      return;
-    }
-    if (currentVersion === 7) {
-      this.migrateSchemaV8();
-      this.migrateSchemaV9();
-      this.migrateSchemaV10();
+    if (currentVersion > 13) throw new Error(`company-os database schema ${currentVersion} is newer than this plugin supports`);
+    if (currentVersion === 13) return;
+    if (currentVersion > 0) {
+      for (let version = currentVersion; version < 13; version += 1) {
+        switch (version) {
+          case 1: this.migrateSchemaV2(); break;
+          case 2: this.migrateSchemaV3(); break;
+          case 3: this.migrateSchemaV4(); break;
+          case 4: this.migrateSchemaV5(); break;
+          case 5: this.migrateSchemaV6(); break;
+          case 6: this.migrateSchemaV7(); break;
+          case 7: this.migrateSchemaV8(); break;
+          case 8: this.migrateSchemaV9(); break;
+          case 9: this.migrateSchemaV10(); break;
+          case 10: this.migrateSchemaV11(); break;
+          case 11: this.migrateSchemaV12(); break;
+          case 12: this.migrateSchemaV13(); break;
+          default: throw new Error(`company-os database schema ${version} has no migration path`);
+        }
+      }
       return;
     }
     this.db.exec("BEGIN IMMEDIATE");
@@ -202,6 +194,7 @@ export class CompanyOsStore {
         status TEXT NOT NULL CHECK (status IN ('assigned', 'in_progress', 'review', 'blocked', 'closed', 'canceled')),
         revision INTEGER NOT NULL DEFAULT 1,
         blocked_reason TEXT,
+        blocked_at TEXT,
         review_feedback TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -239,11 +232,23 @@ export class CompanyOsStore {
         submitter_id TEXT NOT NULL REFERENCES members(id),
         summary TEXT NOT NULL,
         evidence_json TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected', 'invalidated')),
         reviewer_id TEXT,
         feedback TEXT,
+        review_report_json TEXT,
         created_at TEXT NOT NULL,
         reviewed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS task_review_email_notifications (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        submission_id TEXT NOT NULL UNIQUE REFERENCES task_submissions(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        sent_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS task_acknowledgements (
@@ -258,7 +263,11 @@ export class CompanyOsStore {
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         target_agent_id TEXT NOT NULL REFERENCES members(id),
-        kind TEXT NOT NULL CHECK (kind IN ('boss_reminder', 'review_accepted', 'review_rejected')),
+        kind TEXT NOT NULL CHECK (kind IN (
+          'boss_reminder', 'review_accepted', 'review_rejected', 'block_escalated', 'block_guidance',
+          'cancel_request_accepted', 'cancel_request_rejected', 'acceptance_revoked', 'cancellation_restored'
+        )),
+        source_event_id TEXT,
         prompt TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
         attempts INTEGER NOT NULL DEFAULT 0,
@@ -310,6 +319,115 @@ export class CompanyOsStore {
         UNIQUE(batch_id, slot_index)
       );
 
+      CREATE TABLE IF NOT EXISTS task_review_inspections (
+        submission_id TEXT NOT NULL REFERENCES task_submissions(id) ON DELETE CASCADE,
+        reviewer_id TEXT NOT NULL REFERENCES members(id),
+        read_at TEXT NOT NULL,
+        PRIMARY KEY(submission_id, reviewer_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS task_cancel_requests (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        requester_id TEXT NOT NULL REFERENCES members(id),
+        reason TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'canceled')),
+        reviewer_id TEXT REFERENCES members(id),
+        feedback TEXT,
+        created_at TEXT NOT NULL,
+        reviewed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS task_cancellation_events (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        actor_id TEXT NOT NULL REFERENCES members(id),
+        request_id TEXT REFERENCES task_cancel_requests(id),
+        status_before TEXT NOT NULL CHECK (status_before IN ('assigned', 'in_progress', 'review', 'blocked')),
+        reason TEXT NOT NULL,
+        canceled_at TEXT NOT NULL,
+        restored_by TEXT REFERENCES members(id),
+        restored_reason TEXT,
+        restored_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS task_corrections (
+        id TEXT PRIMARY KEY,
+        target_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('acceptance_revoked', 'cancellation_restored')),
+        actor_id TEXT NOT NULL REFERENCES members(id),
+        reason TEXT NOT NULL,
+        report_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS task_correction_impacts (
+        correction_id TEXT NOT NULL REFERENCES task_corrections(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('target', 'ancestor')),
+        status_before TEXT NOT NULL,
+        status_after TEXT NOT NULL,
+        submission_id TEXT REFERENCES task_submissions(id),
+        PRIMARY KEY(correction_id, task_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS boss_task_action_email_notifications (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('block_escalated', 'cancel_requested')),
+        source_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        sent_at TEXT,
+        UNIQUE(kind, source_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS task_prompt_pool_items (
+        id TEXT PRIMARY KEY,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        parent_task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('execution', 'review', 'blocked_review')),
+        queue_seq INTEGER NOT NULL CHECK (queue_seq > 0),
+        enqueued_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_prompted_at TEXT,
+        prompt_count INTEGER NOT NULL DEFAULT 0 CHECK (prompt_count >= 0),
+        UNIQUE(member_id, task_id, kind),
+        UNIQUE(member_id, queue_seq)
+      );
+
+      CREATE TABLE IF NOT EXISTS task_prompt_ticks (
+        id TEXT PRIMARY KEY,
+        slot_key TEXT NOT NULL UNIQUE,
+        scheduled_at TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+        local_minute INTEGER NOT NULL CHECK (local_minute IN (0, 20, 40)),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS task_prompt_dispatches (
+        id TEXT PRIMARY KEY,
+        tick_id TEXT NOT NULL REFERENCES task_prompt_ticks(id) ON DELETE CASCADE,
+        pool_item_id TEXT REFERENCES task_prompt_pool_items(id) ON DELETE SET NULL,
+        target_member_id TEXT NOT NULL REFERENCES members(id),
+        task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        kind TEXT CHECK (kind IN ('execution', 'review', 'blocked_review')),
+        scheduled_at TEXT NOT NULL,
+        prompt TEXT,
+        status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped_busy', 'skipped_empty', 'canceled')),
+        started INTEGER NOT NULL DEFAULT 0 CHECK (started IN (0, 1)),
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE(tick_id, target_member_id)
+      );
+
       CREATE TABLE IF NOT EXISTS notices (
         id TEXT PRIMARY KEY,
         author_id TEXT NOT NULL REFERENCES members(id),
@@ -346,6 +464,35 @@ export class CompanyOsStore {
         candidate_count INTEGER NOT NULL CHECK (candidate_count >= 0),
         prompt TEXT,
         status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'skipped', 'canceled')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE(run_id, target_member_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS daily_agent_runs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('daily_self_improvement', 'daily_persona_audit')),
+        slot_key TEXT NOT NULL UNIQUE,
+        scheduled_at TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+        local_minute INTEGER NOT NULL CHECK (local_minute BETWEEN 0 AND 59),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS daily_agent_dispatches (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES daily_agent_runs(id) ON DELETE CASCADE,
+        target_member_id TEXT NOT NULL REFERENCES members(id),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        scheduled_at TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
         attempts INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         lease_expires_at TEXT,
@@ -531,13 +678,25 @@ export class CompanyOsStore {
       CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee_id, status);
       CREATE INDEX IF NOT EXISTS idx_tasks_issuer_status ON tasks(issuer_id, status);
       CREATE INDEX IF NOT EXISTS idx_task_dispatch_pending ON task_agent_dispatches(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_task_review_email_pending
+        ON task_review_email_notifications(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_task_checkin_dispatch_due
         ON task_checkin_dispatches(status, scheduled_at, created_at);
       CREATE INDEX IF NOT EXISTS idx_task_checkin_rotation
         ON task_checkin_dispatches(target_member_id, status, completed_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_task_cancel_request_pending
+        ON task_cancel_requests(task_id) WHERE status = 'pending';
+      CREATE INDEX IF NOT EXISTS idx_task_prompt_pool_head
+        ON task_prompt_pool_items(member_id, queue_seq);
+      CREATE INDEX IF NOT EXISTS idx_task_prompt_dispatch_tick
+        ON task_prompt_dispatches(tick_id, target_member_id);
+      CREATE INDEX IF NOT EXISTS idx_boss_task_action_email_pending
+        ON boss_task_action_email_notifications(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_notices_created ON notices(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_notice_reminder_dispatch_due
         ON notice_reminder_dispatches(status, scheduled_at, created_at);
+      CREATE INDEX IF NOT EXISTS idx_daily_agent_dispatch_due
+        ON daily_agent_dispatches(status, scheduled_at, created_at);
       CREATE INDEX IF NOT EXISTS idx_meetings_status_queue ON meetings(status, queue_position);
       CREATE INDEX IF NOT EXISTS idx_meeting_messages_sequence ON meeting_messages(meeting_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_meeting_email_pending ON meeting_email_notifications(status, created_at);
@@ -547,7 +706,7 @@ export class CompanyOsStore {
         ON meeting_closeout_dispatches(status, blocks_room DESC, next_attempt_at, position);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meeting ON meetings(status) WHERE status = 'active';
       `);
-      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '10')").run();
+      this.db.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', '13')").run();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -947,6 +1106,309 @@ export class CompanyOsStore {
     }
   }
 
+  private migrateSchemaV11() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS task_review_email_notifications (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          submission_id TEXT NOT NULL UNIQUE REFERENCES task_submissions(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          sent_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_review_email_pending
+          ON task_review_email_notifications(status, created_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '11' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV12() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS daily_agent_runs (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL CHECK (kind IN ('daily_self_improvement', 'daily_persona_audit')),
+          slot_key TEXT NOT NULL UNIQUE,
+          scheduled_at TEXT NOT NULL,
+          local_date TEXT NOT NULL,
+          local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+          local_minute INTEGER NOT NULL CHECK (local_minute BETWEEN 0 AND 59),
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS daily_agent_dispatches (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES daily_agent_runs(id) ON DELETE CASCADE,
+          target_member_id TEXT NOT NULL REFERENCES members(id),
+          position INTEGER NOT NULL CHECK (position >= 0),
+          scheduled_at TEXT NOT NULL,
+          session_key TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT,
+          UNIQUE(run_id, target_member_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_agent_dispatch_due
+          ON daily_agent_dispatches(status, scheduled_at, created_at);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private migrateSchemaV13() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // These tables cannot exist in a real v12 database. Dropping them makes the
+      // migration idempotent for development databases whose schema version was
+      // intentionally rolled back while exercising older migration paths.
+      this.db.exec(`
+        DROP TABLE IF EXISTS task_prompt_dispatches;
+        DROP TABLE IF EXISTS task_prompt_ticks;
+        DROP TABLE IF EXISTS task_prompt_pool_items;
+        DROP TABLE IF EXISTS boss_task_action_email_notifications;
+        DROP TABLE IF EXISTS task_correction_impacts;
+        DROP TABLE IF EXISTS task_corrections;
+        DROP TABLE IF EXISTS task_cancellation_events;
+        DROP TABLE IF EXISTS task_cancel_requests;
+        DROP TABLE IF EXISTS task_review_inspections;
+      `);
+      if (!this.columnExists("tasks", "blocked_at")) {
+        this.db.exec("ALTER TABLE tasks ADD COLUMN blocked_at TEXT");
+      }
+      if (!this.tableExists("task_submissions")) {
+        this.db.exec(`
+          CREATE TABLE task_submissions (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            submitter_id TEXT NOT NULL REFERENCES members(id),
+            summary TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+            reviewer_id TEXT,
+            feedback TEXT,
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT
+          );
+        `);
+      }
+      const blockedActivityColumn = this.columnExists("tasks", "last_activity_at")
+        ? "last_activity_at"
+        : this.columnExists("tasks", "updated_at")
+          ? "updated_at"
+          : null;
+      if (blockedActivityColumn && this.columnExists("tasks", "status")) {
+        this.db.exec(`UPDATE tasks SET blocked_at = COALESCE(blocked_at, ${blockedActivityColumn}) WHERE status = 'blocked'`);
+      }
+      this.db.exec(`
+        DROP INDEX IF EXISTS idx_task_review_email_pending;
+        ALTER TABLE task_review_email_notifications RENAME TO task_review_email_notifications_v12;
+        ALTER TABLE task_submissions RENAME TO task_submissions_v12;
+        CREATE TABLE task_submissions (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          submitter_id TEXT NOT NULL REFERENCES members(id),
+          summary TEXT NOT NULL,
+          evidence_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected', 'invalidated')),
+          reviewer_id TEXT,
+          feedback TEXT,
+          review_report_json TEXT,
+          created_at TEXT NOT NULL,
+          reviewed_at TEXT
+        );
+        INSERT INTO task_submissions (
+          id, task_id, submitter_id, summary, evidence_json, status, reviewer_id,
+          feedback, review_report_json, created_at, reviewed_at
+        )
+        SELECT id, task_id, submitter_id, summary, evidence_json, status, reviewer_id,
+          feedback, NULL, created_at, reviewed_at
+        FROM task_submissions_v12;
+        CREATE TABLE task_review_email_notifications (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          submission_id TEXT NOT NULL UNIQUE REFERENCES task_submissions(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          sent_at TEXT
+        );
+        INSERT INTO task_review_email_notifications
+          (id, task_id, submission_id, status, attempts, last_error, created_at, sent_at)
+        SELECT id, task_id, submission_id, status, attempts, last_error, created_at, sent_at
+        FROM task_review_email_notifications_v12;
+        DROP TABLE task_review_email_notifications_v12;
+        DROP TABLE task_submissions_v12;
+        CREATE INDEX idx_task_review_email_pending
+          ON task_review_email_notifications(status, created_at);
+
+        DROP INDEX IF EXISTS idx_task_dispatch_pending;
+        ALTER TABLE task_agent_dispatches RENAME TO task_agent_dispatches_v12;
+        CREATE TABLE task_agent_dispatches (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          target_agent_id TEXT NOT NULL REFERENCES members(id),
+          kind TEXT NOT NULL CHECK (kind IN (
+            'boss_reminder', 'review_accepted', 'review_rejected', 'block_escalated', 'block_guidance',
+            'cancel_request_accepted', 'cancel_request_rejected', 'acceptance_revoked', 'cancellation_restored'
+          )),
+          source_event_id TEXT,
+          prompt TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed', 'canceled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT
+        );
+        INSERT INTO task_agent_dispatches (
+          id, task_id, target_agent_id, kind, source_event_id, prompt, status, attempts,
+          last_error, lease_expires_at, created_at, started_at, completed_at
+        )
+        SELECT id, task_id, target_agent_id, kind, NULL, prompt, status, attempts,
+          last_error, lease_expires_at, created_at, started_at, completed_at
+        FROM task_agent_dispatches_v12;
+        DROP TABLE task_agent_dispatches_v12;
+        CREATE INDEX idx_task_dispatch_pending ON task_agent_dispatches(status, created_at);
+        CREATE UNIQUE INDEX idx_task_dispatch_source_target
+          ON task_agent_dispatches(kind, source_event_id, target_agent_id)
+          WHERE source_event_id IS NOT NULL;
+
+        CREATE TABLE task_review_inspections (
+          submission_id TEXT NOT NULL REFERENCES task_submissions(id) ON DELETE CASCADE,
+          reviewer_id TEXT NOT NULL REFERENCES members(id),
+          read_at TEXT NOT NULL,
+          PRIMARY KEY(submission_id, reviewer_id)
+        );
+        CREATE TABLE task_cancel_requests (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          requester_id TEXT NOT NULL REFERENCES members(id),
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'canceled')),
+          reviewer_id TEXT REFERENCES members(id),
+          feedback TEXT,
+          created_at TEXT NOT NULL,
+          reviewed_at TEXT
+        );
+        CREATE UNIQUE INDEX idx_task_cancel_request_pending
+          ON task_cancel_requests(task_id) WHERE status = 'pending';
+        CREATE TABLE task_cancellation_events (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          actor_id TEXT NOT NULL REFERENCES members(id),
+          request_id TEXT REFERENCES task_cancel_requests(id),
+          status_before TEXT NOT NULL CHECK (status_before IN ('assigned', 'in_progress', 'review', 'blocked')),
+          reason TEXT NOT NULL,
+          canceled_at TEXT NOT NULL,
+          restored_by TEXT REFERENCES members(id),
+          restored_reason TEXT,
+          restored_at TEXT
+        );
+        CREATE TABLE task_corrections (
+          id TEXT PRIMARY KEY,
+          target_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('acceptance_revoked', 'cancellation_restored')),
+          actor_id TEXT NOT NULL REFERENCES members(id),
+          reason TEXT NOT NULL,
+          report_json TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE task_correction_impacts (
+          correction_id TEXT NOT NULL REFERENCES task_corrections(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          role TEXT NOT NULL CHECK (role IN ('target', 'ancestor')),
+          status_before TEXT NOT NULL,
+          status_after TEXT NOT NULL,
+          submission_id TEXT REFERENCES task_submissions(id),
+          PRIMARY KEY(correction_id, task_id)
+        );
+        CREATE TABLE boss_task_action_email_notifications (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('block_escalated', 'cancel_requested')),
+          source_id TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          sent_at TEXT,
+          UNIQUE(kind, source_id)
+        );
+        CREATE INDEX idx_boss_task_action_email_pending
+          ON boss_task_action_email_notifications(status, created_at);
+
+        CREATE TABLE task_prompt_pool_items (
+          id TEXT PRIMARY KEY,
+          member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          parent_task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('execution', 'review', 'blocked_review')),
+          queue_seq INTEGER NOT NULL CHECK (queue_seq > 0),
+          enqueued_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_prompted_at TEXT,
+          prompt_count INTEGER NOT NULL DEFAULT 0 CHECK (prompt_count >= 0),
+          UNIQUE(member_id, task_id, kind),
+          UNIQUE(member_id, queue_seq)
+        );
+        CREATE INDEX idx_task_prompt_pool_head ON task_prompt_pool_items(member_id, queue_seq);
+        CREATE TABLE task_prompt_ticks (
+          id TEXT PRIMARY KEY,
+          slot_key TEXT NOT NULL UNIQUE,
+          scheduled_at TEXT NOT NULL,
+          local_date TEXT NOT NULL,
+          local_hour INTEGER NOT NULL CHECK (local_hour BETWEEN 0 AND 23),
+          local_minute INTEGER NOT NULL CHECK (local_minute IN (0, 20, 40)),
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE task_prompt_dispatches (
+          id TEXT PRIMARY KEY,
+          tick_id TEXT NOT NULL REFERENCES task_prompt_ticks(id) ON DELETE CASCADE,
+          pool_item_id TEXT REFERENCES task_prompt_pool_items(id) ON DELETE SET NULL,
+          target_member_id TEXT NOT NULL REFERENCES members(id),
+          task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+          kind TEXT CHECK (kind IN ('execution', 'review', 'blocked_review')),
+          scheduled_at TEXT NOT NULL,
+          prompt TEXT,
+          status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'skipped_busy', 'skipped_empty', 'canceled')),
+          started INTEGER NOT NULL DEFAULT 0 CHECK (started IN (0, 1)),
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          completed_at TEXT,
+          UNIQUE(tick_id, target_member_id)
+        );
+        CREATE INDEX idx_task_prompt_dispatch_tick ON task_prompt_dispatches(tick_id, target_member_id);
+      `);
+      this.db.prepare("UPDATE schema_meta SET value = '13' WHERE key = 'schema_version'").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private tableExists(table: string) {
     return Boolean(this.db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
   }
@@ -1236,6 +1698,19 @@ export class CompanyOsStore {
         ON CONFLICT(member_id, task_id) DO UPDATE SET revision = excluded.revision, seen_at = excluded.seen_at
       `).run(actorId, taskId, row.revision, nowIso());
     }
+    if (actorId !== "boss" && markSeen && row.issuer_id === actorId && row.status === "review") {
+      const submission = this.db.prepare(`
+        SELECT id FROM task_submissions WHERE task_id = ? AND status = 'pending'
+        ORDER BY created_at DESC LIMIT 1
+      `).get(taskId) as Row | undefined;
+      if (submission) {
+        this.db.prepare(`
+          INSERT INTO task_review_inspections (submission_id, reviewer_id, read_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(submission_id, reviewer_id) DO UPDATE SET read_at = excluded.read_at
+        `).run(submission.id, actorId, nowIso());
+      }
+    }
     const tasks = this.listTasks("boss");
     const task = tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`task not found: ${taskId}`);
@@ -1252,6 +1727,16 @@ export class CompanyOsStore {
       WHERE task_id = ? AND kind IN ('review_accepted', 'review_rejected')
       ORDER BY created_at DESC, rowid DESC LIMIT 1
     `).get(taskId) as Row | undefined;
+    const pendingCancelRequest = this.db.prepare(`
+      SELECT * FROM task_cancel_requests WHERE task_id = ? AND status = 'pending'
+      ORDER BY created_at DESC LIMIT 1
+    `).get(taskId) as Row | undefined;
+    const cancellationEvents = this.db.prepare(`
+      SELECT * FROM task_cancellation_events WHERE task_id = ? ORDER BY canceled_at DESC
+    `).all(taskId) as Row[];
+    const correctionRows = this.db.prepare(`
+      SELECT * FROM task_corrections WHERE target_task_id = ? ORDER BY created_at DESC
+    `).all(taskId) as Row[];
     return {
       ...task,
       versions: versions.map(mapTaskVersion),
@@ -1259,6 +1744,9 @@ export class CompanyOsStore {
       submissions: submissions.map(mapTaskSubmission),
       reminderDispatch: latestReminder ? mapTaskAgentDispatch(latestReminder) : null,
       reviewNotificationDispatch: latestReviewNotification ? mapTaskAgentDispatch(latestReviewNotification) : null,
+      pendingCancelRequest: pendingCancelRequest ? mapTaskCancelRequest(pendingCancelRequest) : null,
+      cancellationEvents: cancellationEvents.map(mapTaskCancellationEvent),
+      corrections: correctionRows.map((correction) => this.mapTaskCorrection(correction)),
       audit: this.listAudit("task", taskId),
     };
   }
@@ -1379,6 +1867,14 @@ export class CompanyOsStore {
     });
   }
 
+  nextTaskDispatchTarget() {
+    const row = this.db.prepare(`
+      SELECT target_agent_id FROM task_agent_dispatches
+      WHERE status = 'pending' AND attempts < 3 ORDER BY created_at, rowid LIMIT 1
+    `).get() as Row | undefined;
+    return row ? { memberId: row.target_agent_id as string, agentId: this.runtimeAgentId(row.target_agent_id) } : null;
+  }
+
   hasPendingTaskDispatches() {
     return Boolean(this.db.prepare(`
       SELECT 1 AS ok FROM task_agent_dispatches WHERE status = 'pending' AND attempts < 3 LIMIT 1
@@ -1463,6 +1959,441 @@ export class CompanyOsStore {
       });
       return retry;
     });
+  }
+
+  // ── Rolling task prompt pool ──────────────────────────────
+
+  reconcileTaskPromptPool() {
+    if (!this.tableExists("task_prompt_pool_items")) return { added: 0, removed: 0 };
+    const requiredTaskColumns = ["status", "parent_id", "issuer_id", "assignee_id", "created_at", "last_activity_at"];
+    if (requiredTaskColumns.some((column) => !this.columnExists("tasks", column))) return { added: 0, removed: 0 };
+    return this.transaction(() => {
+      const desired = new Map<string, {
+        memberId: string;
+        taskId: string;
+        parentTaskId: string | null;
+        kind: TaskPromptPoolItemKind;
+        actionAt: string;
+      }>();
+      const tasks = this.db.prepare(`
+        SELECT t.*, m.active AS target_active,
+          (SELECT COUNT(*) FROM tasks child
+            WHERE child.parent_id = t.id AND child.status NOT IN ('closed', 'canceled')) AS active_children
+        FROM tasks t
+        LEFT JOIN members m ON m.id = CASE
+          WHEN t.status IN ('review', 'blocked') THEN t.issuer_id ELSE t.assignee_id END
+        ORDER BY t.created_at, t.id
+      `).all() as Row[];
+      for (const task of tasks) {
+        if (!task.target_active) continue;
+        let memberId: string | null = null;
+        let kind: TaskPromptPoolItemKind | null = null;
+        let actionAt = task.last_activity_at as string;
+        if ((task.status === "assigned" || task.status === "in_progress") && Number(task.active_children) === 0) {
+          memberId = task.assignee_id;
+          kind = "execution";
+        } else if (task.status === "review" && task.issuer_id !== "boss") {
+          memberId = task.issuer_id;
+          kind = "review";
+          actionAt = task.submitted_at ?? task.last_activity_at;
+        } else if (task.status === "blocked" && task.parent_id && task.issuer_id !== "boss") {
+          memberId = task.issuer_id;
+          kind = "blocked_review";
+          actionAt = task.blocked_at ?? task.last_activity_at;
+        }
+        if (!memberId || !kind) continue;
+        desired.set(`${memberId}\0${task.id}\0${kind}`, {
+          memberId,
+          taskId: task.id,
+          parentTaskId: task.parent_id ?? null,
+          kind,
+          actionAt,
+        });
+      }
+
+      const existing = this.db.prepare("SELECT * FROM task_prompt_pool_items ORDER BY member_id, queue_seq").all() as Row[];
+      let removed = 0;
+      for (const row of existing) {
+        const key = `${row.member_id}\0${row.task_id}\0${row.kind}`;
+        const expected = desired.get(key);
+        if (!expected) {
+          this.db.prepare("DELETE FROM task_prompt_pool_items WHERE id = ?").run(row.id);
+          this.audit({
+            actorId: "system",
+            action: "task.prompt_pool_removed",
+            entityType: "task",
+            entityId: row.task_id,
+            after: { poolItemId: row.id, memberId: row.member_id, kind: row.kind },
+          });
+          removed += 1;
+          continue;
+        }
+        desired.delete(key);
+        if ((row.parent_task_id ?? null) !== expected.parentTaskId) {
+          this.db.prepare("UPDATE task_prompt_pool_items SET parent_task_id = ?, updated_at = ? WHERE id = ?")
+            .run(expected.parentTaskId, nowIso(), row.id);
+        }
+      }
+
+      const nextSeq = new Map<string, number>();
+      const maxRows = this.db.prepare(`
+        SELECT member_id, COALESCE(MAX(queue_seq), 0) AS max_seq
+        FROM task_prompt_pool_items GROUP BY member_id
+      `).all() as Row[];
+      maxRows.forEach((row) => nextSeq.set(row.member_id, Number(row.max_seq)));
+      const missing = [...desired.values()].sort((a, b) =>
+        a.actionAt.localeCompare(b.actionAt) || a.taskId.localeCompare(b.taskId) || a.kind.localeCompare(b.kind));
+      let added = 0;
+      for (const item of missing) {
+        const queueSeq = (nextSeq.get(item.memberId) ?? 0) + 1;
+        nextSeq.set(item.memberId, queueSeq);
+        const id = randomUUID();
+        const createdAt = item.actionAt;
+        const updatedAt = nowIso();
+        this.db.prepare(`
+          INSERT INTO task_prompt_pool_items (
+            id, member_id, task_id, parent_task_id, kind, queue_seq, enqueued_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(id, item.memberId, item.taskId, item.parentTaskId, item.kind, queueSeq, createdAt, updatedAt);
+        this.audit({
+          actorId: "system",
+          action: "task.prompt_pool_enqueued",
+          entityType: "task",
+          entityId: item.taskId,
+          after: { poolItemId: id, memberId: item.memberId, kind: item.kind, queueSeq },
+        });
+        added += 1;
+      }
+      return { added, removed };
+    });
+  }
+
+  queueTaskPromptTick(scheduledAtInput: string | number | Date) {
+    const scheduledAt = new Date(scheduledAtInput);
+    if (!Number.isFinite(scheduledAt.getTime())) throw new Error("task prompt tick scheduledAt is invalid");
+    const slot = shanghaiSlot(scheduledAt.getTime());
+    if (![0, 20, 40].includes(slot.minute) || slot.second !== 0 || slot.millisecond !== 0) {
+      throw new Error("task prompt ticks must be scheduled at :00, :20, or :40");
+    }
+    if (slot.hour < this.taskPromptConfig.startHour || slot.hour > this.taskPromptConfig.endHour) {
+      throw new Error("task prompt tick is outside the configured schedule");
+    }
+    const slotKey = `${slot.localDate}T${String(slot.hour).padStart(2, "0")}:${String(slot.minute).padStart(2, "0")}`;
+    const existing = this.db.prepare("SELECT * FROM task_prompt_ticks WHERE slot_key = ?").get(slotKey) as Row | undefined;
+    if (existing) return mapTaskPromptTick(existing);
+    const id = randomUUID();
+    const createdAt = nowIso();
+    this.db.prepare(`
+      INSERT INTO task_prompt_ticks (id, slot_key, scheduled_at, local_date, local_hour, local_minute, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id, slotKey, scheduledAt.toISOString(), slot.localDate, slot.hour, slot.minute, createdAt);
+    this.audit({
+      actorId: "system",
+      action: "task.prompt_tick_created",
+      entityType: "task_prompt_tick",
+      entityId: id,
+      after: { scheduledAt: scheduledAt.toISOString(), slotKey },
+    });
+    return mapTaskPromptTick(this.db.prepare("SELECT * FROM task_prompt_ticks WHERE id = ?").get(id) as Row);
+  }
+
+  taskPromptTickMembers() {
+    return this.listMembers().filter((member) => member.kind === "agent" && member.active)
+      .sort((a, b) => a.level - b.level || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  }
+
+  createTaskPromptDispatch(
+    tickId: string,
+    memberId: string,
+    busy: boolean,
+    busyReason = "main session is active or reserved",
+  ): TaskPromptDispatch & { claimed: boolean } {
+    return this.transaction(() => {
+      const tick = this.db.prepare("SELECT * FROM task_prompt_ticks WHERE id = ?").get(tickId) as Row | undefined;
+      if (!tick) throw new Error(`task prompt tick not found: ${tickId}`);
+      this.requireAgentMember(memberId);
+      const existing = this.db.prepare(`
+        SELECT * FROM task_prompt_dispatches WHERE tick_id = ? AND target_member_id = ?
+      `).get(tickId, memberId) as Row | undefined;
+      if (existing) return { ...mapTaskPromptDispatch({ ...existing, target_runtime_agent_id: this.runtimeAgentId(memberId) }), claimed: false };
+      this.reconcileTaskPromptPool();
+      const now = nowIso();
+      if (busy) {
+        return { ...this.insertSkippedTaskPromptDispatch(tick, memberId, "skipped_busy", busyReason, now), claimed: false };
+      }
+      const item = this.db.prepare(`
+        SELECT * FROM task_prompt_pool_items WHERE member_id = ? ORDER BY queue_seq LIMIT 1
+      `).get(memberId) as Row | undefined;
+      if (!item) {
+        return { ...this.insertSkippedTaskPromptDispatch(tick, memberId, "skipped_empty", "task prompt pool is empty", now), claimed: false };
+      }
+      const id = randomUUID();
+      const prompt = this.buildTaskPromptPoolPrompt(item, id);
+      this.db.prepare(`
+        INSERT INTO task_prompt_dispatches (
+          id, tick_id, pool_item_id, target_member_id, task_id, kind, scheduled_at,
+          prompt, status, started, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, ?)
+      `).run(id, tick.id, item.id, memberId, item.task_id, item.kind, tick.scheduled_at, prompt, now);
+      this.audit({
+        actorId: "system",
+        action: "task.prompt_dispatch_claimed",
+        entityType: "task_prompt_tick",
+        entityId: tick.id,
+        after: { dispatchId: id, poolItemId: item.id, memberId, taskId: item.task_id, kind: item.kind },
+      });
+      return { ...mapTaskPromptDispatch({
+        ...this.db.prepare("SELECT * FROM task_prompt_dispatches WHERE id = ?").get(id) as Row,
+        target_runtime_agent_id: this.runtimeAgentId(memberId),
+      }), claimed: true };
+    });
+  }
+
+  markTaskPromptDispatchStarted(dispatchId: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_prompt_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running" || row.started) return false;
+      const startedAt = nowIso();
+      if (row.pool_item_id) {
+        const item = this.db.prepare("SELECT * FROM task_prompt_pool_items WHERE id = ?").get(row.pool_item_id) as Row | undefined;
+        if (item) {
+          const maximum = this.db.prepare(`
+            SELECT COALESCE(MAX(queue_seq), 0) AS max_seq FROM task_prompt_pool_items WHERE member_id = ?
+          `).get(item.member_id) as Row;
+          this.db.prepare(`
+            UPDATE task_prompt_pool_items SET queue_seq = ?, updated_at = ?, last_prompted_at = ?,
+              prompt_count = prompt_count + 1 WHERE id = ?
+          `).run(Number(maximum.max_seq) + 1, startedAt, startedAt, item.id);
+        }
+      }
+      this.db.prepare("UPDATE task_prompt_dispatches SET started = 1, started_at = ? WHERE id = ?")
+        .run(startedAt, dispatchId);
+      this.audit({
+        actorId: "system",
+        action: "task.prompt_dispatch_started",
+        entityType: "task_prompt_tick",
+        entityId: row.tick_id,
+        after: { dispatchId, memberId: row.target_member_id, taskId: row.task_id },
+      });
+      return true;
+    });
+  }
+
+  finishTaskPromptDispatch(dispatchId: string, result: { status: "succeeded" | "failed" | "skipped_busy" | "canceled"; error?: string }) {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_prompt_dispatches WHERE id = ?").get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const completedAt = nowIso();
+      const error = result.error?.trim().slice(0, 1000) || null;
+      this.db.prepare(`
+        UPDATE task_prompt_dispatches SET status = ?, last_error = ?, completed_at = ? WHERE id = ?
+      `).run(result.status, error, completedAt, dispatchId);
+      this.audit({
+        actorId: "system",
+        action: result.status === "succeeded"
+          ? "task.prompt_dispatch_delivered"
+          : result.status === "skipped_busy"
+            ? "task.prompt_dispatch_skipped_busy"
+            : result.status === "canceled"
+              ? "task.prompt_dispatch_canceled"
+              : "task.prompt_dispatch_failed",
+        entityType: "task_prompt_tick",
+        entityId: row.tick_id,
+        reason: error ?? undefined,
+        after: { dispatchId, memberId: row.target_member_id, taskId: row.task_id, started: Boolean(row.started) },
+      });
+      return true;
+    });
+  }
+
+  recoverTaskPromptDispatches() {
+    return this.transaction(() => {
+      const rows = this.db.prepare("SELECT * FROM task_prompt_dispatches WHERE status = 'running'").all() as Row[];
+      const completedAt = nowIso();
+      for (const row of rows) {
+        const reason = row.started
+          ? "Gateway restarted after task prompt injection started; duplicate replay suppressed"
+          : "Gateway restarted before task prompt injection was confirmed";
+        this.db.prepare(`
+          UPDATE task_prompt_dispatches SET status = 'failed', last_error = ?, completed_at = ? WHERE id = ?
+        `).run(reason, completedAt, row.id);
+        this.audit({
+          actorId: "system",
+          action: "task.prompt_dispatch_failed",
+          entityType: "task_prompt_tick",
+          entityId: row.tick_id,
+          reason,
+          after: { dispatchId: row.id, memberId: row.target_member_id, taskId: row.task_id, started: Boolean(row.started) },
+        });
+      }
+      return rows.length;
+    });
+  }
+
+  taskPromptPoolSummary(now = Date.now()): TaskPromptPoolSummary {
+    this.reconcileTaskPromptPool();
+    const members = this.taskPromptTickMembers();
+    const items = this.db.prepare("SELECT * FROM task_prompt_pool_items ORDER BY member_id, queue_seq").all() as Row[];
+    const byMember = new Map<string, Row[]>();
+    for (const item of items) {
+      const list = byMember.get(item.member_id) ?? [];
+      list.push(item);
+      byMember.set(item.member_id, list);
+    }
+    const queues = members.map((member) => {
+      const queue = byMember.get(member.id) ?? [];
+      const head = queue[0];
+      const task = head ? this.db.prepare("SELECT title FROM tasks WHERE id = ?").get(head.task_id) as Row | undefined : undefined;
+      const parent = head?.parent_task_id
+        ? this.db.prepare("SELECT title FROM tasks WHERE id = ?").get(head.parent_task_id) as Row | undefined
+        : undefined;
+      const last = this.db.prepare(`
+        SELECT * FROM task_prompt_dispatches WHERE target_member_id = ?
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+      `).get(member.id) as Row | undefined;
+      return {
+        memberId: member.id,
+        memberName: member.name,
+        count: queue.length,
+        head: head ? {
+          taskId: head.task_id,
+          parentTaskId: head.parent_task_id ?? null,
+          title: task?.title ?? head.task_id,
+          parentTitle: parent?.title ?? null,
+          kind: head.kind as TaskPromptPoolItemKind,
+          enqueuedAt: head.enqueued_at,
+          lastPromptedAt: head.last_prompted_at ?? null,
+          promptCount: Number(head.prompt_count),
+        } : null,
+        lastDispatch: last ? {
+          status: last.status,
+          taskId: last.task_id ?? null,
+          kind: last.kind ?? null,
+          scheduledAt: last.scheduled_at,
+          completedAt: last.completed_at ?? null,
+          lastError: last.last_error ?? null,
+        } : null,
+      };
+    });
+    return {
+      enabled: this.taskPromptConfig.enabled,
+      timeZone: "Asia/Shanghai",
+      startHour: this.taskPromptConfig.startHour,
+      endHour: this.taskPromptConfig.endHour,
+      intervalMinutes: 20,
+      nextTickAt: this.taskPromptConfig.enabled
+        ? nextTaskPromptTickAt(now, this.taskPromptConfig.startHour, this.taskPromptConfig.endHour)
+        : null,
+      totals: {
+        employees: queues.filter((queue) => queue.count > 0).length,
+        items: items.length,
+        execution: items.filter((item) => item.kind === "execution").length,
+        review: items.filter((item) => item.kind === "review").length,
+        blockedReview: items.filter((item) => item.kind === "blocked_review").length,
+      },
+      queues,
+    };
+  }
+
+  private insertSkippedTaskPromptDispatch(
+    tick: Row,
+    memberId: string,
+    status: "skipped_busy" | "skipped_empty",
+    reason: string,
+    createdAt: string,
+  ) {
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO task_prompt_dispatches (
+        id, tick_id, target_member_id, scheduled_at, status, started, last_error, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+    `).run(id, tick.id, memberId, tick.scheduled_at, status, reason, createdAt, createdAt);
+    this.audit({
+      actorId: "system",
+      action: status === "skipped_busy" ? "task.prompt_dispatch_skipped_busy" : "task.prompt_dispatch_skipped_empty",
+      entityType: "task_prompt_tick",
+      entityId: tick.id,
+      reason,
+      after: { dispatchId: id, memberId },
+    });
+    return mapTaskPromptDispatch({
+      ...this.db.prepare("SELECT * FROM task_prompt_dispatches WHERE id = ?").get(id) as Row,
+      target_runtime_agent_id: this.runtimeAgentId(memberId),
+    });
+  }
+
+  private buildTaskPromptPoolPrompt(item: Row, promptId: string) {
+    const task = this.getTaskRow(item.task_id);
+    const parent = task.parent_id ? this.getTaskRow(task.parent_id) : null;
+    const member = this.getMember(task.assignee_id, { active: false });
+    const progress = this.db.prepare(`
+      SELECT * FROM task_progress WHERE task_id = ? ORDER BY created_at DESC LIMIT 1
+    `).get(task.id) as Row | undefined;
+    const directCounts = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+        SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END) AS canceled,
+        SUM(CASE WHEN status NOT IN ('closed', 'canceled') THEN 1 ELSE 0 END) AS active
+      FROM tasks WHERE parent_id = ?
+    `).get(task.id) as Row;
+    const common = [
+      `回转池提示 ID：${promptId}（本次只处理这一项）`,
+      `任务：${task.title}`,
+      `任务 ID：${task.id}`,
+      `负责人：${member.name}（${task.assignee_id}）`,
+      ...(parent ? [`所属父任务：${parent.title}`, `父任务 ID：${parent.id}`] : []),
+    ];
+    if (item.kind === "review") {
+      const submission = this.db.prepare(`
+        SELECT * FROM task_submissions WHERE task_id = ? AND status = 'pending'
+        ORDER BY created_at DESC LIMIT 1
+      `).get(task.id) as Row | undefined;
+      const evidence = parseJson<EvidenceInput[]>(submission?.evidence_json, []);
+      return [
+        "【Company OS 任务回转池 · 待验收子任务】",
+        ...common,
+        `提交时间：${submission?.created_at ?? task.submitted_at ?? task.last_activity_at}`,
+        `验收标准：${task.acceptance_criteria}`,
+        `提交摘要：${submission?.summary ?? "未找到待验收摘要"}`,
+        `提交证据：${evidence.length ? evidence.map((entry, index) => `${index}: ${entry.label}（${entry.type}）`).join("；") : "无"}`,
+        `直接子任务：共 ${Number(directCounts.total)}，已关闭 ${Number(directCounts.closed ?? 0)}，已取消 ${Number(directCounts.canceled ?? 0)}，活动 ${Number(directCounts.active ?? 0)}`,
+        "请先调用 company_task_read 读取当前提交。随后逐项核对验收标准和证据，并调用 company_task_review：",
+        "- accept：所有检查项必须通过并引用有效证据索引；",
+        "- reject：至少指出一个失败项、具体发现和整改要求。",
+        "必须提交结构化 reviewReport，不要看到 review 状态就直接通过。",
+      ].join("\n");
+    }
+    if (item.kind === "blocked_review") {
+      const blockedAt = task.blocked_at ?? task.last_activity_at;
+      const waitingMinutes = Math.max(0, Math.floor((Date.now() - Date.parse(blockedAt)) / 60_000));
+      return [
+        "【Company OS 任务回转池 · 子任务阻塞审查】",
+        ...common,
+        `阻塞开始：${blockedAt}`,
+        `已等待：${waitingMinutes} 分钟`,
+        `阻塞原因：${task.blocked_reason ?? "未记录"}`,
+        `最近进度：${progress ? `${progress.created_at} · ${progress.body}` : "无进度记录"}`,
+        "请调用 company_task_read 核查阻塞原因、已有进展和任务上下文，然后必须完成一个真实决策：",
+        `- 需要上级协助：${parent?.status === "blocked" ? `调用 company_task_progress 更新父任务 ${parent.id} 的阻塞升级进展` : parent ? `调用 company_task_block 阻塞父任务 ${parent.id}，说明本子任务阻塞及所需协助` : "该任务没有可向上阻塞的父任务"}；`,
+        `- 不需要上级协助：调用 company_task_unblock 解除子任务 ${task.id} 的阻塞，reason 必须包含可执行解决方案，系统会立即通知负责人继续执行；`,
+        `- 确实应终止：调用 company_task_cancel 为子任务 ${task.id} 创建 Boss 取消审批申请。`,
+        "不要只回复分析结果，必须完成对应任务工具操作。",
+      ].join("\n");
+    }
+    return [
+      "【Company OS 任务回转池 · 执行任务】",
+      ...common,
+      `当前状态：${task.status}`,
+      `验收标准：${task.acceptance_criteria}`,
+      `最后活动：${task.last_activity_at}`,
+      `最近进度：${progress ? `${progress.created_at} · ${progress.body}` : "无进度记录"}`,
+      `直接子任务：共 ${Number(directCounts.total)}，已关闭 ${Number(directCounts.closed ?? 0)}，已取消 ${Number(directCounts.canceled ?? 0)}，活动 ${Number(directCounts.active ?? 0)}`,
+      "请先调用 company_task_read 获取最新版本，再实际推进这一项任务：",
+      "- assigned：调用 company_task_start 后开始执行；",
+      "- in_progress：完成当前可执行工作并调用 company_task_progress 记录成果；",
+      "- 已满足标准且直接子任务全部终结：调用 company_task_submit 提交摘要和 proof/artifact。",
+      "遇到真实阻塞请调用 company_task_block。不要只回复进度说明。",
+    ].join("\n");
   }
 
   // ── Hourly task check-ins ──────────────────────────────────
@@ -2077,6 +3008,7 @@ export class CompanyOsStore {
       this.db.prepare("UPDATE tasks SET status = 'in_progress', started_at = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
         .run(now, now, now, taskId);
       this.audit({ actorId, action: "task.started", entityType: "task", entityId: taskId, before: mapTaskRow(before) });
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
@@ -2100,6 +3032,7 @@ export class CompanyOsStore {
       this.db.prepare("INSERT INTO task_progress (id, task_id, author_id, body, created_at) VALUES (?, ?, ?, ?, ?)")
         .run(progressId, taskId, actorId, required(body, "body"), now);
       this.audit({ actorId, action: "task.progress", entityType: "task", entityId: taskId, after: { progressId, body } });
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
@@ -2125,6 +3058,7 @@ export class CompanyOsStore {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(randomUUID(), taskId, nextRevision, next.title, next.description, next.acceptanceCriteria, actorId, required(reason, "reason"), now);
       this.audit({ actorId, action: "task.revised", entityType: "task", entityId: taskId, reason, before: mapTaskRow(before), after: next });
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
@@ -2135,10 +3069,33 @@ export class CompanyOsStore {
     if (before.assignee_id !== actorId) throw new Error("only the assignee can block a task");
     if (before.status !== "assigned" && before.status !== "in_progress") throw new Error("task cannot be blocked in its current state");
     const now = nowIso();
+    const blockEventId = randomUUID();
+    const normalizedReason = required(reason, "reason");
     this.transaction(() => {
-      this.db.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
-        .run(required(reason, "reason"), now, now, taskId);
-      this.audit({ actorId, action: "task.blocked", entityType: "task", entityId: taskId, reason, before: mapTaskRow(before) });
+      this.db.prepare("UPDATE tasks SET status = 'blocked', blocked_reason = ?, blocked_at = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
+        .run(normalizedReason, now, now, now, taskId);
+      this.audit({ actorId, action: "task.blocked", entityType: "task", entityId: taskId, reason: normalizedReason, before: mapTaskRow(before), after: { blockEventId } });
+      if (before.issuer_id === "boss") {
+        if (this.bossEmailEnabled) {
+          this.queueBossTaskActionEmail(taskId, "block_escalated", blockEventId, {
+            reason: normalizedReason,
+            blockedReason: normalizedReason,
+            parentTaskId: before.parent_id,
+          }, now);
+        }
+      } else if (before.issuer_id !== actorId) {
+        const prompt = [
+          "【Company OS 任务阻塞上报】",
+          `通知 ID：${blockEventId}（同一通知只处理一次）`,
+          `任务：${before.title}`,
+          `任务 ID：${before.id}`,
+          `负责人：${before.assignee_id}`,
+          `阻塞原因：${normalizedReason}`,
+          "该阻塞审查事项已进入你的任务回转提示池。请读取任务真实现状，判断是否需要向上升级、给出解决建议并解除阻塞，或申请 Boss 取消审批。",
+        ].join("\n");
+        this.insertTaskAgentDispatch(taskId, before.issuer_id, "block_escalated", prompt, now, blockEventId);
+      }
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
@@ -2151,10 +3108,26 @@ export class CompanyOsStore {
     }
     if (before.status !== "blocked") throw new Error("only blocked tasks can be unblocked");
     const now = nowIso();
+    const guidanceEventId = randomUUID();
+    const normalizedReason = required(reason, "reason");
     this.transaction(() => {
-      this.db.prepare("UPDATE tasks SET status = 'in_progress', blocked_reason = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?")
+      this.db.prepare("UPDATE tasks SET status = 'in_progress', blocked_reason = NULL, blocked_at = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?")
         .run(now, now, taskId);
-      this.audit({ actorId, action: "task.unblocked", entityType: "task", entityId: taskId, reason: required(reason, "reason"), before: mapTaskRow(before) });
+      this.audit({ actorId, action: "task.unblocked", entityType: "task", entityId: taskId, reason: normalizedReason, before: mapTaskRow(before), after: { guidanceEventId } });
+      if (actorId !== before.assignee_id) {
+        const prompt = [
+          "【Company OS 阻塞解决建议】",
+          `通知 ID：${guidanceEventId}（同一通知只处理一次）`,
+          `任务：${before.title}`,
+          `任务 ID：${before.id}`,
+          `原阻塞原因：${before.blocked_reason ?? "未记录"}`,
+          `派发者解决建议：${normalizedReason}`,
+          "任务已恢复为 in_progress，并重新进入你的执行回转池。请读取最新任务，按建议继续实际推进并记录进度。",
+        ].join("\n");
+        this.insertTaskAgentDispatch(taskId, before.assignee_id, "block_guidance", prompt, now, guidanceEventId);
+      }
+      this.cancelPendingTaskCancelRequest(taskId, actorId, "task was unblocked");
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
@@ -2179,11 +3152,21 @@ export class CompanyOsStore {
       this.db.prepare("UPDATE tasks SET status = 'review', submitted_at = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
         .run(now, now, now, taskId);
       this.audit({ actorId, action: "task.submitted", entityType: "task", entityId: taskId, before: mapTaskRow(before), after: { submissionId, summary, evidence } });
+      if (before.parent_id === null && before.issuer_id === "boss" && this.bossEmailEnabled) {
+        this.queueTaskReviewEmail(taskId, submissionId, now);
+      }
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
 
-  reviewTask(actorId: Actor, taskId: string, decision: "accept" | "reject", feedback?: string) {
+  reviewTask(
+    actorId: Actor,
+    taskId: string,
+    decision: "accept" | "reject",
+    feedback?: string,
+    reviewReport?: TaskReviewReport,
+  ) {
     const before = this.getTaskRow(taskId);
     if (actorId !== "boss") this.requireAgentMember(actorId);
     if (before.issuer_id !== actorId) throw new Error("only the task issuer can review a task");
@@ -2191,18 +3174,33 @@ export class CompanyOsStore {
     const submission = this.db.prepare("SELECT * FROM task_submissions WHERE task_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1").get(taskId) as Row | undefined;
     if (!submission) throw new Error("pending task submission not found");
     const reviewer = this.getMember(actorId);
-    const normalizedFeedback = decision === "reject" ? required(feedback, "feedback") : feedback?.trim() || null;
+    const evidence = parseJson<EvidenceInput[]>(submission.evidence_json, []);
+    const normalizedReport = actorId === "boss" && !reviewReport
+      ? null
+      : normalizeTaskReviewReport(reviewReport, decision, evidence.length);
+    if (actorId !== "boss") {
+      const inspection = this.db.prepare(`
+        SELECT read_at FROM task_review_inspections WHERE submission_id = ? AND reviewer_id = ?
+      `).get(submission.id, actorId) as Row | undefined;
+      if (!inspection || inspection.read_at < submission.created_at) {
+        throw new Error("reviewer must read the current task submission before reviewing it");
+      }
+    }
+    const reportFeedback = normalizedReport ? taskReviewReportText(normalizedReport) : null;
+    const normalizedFeedback = actorId === "boss"
+      ? decision === "reject" ? required(feedback, "feedback") : feedback?.trim() || null
+      : feedback?.trim() || reportFeedback;
     const now = this.nextTaskActivityAt(taskId, before.updated_at);
     this.transaction(() => {
       if (decision === "accept") {
-        this.db.prepare("UPDATE task_submissions SET status = 'accepted', reviewer_id = ?, feedback = ?, reviewed_at = ? WHERE id = ?")
-          .run(actorId, normalizedFeedback, now, submission.id);
+        this.db.prepare("UPDATE task_submissions SET status = 'accepted', reviewer_id = ?, feedback = ?, review_report_json = ?, reviewed_at = ? WHERE id = ?")
+          .run(actorId, normalizedFeedback, normalizedReport ? JSON.stringify(normalizedReport) : null, now, submission.id);
         this.db.prepare("UPDATE tasks SET status = 'closed', review_feedback = ?, closed_at = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
           .run(normalizedFeedback, now, now, now, taskId);
         this.audit({ actorId, action: "task.closed", entityType: "task", entityId: taskId, reason: normalizedFeedback ?? undefined, before: mapTaskRow(before) });
       } else {
-        this.db.prepare("UPDATE task_submissions SET status = 'rejected', reviewer_id = ?, feedback = ?, reviewed_at = ? WHERE id = ?")
-          .run(actorId, normalizedFeedback, now, submission.id);
+        this.db.prepare("UPDATE task_submissions SET status = 'rejected', reviewer_id = ?, feedback = ?, review_report_json = ?, reviewed_at = ? WHERE id = ?")
+          .run(actorId, normalizedFeedback, normalizedReport ? JSON.stringify(normalizedReport) : null, now, submission.id);
         this.db.prepare("UPDATE tasks SET status = 'in_progress', review_feedback = ?, submitted_at = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?")
           .run(normalizedFeedback, now, now, taskId);
         this.audit({ actorId, action: "task.rejected", entityType: "task", entityId: taskId, reason: normalizedFeedback ?? undefined, before: mapTaskRow(before) });
@@ -2214,6 +3212,7 @@ export class CompanyOsStore {
         normalizedFeedback,
         now,
       );
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
@@ -2227,18 +3226,38 @@ export class CompanyOsStore {
   ) {
     const dispatchId = randomUUID();
     const prompt = buildTaskReviewNotificationPrompt(task, reviewer, kind, feedback, dispatchId);
-    this.db.prepare(`
-      INSERT INTO task_agent_dispatches (
-        id, task_id, target_agent_id, kind, prompt, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
-    `).run(dispatchId, task.id, task.assignee_id, kind, prompt, createdAt);
+    this.insertTaskAgentDispatch(task.id, task.assignee_id, kind, prompt, createdAt, undefined, dispatchId);
+  }
+
+  private insertTaskAgentDispatch(
+    taskId: string,
+    targetAgentId: string,
+    kind: TaskAgentDispatchKind,
+    prompt: string,
+    createdAt: string,
+    sourceEventId?: string,
+    requestedDispatchId?: string,
+  ) {
+    const dispatchId = requestedDispatchId ?? randomUUID();
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO task_agent_dispatches (
+        id, task_id, target_agent_id, kind, source_event_id, prompt, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(dispatchId, taskId, targetAgentId, kind, sourceEventId ?? null, prompt, createdAt);
+    if (Number(result.changes) === 0 && sourceEventId) {
+      const existing = this.db.prepare(`
+        SELECT id FROM task_agent_dispatches WHERE kind = ? AND source_event_id = ? AND target_agent_id = ?
+      `).get(kind, sourceEventId, targetAgentId) as Row;
+      return existing.id as string;
+    }
     this.audit({
-      actorId: reviewer.id,
+      actorId: "system",
       action: taskDispatchAuditAction(kind, "queued"),
       entityType: "task",
-      entityId: task.id,
-      after: { dispatchId, kind, targetAgentId: task.assignee_id },
+      entityId: taskId,
+      after: { dispatchId, kind, targetAgentId, sourceEventId: sourceEventId ?? null },
     });
+    return dispatchId;
   }
 
   reassignTask(actorId: Actor, taskId: string, assigneeId: string, reason: string) {
@@ -2253,9 +3272,11 @@ export class CompanyOsStore {
     this.transaction(() => {
       this.db.prepare(`
         UPDATE tasks SET assignee_id = ?, status = 'assigned', blocked_reason = NULL, review_feedback = NULL,
-          started_at = NULL, submitted_at = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?
+          blocked_at = NULL, started_at = NULL, submitted_at = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?
       `).run(assigneeId, now, now, taskId);
       this.audit({ actorId, action: "task.reassigned", entityType: "task", entityId: taskId, reason: required(reason, "reason"), before: mapTaskRow(before), after: { assigneeId } });
+      this.cancelPendingTaskCancelRequest(taskId, actorId, "task was reassigned");
+      this.reconcileTaskPromptPool();
     });
     return this.readTask(actorId, taskId, false);
   }
@@ -2264,16 +3285,365 @@ export class CompanyOsStore {
     const before = this.getTaskRow(taskId);
     if (actorId !== "boss") this.requireAgentMember(actorId);
     if (actorId !== "boss" && before.issuer_id !== actorId) throw new Error("only the issuer or Boss can cancel a task");
+    if (actorId !== "boss" && before.status === "blocked") {
+      throw new Error("blocked tasks require a Boss cancellation request");
+    }
+    return this.performTaskCancellation(actorId, before, reason);
+  }
+
+  requestTaskCancellation(actorId: string, taskId: string, reason: string) {
+    this.requireAgentMember(actorId);
+    const task = this.getTaskRow(taskId);
+    if (task.issuer_id !== actorId) throw new Error("only the task issuer can request cancellation");
+    if (task.status !== "blocked") throw new Error("only blocked tasks require a Boss cancellation request");
+    const openChildren = this.db.prepare("SELECT id FROM tasks WHERE parent_id = ? AND status NOT IN ('closed', 'canceled')").all(taskId) as Row[];
+    if (openChildren.length > 0) throw new Error("cascade cancellation is forbidden; resolve child tasks first");
+    const existing = this.db.prepare("SELECT * FROM task_cancel_requests WHERE task_id = ? AND status = 'pending'").get(taskId) as Row | undefined;
+    if (existing) return mapTaskCancelRequest(existing);
+    return this.transaction(() => {
+      const id = randomUUID();
+      const createdAt = nowIso();
+      const normalizedReason = required(reason, "reason");
+      this.db.prepare(`
+        INSERT INTO task_cancel_requests (id, task_id, requester_id, reason, status, created_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
+      `).run(id, taskId, actorId, normalizedReason, createdAt);
+      this.audit({
+        actorId,
+        action: "task.cancel_requested",
+        entityType: "task",
+        entityId: taskId,
+        reason: normalizedReason,
+        after: { requestId: id },
+      });
+      if (this.bossEmailEnabled) {
+        this.queueBossTaskActionEmail(taskId, "cancel_requested", id, {
+          requestId: id,
+          requesterId: actorId,
+          reason: normalizedReason,
+          blockedReason: task.blocked_reason,
+        }, createdAt);
+      }
+      return mapTaskCancelRequest(this.db.prepare("SELECT * FROM task_cancel_requests WHERE id = ?").get(id) as Row);
+    });
+  }
+
+  reviewTaskCancellationRequest(
+    actorId: "boss",
+    taskId: string,
+    requestId: string,
+    decision: "accept" | "reject",
+    feedback?: string,
+  ) {
+    if (actorId !== "boss") throw new Error("only Boss can review task cancellation requests");
+    const request = this.db.prepare("SELECT * FROM task_cancel_requests WHERE id = ? AND task_id = ?").get(requestId, taskId) as Row | undefined;
+    if (!request) throw new Error("task cancellation request not found");
+    if (request.status !== "pending") throw new Error("task cancellation request is no longer pending");
+    const task = this.getTaskRow(taskId);
+    if (task.status !== "blocked") {
+      this.transaction(() => this.cancelPendingTaskCancelRequest(taskId, "boss", "task is no longer blocked"));
+      throw new Error("task cancellation request is stale because the task is no longer blocked");
+    }
+    const now = nowIso();
+    if (decision === "accept") {
+      return this.transaction(() => {
+        this.db.prepare(`
+          UPDATE task_cancel_requests SET status = 'approved', reviewer_id = 'boss', feedback = ?, reviewed_at = ? WHERE id = ?
+        `).run(feedback?.trim() || null, now, requestId);
+        const canceled = this.performTaskCancellation("boss", task, request.reason, requestId);
+        this.queueCancelRequestResultNotifications(task, request, "cancel_request_accepted", feedback?.trim() || null, now);
+        this.audit({
+          actorId: "boss",
+          action: "task.cancel_request_approved",
+          entityType: "task",
+          entityId: taskId,
+          reason: feedback?.trim() || undefined,
+          after: { requestId },
+        });
+        return { request: mapTaskCancelRequest(this.db.prepare("SELECT * FROM task_cancel_requests WHERE id = ?").get(requestId) as Row), task: canceled };
+      });
+    }
+    const normalizedFeedback = required(feedback, "feedback");
+    return this.transaction(() => {
+      this.db.prepare(`
+        UPDATE task_cancel_requests SET status = 'rejected', reviewer_id = 'boss', feedback = ?, reviewed_at = ? WHERE id = ?
+      `).run(normalizedFeedback, now, requestId);
+      this.queueCancelRequestResultNotifications(task, request, "cancel_request_rejected", normalizedFeedback, now);
+      this.audit({
+        actorId: "boss",
+        action: "task.cancel_request_rejected",
+        entityType: "task",
+        entityId: taskId,
+        reason: normalizedFeedback,
+        after: { requestId },
+      });
+      return {
+        request: mapTaskCancelRequest(this.db.prepare("SELECT * FROM task_cancel_requests WHERE id = ?").get(requestId) as Row),
+        task: this.readTask("boss", taskId, false),
+      };
+    });
+  }
+
+  private performTaskCancellation(actorId: Actor, before: Row, reason: string, requestId?: string) {
+    const taskId = before.id as string;
     if (TERMINAL_TASK_STATUSES.has(before.status as TaskStatus)) throw new Error("task is already terminal");
     const openChildren = this.db.prepare("SELECT id FROM tasks WHERE parent_id = ? AND status NOT IN ('closed', 'canceled')").all(taskId) as Row[];
     if (openChildren.length > 0) throw new Error("cascade cancellation is forbidden; resolve child tasks first");
     const now = nowIso();
-    this.transaction(() => {
+    return this.transaction(() => {
+      const cancellationId = randomUUID();
+      const normalizedReason = required(reason, "reason");
+      this.db.prepare(`
+        INSERT INTO task_cancellation_events (
+          id, task_id, actor_id, request_id, status_before, reason, canceled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(cancellationId, taskId, actorId, requestId ?? null, before.status, normalizedReason, now);
       this.db.prepare("UPDATE tasks SET status = 'canceled', canceled_at = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
         .run(now, now, now, taskId);
-      this.audit({ actorId, action: "task.canceled", entityType: "task", entityId: taskId, reason: required(reason, "reason"), before: mapTaskRow(before) });
+      this.audit({ actorId, action: "task.canceled", entityType: "task", entityId: taskId, reason: normalizedReason, before: mapTaskRow(before), after: { cancellationId, requestId: requestId ?? null } });
+      if (actorId !== before.assignee_id && !requestId) {
+        const prompt = [
+          "【Company OS 任务取消通知】",
+          `通知 ID：${cancellationId}（同一通知只处理一次）`,
+          `任务：${before.title}`,
+          `任务 ID：${before.id}`,
+          `取消人：${actorId}`,
+          `取消原因：${normalizedReason}`,
+          "任务现已取消。原取消人或 Boss 后续可恢复到取消前状态。",
+        ].join("\n");
+        this.insertTaskAgentDispatch(taskId, before.assignee_id, "cancel_request_accepted", prompt, now, cancellationId);
+      }
+      this.cancelPendingTaskCancelRequest(taskId, actorId, requestId ? "cancellation request approved" : "task canceled directly", requestId);
+      this.reconcileTaskPromptPool();
+      return this.readTask(actorId, taskId, false);
     });
-    return this.readTask(actorId, taskId, false);
+  }
+
+  private cancelPendingTaskCancelRequest(taskId: string, actorId: Actor, reason: string, exceptRequestId?: string) {
+    const rows = this.db.prepare(`
+      SELECT * FROM task_cancel_requests WHERE task_id = ? AND status = 'pending'
+        ${exceptRequestId ? "AND id != ?" : ""}
+    `).all(...(exceptRequestId ? [taskId, exceptRequestId] : [taskId])) as Row[];
+    for (const row of rows) {
+      const completedAt = nowIso();
+      this.db.prepare(`
+        UPDATE task_cancel_requests SET status = 'canceled', reviewer_id = ?, feedback = ?, reviewed_at = ? WHERE id = ?
+      `).run(actorId, reason, completedAt, row.id);
+      this.audit({
+        actorId,
+        action: "task.cancel_request_canceled",
+        entityType: "task",
+        entityId: taskId,
+        reason,
+        after: { requestId: row.id },
+      });
+    }
+  }
+
+  private queueCancelRequestResultNotifications(
+    task: Row,
+    request: Row,
+    kind: "cancel_request_accepted" | "cancel_request_rejected",
+    feedback: string | null,
+    createdAt: string,
+  ) {
+    const recipients = [...new Set([request.requester_id as string, task.assignee_id as string])].filter((id) => id !== "boss");
+    for (const recipient of recipients) {
+      const id = randomUUID();
+      const prompt = [
+        "【Company OS 任务取消申请结果】",
+        `通知 ID：${id}（同一通知只处理一次）`,
+        `任务：${task.title}`,
+        `任务 ID：${task.id}`,
+        `审批结果：${kind === "cancel_request_accepted" ? "Boss 已批准取消" : "Boss 已驳回取消申请"}`,
+        `申请理由：${request.reason}`,
+        ...(feedback ? [`Boss 意见：${feedback}`] : []),
+        kind === "cancel_request_accepted"
+          ? "任务现已取消，无需继续执行。"
+          : "任务保持阻塞，请读取最新任务并继续处理阻塞或按 Boss 意见调整方案。",
+      ].join("\n");
+      this.insertTaskAgentDispatch(task.id, recipient, kind, prompt, createdAt, request.id);
+    }
+  }
+
+  correctTaskTerminalDecision(
+    actorId: Actor,
+    taskId: string,
+    action: TaskCorrectionAction,
+    reason: string,
+    reviewReport?: TaskReviewReport,
+  ) {
+    if (actorId !== "boss") this.requireAgentMember(actorId);
+    const task = this.getTaskRow(taskId);
+    const normalizedReason = required(reason, "reason");
+    const ancestors: Row[] = [];
+    let parentId = task.parent_id as string | null;
+    while (parentId) {
+      const parent = this.getTaskRow(parentId);
+      ancestors.push(parent);
+      parentId = parent.parent_id as string | null;
+    }
+    const highestCanceledAncestor = [...ancestors].reverse().find((ancestor) => ancestor.status === "canceled");
+    if (highestCanceledAncestor) {
+      throw new Error(`restore the highest canceled ancestor first: ${highestCanceledAncestor.id}`);
+    }
+
+    let sourceSubmission: Row | undefined;
+    let sourceCancellation: Row | undefined;
+    let normalizedReport: TaskReviewReport | null = null;
+    let correctionKind: "acceptance_revoked" | "cancellation_restored";
+    let restoredStatus: TaskStatus = "in_progress";
+    let originalDecider: string;
+    if (action === "revoke_acceptance") {
+      if (task.status !== "closed") throw new Error("only a closed task can fail a second acceptance review");
+      sourceSubmission = this.db.prepare(`
+        SELECT * FROM task_submissions WHERE task_id = ? AND status = 'accepted'
+        ORDER BY reviewed_at DESC, created_at DESC LIMIT 1
+      `).get(taskId) as Row | undefined;
+      if (!sourceSubmission) throw new Error("accepted task submission not found");
+      originalDecider = sourceSubmission.reviewer_id as string;
+      if (actorId !== "boss" && originalDecider !== actorId) {
+        throw new Error("only Boss or the original reviewer can revoke this acceptance");
+      }
+      const evidence = parseJson<EvidenceInput[]>(sourceSubmission.evidence_json, []);
+      normalizedReport = actorId === "boss" && !reviewReport
+        ? null
+        : normalizeTaskReviewReport(reviewReport, "reject", evidence.length);
+      correctionKind = "acceptance_revoked";
+    } else {
+      if (task.status !== "canceled") throw new Error("only a canceled task can be restored");
+      sourceCancellation = this.db.prepare(`
+        SELECT * FROM task_cancellation_events
+        WHERE task_id = ? AND restored_at IS NULL ORDER BY canceled_at DESC LIMIT 1
+      `).get(taskId) as Row | undefined;
+      if (!sourceCancellation) throw new Error("active task cancellation event not found");
+      originalDecider = sourceCancellation.actor_id as string;
+      if (actorId !== "boss" && originalDecider !== actorId) {
+        throw new Error("only Boss or the original canceler can restore this task");
+      }
+      restoredStatus = sourceCancellation.status_before as TaskStatus;
+      if (restoredStatus === "review") {
+        const pending = this.db.prepare("SELECT 1 AS ok FROM task_submissions WHERE task_id = ? AND status = 'pending'").get(taskId);
+        if (!pending) restoredStatus = "in_progress";
+      }
+      correctionKind = "cancellation_restored";
+    }
+
+    const correctionId = randomUUID();
+    const now = nowIso();
+    return this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO task_corrections (id, target_task_id, kind, actor_id, reason, report_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(correctionId, taskId, correctionKind, actorId, normalizedReason, normalizedReport ? JSON.stringify(normalizedReport) : null, now);
+
+      const impacts: Array<{ row: Row; role: "target" | "ancestor"; before: TaskStatus; after: TaskStatus; submissionId?: string }> = [];
+      if (action === "revoke_acceptance") {
+        this.db.prepare(`
+          UPDATE tasks SET status = 'in_progress', review_feedback = ?, submitted_at = NULL,
+            closed_at = NULL, canceled_at = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?
+        `).run(normalizedReason, now, now, taskId);
+        impacts.push({ row: task, role: "target", before: "closed", after: "in_progress", submissionId: sourceSubmission!.id });
+      } else {
+        this.db.prepare(`
+          UPDATE tasks SET status = ?, canceled_at = NULL, updated_at = ?, last_activity_at = ? WHERE id = ?
+        `).run(restoredStatus, now, now, taskId);
+        this.db.prepare(`
+          UPDATE task_cancellation_events SET restored_by = ?, restored_reason = ?, restored_at = ? WHERE id = ?
+        `).run(actorId, normalizedReason, now, sourceCancellation!.id);
+        impacts.push({ row: task, role: "target", before: "canceled", after: restoredStatus });
+      }
+
+      for (const ancestor of ancestors) {
+        if (ancestor.status === "closed") {
+          this.db.prepare(`
+            UPDATE tasks SET status = 'in_progress', closed_at = NULL, submitted_at = NULL,
+              review_feedback = ?, updated_at = ?, last_activity_at = ? WHERE id = ?
+          `).run(`Descendant correction ${correctionId}: ${normalizedReason}`, now, now, ancestor.id);
+          impacts.push({ row: ancestor, role: "ancestor", before: "closed", after: "in_progress" });
+        } else if (ancestor.status === "review") {
+          const submission = this.db.prepare(`
+            SELECT * FROM task_submissions WHERE task_id = ? AND status = 'pending'
+            ORDER BY created_at DESC LIMIT 1
+          `).get(ancestor.id) as Row | undefined;
+          if (submission) {
+            this.db.prepare(`
+              UPDATE task_submissions SET status = 'invalidated', reviewer_id = ?, feedback = ?, reviewed_at = ? WHERE id = ?
+            `).run(actorId, `Descendant correction ${correctionId}: ${normalizedReason}`, now, submission.id);
+            this.db.prepare(`
+              DELETE FROM task_review_email_notifications WHERE submission_id = ? AND status != 'sent'
+            `).run(submission.id);
+          }
+          this.db.prepare(`
+            UPDATE tasks SET status = 'in_progress', submitted_at = NULL, review_feedback = ?,
+              updated_at = ?, last_activity_at = ? WHERE id = ?
+          `).run(`Descendant correction ${correctionId}: ${normalizedReason}`, now, now, ancestor.id);
+          impacts.push({ row: ancestor, role: "ancestor", before: "review", after: "in_progress", submissionId: submission?.id });
+        }
+      }
+
+      for (const impact of impacts) {
+        this.db.prepare(`
+          INSERT INTO task_correction_impacts (
+            correction_id, task_id, role, status_before, status_after, submission_id
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(correctionId, impact.row.id, impact.role, impact.before, impact.after, impact.submissionId ?? null);
+      }
+
+      const recipients = new Set<string>([task.assignee_id, originalDecider]);
+      impacts.filter((impact) => impact.role === "ancestor").forEach((impact) => recipients.add(impact.row.assignee_id));
+      recipients.delete("boss");
+      recipients.delete(actorId);
+      for (const recipient of recipients) {
+        const prompt = [
+          action === "revoke_acceptance"
+            ? "【Company OS 二次审查不通过】"
+            : "【Company OS 任务取消恢复】",
+          `纠错 ID：${correctionId}（同一通知只处理一次）`,
+          `任务：${task.title}`,
+          `任务 ID：${task.id}`,
+          `纠错人：${actorId}`,
+          `原因：${normalizedReason}`,
+          action === "revoke_acceptance"
+            ? "原 accepted 提交与验收报告已永久保留；任务和必要祖先已恢复为 in_progress。请读取最新任务、按纠错意见整改并重新提交验收。"
+            : `任务已从 canceled 恢复为 ${restoredStatus}。请读取最新任务并按恢复后的真实状态继续处理。`,
+        ].join("\n");
+        this.insertTaskAgentDispatch(taskId, recipient, correctionKind, prompt, now, correctionId);
+      }
+      this.audit({
+        actorId,
+        action: `task.${correctionKind}`,
+        entityType: "task",
+        entityId: taskId,
+        reason: normalizedReason,
+        before: mapTaskRow(task),
+        after: { correctionId, impacts: impacts.map((impact) => ({ taskId: impact.row.id, before: impact.before, after: impact.after })) },
+      });
+      this.reconcileTaskPromptPool();
+      return this.readTask(actorId, taskId, false);
+    });
+  }
+
+  private mapTaskCorrection(row: Row): TaskCorrection {
+    const impacts = this.db.prepare(`
+      SELECT * FROM task_correction_impacts WHERE correction_id = ?
+      ORDER BY CASE role WHEN 'target' THEN 0 ELSE 1 END, rowid
+    `).all(row.id) as Row[];
+    return {
+      id: row.id,
+      taskId: row.target_task_id,
+      actorId: row.actor_id,
+      action: row.kind === "acceptance_revoked" ? "revoke_acceptance" : "restore_cancellation",
+      reason: row.reason,
+      reviewReport: parseJson<TaskReviewReport | null>(row.report_json, null),
+      createdAt: row.created_at,
+      impacts: impacts.map((impact) => ({
+        taskId: impact.task_id,
+        statusBefore: impact.status_before,
+        statusAfter: impact.status_after,
+        invalidatedSubmissionId: impact.submission_id ?? null,
+      })),
+    };
   }
 
   private insertTask(input: {
@@ -2307,6 +3677,7 @@ export class CompanyOsStore {
       this.db.prepare("UPDATE tasks SET updated_at = ?, last_activity_at = ? WHERE id = ?").run(now, now, input.parentId);
     }
     this.audit({ actorId: input.actorId, action: "task.created", entityType: "task", entityId: id, after: { ...input, id } });
+    this.reconcileTaskPromptPool();
     return this.decorateTasks([this.getTaskRow(id)])[0]!;
   }
 
@@ -2828,6 +4199,290 @@ export class CompanyOsStore {
     });
   }
 
+  // ── Daily self-governance ───────────────────────────────────
+
+  queueDailyAgentRun(kind: DailyAgentKind, scheduledAtInput: string | number | Date) {
+    const scheduledAt = new Date(scheduledAtInput);
+    if (!Number.isFinite(scheduledAt.getTime())) throw new Error("daily agent run scheduledAt is invalid");
+    const slot = shanghaiSlot(scheduledAt.getTime());
+    const config = this.dailyAgentConfig(kind);
+    if (slot.hour !== config.hour || slot.minute !== config.minute || slot.second !== 0 || slot.millisecond !== 0) {
+      throw new Error(`daily agent run does not match the configured ${kind} schedule`);
+    }
+    const slotKey = `${kind}:${slot.localDate}`;
+    const existing = this.db.prepare("SELECT id FROM daily_agent_runs WHERE slot_key = ?").get(slotKey) as Row | undefined;
+    if (existing) return this.dailyAgentRunSummary(existing.id);
+
+    return this.transaction(() => {
+      const runId = randomUUID();
+      const createdAt = nowIso();
+      this.db.prepare(`
+        INSERT INTO daily_agent_runs (
+          id, kind, slot_key, scheduled_at, local_date, local_hour, local_minute, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(runId, kind, slotKey, scheduledAt.toISOString(), slot.localDate, slot.hour, slot.minute, createdAt);
+
+      const employees = this.listMembers()
+        .filter((member) => member.kind === "agent" && member.active && member.agentId)
+        .sort((a, b) => a.level - b.level || (a.agentId ?? a.id).localeCompare(b.agentId ?? b.id));
+      employees.forEach((employee, position) => {
+        const dispatchId = randomUUID();
+        const targetAgentId = employee.agentId ?? employee.id;
+        const dispatchAt = new Date(scheduledAt.getTime() + position * 60_000).toISOString();
+        const sessionKey = `agent:${targetAgentId}:${DAILY_SELF_AUDIT_SESSION_NAME}`;
+        this.db.prepare(`
+          INSERT INTO daily_agent_dispatches (
+            id, run_id, target_member_id, position, scheduled_at, session_key, prompt, status, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        `).run(dispatchId, runId, employee.id, position, dispatchAt, sessionKey, DAILY_AGENT_PROMPTS[kind], createdAt);
+        this.audit({
+          actorId: "system",
+          action: `${dailyAgentAuditPrefix(kind)}_dispatch_queued`,
+          entityType: "daily_agent_run",
+          entityId: runId,
+          after: { dispatchId, targetMemberId: employee.id, position, scheduledAt: dispatchAt, sessionKey },
+        });
+      });
+
+      this.audit({
+        actorId: "system",
+        action: employees.length === 0 ? `${dailyAgentAuditPrefix(kind)}_empty` : `${dailyAgentAuditPrefix(kind)}_created`,
+        entityType: "daily_agent_run",
+        entityId: runId,
+        after: {
+          kind,
+          scheduledAt: scheduledAt.toISOString(),
+          localDate: slot.localDate,
+          employeeCount: employees.length,
+        },
+      });
+      return this.dailyAgentRunSummary(runId);
+    });
+  }
+
+  recoverDailyAgentDispatches() {
+    return this.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT d.*, r.kind FROM daily_agent_dispatches d
+        JOIN daily_agent_runs r ON r.id = d.run_id
+        WHERE d.status = 'running' OR (d.status = 'pending' AND d.attempts > 0)
+      `).all() as Row[];
+      const completedAt = nowIso();
+      for (const row of rows) {
+        const reason = "Daily self-governance dispatch had already been attempted; automatic retry suppressed to avoid duplicate workspace edits";
+        this.db.prepare(`
+          UPDATE daily_agent_dispatches SET status = 'failed', lease_expires_at = NULL,
+            last_error = ?, completed_at = ? WHERE id = ?
+        `).run(reason, completedAt, row.id);
+        this.audit({
+          actorId: "system",
+          action: `${dailyAgentAuditPrefix(row.kind)}_dispatch_failed`,
+          entityType: "daily_agent_run",
+          entityId: row.run_id,
+          reason,
+          after: { dispatchId: row.id, targetMemberId: row.target_member_id, attempts: row.attempts },
+        });
+      }
+      return rows.length;
+    });
+  }
+
+  claimNextDailyAgentDispatch(
+    now = Date.now(),
+    excludedTargetMemberIds: ReadonlySet<string> = new Set(),
+    leaseMs = 15 * 60 * 1000,
+  ): DailyAgentDispatch | null {
+    return this.transaction(() => {
+      while (true) {
+        const rows = this.pendingDailyAgentDispatchRows(now);
+        const row = rows.find((candidate) => !excludedTargetMemberIds.has(candidate.target_member_id));
+        if (!row) return null;
+        const member = this.getMember(row.target_member_id, { active: false });
+        if (!member.active) {
+          this.cancelDailyAgentDispatch(row, "target member is inactive");
+          continue;
+        }
+        const targetAgentId = this.runtimeAgentId(row.target_member_id);
+        const startedAt = nowIso();
+        this.db.prepare(`
+          UPDATE daily_agent_dispatches SET status = 'running', attempts = attempts + 1,
+            started_at = ?, lease_expires_at = ?, last_error = NULL WHERE id = ?
+        `).run(startedAt, new Date(now + leaseMs).toISOString(), row.id);
+        this.audit({
+          actorId: "system",
+          action: `${dailyAgentAuditPrefix(row.kind)}_dispatch_started`,
+          entityType: "daily_agent_run",
+          entityId: row.run_id,
+          after: { dispatchId: row.id, targetMemberId: row.target_member_id, attempts: Number(row.attempts) + 1 },
+        });
+        return mapDailyAgentDispatch({
+          ...row,
+          target_runtime_agent_id: targetAgentId,
+          status: "running",
+          attempts: Number(row.attempts) + 1,
+          started_at: startedAt,
+        });
+      }
+    });
+  }
+
+  nextPendingDailyAgentDispatchAt(excludedTargetMemberIds: ReadonlySet<string> = new Set()) {
+    const row = this.pendingDailyAgentDispatchRows()
+      .find((candidate) => !excludedTargetMemberIds.has(candidate.target_member_id));
+    return row?.scheduled_at as string | undefined;
+  }
+
+  completeDailyAgentDispatch(dispatchId: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT d.*, r.kind FROM daily_agent_dispatches d
+        JOIN daily_agent_runs r ON r.id = d.run_id WHERE d.id = ?
+      `).get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const completedAt = nowIso();
+      this.db.prepare(`
+        UPDATE daily_agent_dispatches SET status = 'succeeded', completed_at = ?,
+          lease_expires_at = NULL, last_error = NULL WHERE id = ?
+      `).run(completedAt, dispatchId);
+      this.audit({
+        actorId: "system",
+        action: `${dailyAgentAuditPrefix(row.kind)}_dispatch_delivered`,
+        entityType: "daily_agent_run",
+        entityId: row.run_id,
+        after: { dispatchId, targetMemberId: row.target_member_id, attempts: row.attempts },
+      });
+      return true;
+    });
+  }
+
+  failDailyAgentDispatch(dispatchId: string, error: string) {
+    return this.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT d.*, r.kind FROM daily_agent_dispatches d
+        JOIN daily_agent_runs r ON r.id = d.run_id WHERE d.id = ?
+      `).get(dispatchId) as Row | undefined;
+      if (!row || row.status !== "running") return false;
+      const reason = required(error, "daily agent dispatch error").slice(0, 1000);
+      this.db.prepare(`
+        UPDATE daily_agent_dispatches SET status = 'failed', last_error = ?, completed_at = ?,
+          lease_expires_at = NULL WHERE id = ?
+      `).run(reason, nowIso(), dispatchId);
+      this.audit({
+        actorId: "system",
+        action: `${dailyAgentAuditPrefix(row.kind)}_dispatch_failed`,
+        entityType: "daily_agent_run",
+        entityId: row.run_id,
+        reason,
+        after: { dispatchId, targetMemberId: row.target_member_id, attempts: row.attempts },
+      });
+      return true;
+    });
+  }
+
+  dailySelfGovernanceSummary(now = Date.now()): DailySelfGovernanceSummary {
+    const localDate = shanghaiSlot(now).localDate;
+    const firstLocalDate = shanghaiLocalDateDaysAgo(now, 6);
+    const runRows = this.db.prepare(`
+      SELECT * FROM daily_agent_runs
+      WHERE local_date BETWEEN ? AND ?
+      ORDER BY local_date DESC,
+        CASE kind WHEN 'daily_self_improvement' THEN 0 ELSE 1 END,
+        scheduled_at DESC
+    `).all(firstLocalDate, localDate) as Row[];
+    const history = runRows.map((row) => this.dailyAgentRunSummary(row.id));
+    const backlog = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM daily_agent_dispatches
+      WHERE status = 'pending' AND attempts = 0 AND scheduled_at <= ?
+    `).get(new Date(now).toISOString()) as Row;
+    const selfToday = history.find((run) => run.kind === "daily_self_improvement" && run.localDate === localDate) ?? null;
+    const personaToday = history.find((run) => run.kind === "daily_persona_audit" && run.localDate === localDate) ?? null;
+    return {
+      timeZone: "Asia/Shanghai",
+      sessionName: DAILY_SELF_AUDIT_SESSION_NAME,
+      backlog: Number(backlog.count),
+      mechanisms: {
+        selfImprovement: {
+          enabled: this.dailySelfImprovementConfig.enabled,
+          hour: this.dailySelfImprovementConfig.hour,
+          minute: this.dailySelfImprovementConfig.minute,
+          nextRunAt: this.dailySelfImprovementConfig.enabled
+            ? nextDailyAgentRunAt(now, this.dailySelfImprovementConfig.hour, this.dailySelfImprovementConfig.minute)
+            : null,
+          today: selfToday,
+        },
+        personaAudit: {
+          enabled: this.dailyPersonaAuditConfig.enabled,
+          hour: this.dailyPersonaAuditConfig.hour,
+          minute: this.dailyPersonaAuditConfig.minute,
+          nextRunAt: this.dailyPersonaAuditConfig.enabled
+            ? nextDailyAgentRunAt(now, this.dailyPersonaAuditConfig.hour, this.dailyPersonaAuditConfig.minute)
+            : null,
+          today: personaToday,
+        },
+      },
+      history,
+    };
+  }
+
+  private dailyAgentConfig(kind: DailyAgentKind) {
+    return kind === "daily_self_improvement" ? this.dailySelfImprovementConfig : this.dailyPersonaAuditConfig;
+  }
+
+  private pendingDailyAgentDispatchRows(now?: number) {
+    return this.db.prepare(`
+      SELECT d.*, r.kind FROM daily_agent_dispatches d
+      JOIN daily_agent_runs r ON r.id = d.run_id
+      WHERE d.status = 'pending' AND d.attempts = 0
+        ${now === undefined ? "" : "AND d.scheduled_at <= ?"}
+      ORDER BY d.scheduled_at,
+        CASE r.kind WHEN 'daily_self_improvement' THEN 0 ELSE 1 END,
+        d.position, d.created_at, d.rowid
+    `).all(...(now === undefined ? [] : [new Date(now).toISOString()])) as Row[];
+  }
+
+  private cancelDailyAgentDispatch(row: Row, reason: string) {
+    const completedAt = nowIso();
+    this.db.prepare(`
+      UPDATE daily_agent_dispatches SET status = 'canceled', last_error = ?, completed_at = ?,
+        lease_expires_at = NULL WHERE id = ?
+    `).run(reason, completedAt, row.id);
+    this.audit({
+      actorId: "system",
+      action: `${dailyAgentAuditPrefix(row.kind)}_dispatch_canceled`,
+      entityType: "daily_agent_run",
+      entityId: row.run_id,
+      reason,
+      after: { dispatchId: row.id, targetMemberId: row.target_member_id },
+    });
+  }
+
+  private dailyAgentRunSummary(runId: string): DailyAgentRunSummary {
+    const run = this.db.prepare("SELECT * FROM daily_agent_runs WHERE id = ?").get(runId) as Row;
+    const rows = this.db.prepare(`
+      SELECT d.*, r.kind FROM daily_agent_dispatches d
+      JOIN daily_agent_runs r ON r.id = d.run_id
+      WHERE d.run_id = ? ORDER BY d.position, d.created_at, d.rowid
+    `).all(runId) as Row[];
+    const dispatches = rows.map((row) => {
+      const { prompt: _prompt, ...dispatch } = mapDailyAgentDispatch(row);
+      return dispatch;
+    });
+    const count = (status: string) => dispatches.filter((dispatch) => dispatch.status === status).length;
+    return {
+      id: run.id,
+      kind: run.kind,
+      localDate: run.local_date,
+      scheduledAt: run.scheduled_at,
+      planned: dispatches.length,
+      pending: count("pending"),
+      running: count("running"),
+      succeeded: count("succeeded"),
+      failed: count("failed"),
+      canceled: count("canceled"),
+      dispatches,
+    };
+  }
+
   // ── Meetings ──────────────────────────────────────────────
 
   requestMeeting(actorId: Actor, input: {
@@ -2943,6 +4598,66 @@ export class CompanyOsStore {
     }));
   }
 
+  pendingTaskReviewEmailNotifications(limit = 20): TaskReviewEmailNotification[] {
+    const rows = this.db.prepare(`
+      SELECT n.id AS notification_id, n.task_id, n.submission_id,
+        t.title, t.acceptance_criteria, t.assignee_id,
+        assignee.name AS assignee_name, s.summary, s.evidence_json,
+        s.created_at AS submitted_at
+      FROM task_review_email_notifications n
+      JOIN tasks t ON t.id = n.task_id
+      JOIN task_submissions s ON s.id = n.submission_id
+      JOIN members assignee ON assignee.id = t.assignee_id
+      WHERE n.status IN ('pending', 'failed') AND n.attempts < 5
+      ORDER BY n.created_at, n.rowid LIMIT ?
+    `).all(Math.min(Math.max(Math.floor(limit), 1), 100)) as Row[];
+    return rows.map((row) => ({
+      id: row.notification_id,
+      kind: "task_review_requested",
+      taskId: row.task_id,
+      submissionId: row.submission_id,
+      title: row.title,
+      acceptanceCriteria: row.acceptance_criteria,
+      assigneeId: row.assignee_id,
+      assigneeName: row.assignee_name,
+      submittedAt: row.submitted_at,
+      summary: row.summary,
+      evidence: parseJson<EvidenceInput[]>(row.evidence_json, []),
+    }));
+  }
+
+  pendingBossTaskActionEmailNotifications(limit = 20): BossTaskActionEmailNotification[] {
+    const rows = this.db.prepare(`
+      SELECT n.id AS notification_id, n.kind, n.source_id, n.payload_json, n.created_at,
+        t.id AS task_id, t.title, t.assignee_id, t.issuer_id,
+        assignee.name AS assignee_name
+      FROM boss_task_action_email_notifications n
+      JOIN tasks t ON t.id = n.task_id
+      JOIN members assignee ON assignee.id = t.assignee_id
+      WHERE n.status IN ('pending', 'failed') AND n.attempts < 5
+      ORDER BY n.created_at, n.rowid LIMIT ?
+    `).all(Math.min(Math.max(Math.floor(limit), 1), 100)) as Row[];
+    return rows.map((row) => {
+      const payload = parseJson<Record<string, any>>(row.payload_json, {});
+      return {
+        id: row.notification_id,
+        kind: row.kind === "block_escalated" ? "task_block_escalated" : "task_cancel_requested",
+        taskId: row.task_id,
+        title: row.title,
+        assigneeId: row.assignee_id,
+        assigneeName: row.assignee_name,
+        issuerId: row.issuer_id,
+        createdAt: row.created_at,
+        reason: String(payload.reason ?? ""),
+        blockedReason: payload.blockedReason ?? null,
+        sourceId: row.source_id,
+        ...(payload.requesterId ? { requesterId: String(payload.requesterId) } : {}),
+        ...(payload.parentTaskId ? { parentTaskId: String(payload.parentTaskId) } : {}),
+        ...(payload.parentTitle ? { parentTitle: String(payload.parentTitle) } : {}),
+      } as BossTaskActionEmailNotification;
+    });
+  }
+
   markMeetingEmailSent(notificationId: string) {
     this.transaction(() => {
       const row = this.db.prepare("SELECT * FROM meeting_email_notifications WHERE id = ?").get(notificationId) as Row | undefined;
@@ -2965,6 +4680,82 @@ export class CompanyOsStore {
           last_error = ? WHERE id = ?
       `).run(message, notificationId);
       this.audit({ actorId: "system", action: "meeting.email_failed", entityType: "meeting", entityId: row.meeting_id, reason: message, after: { kind: row.kind } });
+    });
+  }
+
+  markTaskReviewEmailSent(notificationId: string) {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_review_email_notifications WHERE id = ?").get(notificationId) as Row | undefined;
+      if (!row || row.status === "sent") return;
+      this.db.prepare(`
+        UPDATE task_review_email_notifications SET status = 'sent', attempts = attempts + 1,
+          last_error = NULL, sent_at = ? WHERE id = ?
+      `).run(nowIso(), notificationId);
+      this.audit({
+        actorId: "system",
+        action: "task.review_email_sent",
+        entityType: "task",
+        entityId: row.task_id,
+        after: { notificationId, submissionId: row.submission_id },
+      });
+    });
+  }
+
+  markTaskReviewEmailFailed(notificationId: string, error: string) {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM task_review_email_notifications WHERE id = ?").get(notificationId) as Row | undefined;
+      if (!row || row.status === "sent") return;
+      const message = error.trim().slice(0, 1000) || "unknown SMTP error";
+      this.db.prepare(`
+        UPDATE task_review_email_notifications SET status = 'failed', attempts = attempts + 1,
+          last_error = ? WHERE id = ?
+      `).run(message, notificationId);
+      this.audit({
+        actorId: "system",
+        action: "task.review_email_failed",
+        entityType: "task",
+        entityId: row.task_id,
+        reason: message,
+        after: { notificationId, submissionId: row.submission_id },
+      });
+    });
+  }
+
+  markBossTaskActionEmailSent(notificationId: string) {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM boss_task_action_email_notifications WHERE id = ?").get(notificationId) as Row | undefined;
+      if (!row || row.status === "sent") return;
+      this.db.prepare(`
+        UPDATE boss_task_action_email_notifications SET status = 'sent', attempts = attempts + 1,
+          last_error = NULL, sent_at = ? WHERE id = ?
+      `).run(nowIso(), notificationId);
+      this.audit({
+        actorId: "system",
+        action: "task.boss_action_email_sent",
+        entityType: "task",
+        entityId: row.task_id,
+        after: { notificationId, kind: row.kind, sourceId: row.source_id },
+      });
+    });
+  }
+
+  markBossTaskActionEmailFailed(notificationId: string, error: string) {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM boss_task_action_email_notifications WHERE id = ?").get(notificationId) as Row | undefined;
+      if (!row || row.status === "sent") return;
+      const message = error.trim().slice(0, 1000) || "unknown SMTP error";
+      this.db.prepare(`
+        UPDATE boss_task_action_email_notifications SET status = 'failed', attempts = attempts + 1,
+          last_error = ? WHERE id = ?
+      `).run(message, notificationId);
+      this.audit({
+        actorId: "system",
+        action: "task.boss_action_email_failed",
+        entityType: "task",
+        entityId: row.task_id,
+        reason: message,
+        after: { notificationId, kind: row.kind, sourceId: row.source_id },
+      });
     });
   }
 
@@ -3029,6 +4820,25 @@ export class CompanyOsStore {
     if (rows.length > 1) throw new Error("meeting room invariant violated: multiple active meetings");
     this.assertMeetingReadable(actorId, meeting);
     return meeting.id as string;
+  }
+
+  activeMeetingForMember(memberId: string) {
+    this.requireAgentMember(memberId);
+    const meeting = this.db.prepare(`
+      SELECT m.id, m.title
+      FROM meetings m
+      WHERE m.status = 'active'
+        AND (
+          m.host_id = ?
+          OR EXISTS (
+            SELECT 1 FROM meeting_participants participant
+            WHERE participant.meeting_id = m.id AND participant.member_id = ?
+          )
+        )
+      ORDER BY m.started_at, m.created_at
+      LIMIT 1
+    `).get(memberId, memberId) as Row | undefined;
+    return meeting ? { id: meeting.id as string, title: meeting.title as string } : null;
   }
 
   startMeetingByBoss(meetingId: string): MeetingAdvance {
@@ -3658,6 +5468,48 @@ export class CompanyOsStore {
     `).run(id, meetingId, kind, nowIso());
     if (Number(result.changes) > 0) {
       this.audit({ actorId: "system", action: "meeting.email_queued", entityType: "meeting", entityId: meetingId, after: { kind } });
+    }
+  }
+
+  private queueTaskReviewEmail(taskId: string, submissionId: string, createdAt: string) {
+    const id = randomUUID();
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO task_review_email_notifications (
+        id, task_id, submission_id, status, created_at
+      ) VALUES (?, ?, ?, 'pending', ?)
+    `).run(id, taskId, submissionId, createdAt);
+    if (Number(result.changes) > 0) {
+      this.audit({
+        actorId: "system",
+        action: "task.review_email_queued",
+        entityType: "task",
+        entityId: taskId,
+        after: { notificationId: id, submissionId },
+      });
+    }
+  }
+
+  private queueBossTaskActionEmail(
+    taskId: string,
+    kind: "block_escalated" | "cancel_requested",
+    sourceId: string,
+    payload: Record<string, unknown>,
+    createdAt: string,
+  ) {
+    const id = randomUUID();
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO boss_task_action_email_notifications (
+        id, task_id, kind, source_id, payload_json, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+    `).run(id, taskId, kind, sourceId, JSON.stringify(payload), createdAt);
+    if (Number(result.changes) > 0) {
+      this.audit({
+        actorId: "system",
+        action: "task.boss_action_email_queued",
+        entityType: "task",
+        entityId: taskId,
+        after: { notificationId: id, kind, sourceId },
+      });
     }
   }
 
@@ -4711,8 +6563,9 @@ export class CompanyOsStore {
         queue: meetings.filter((meeting) => meeting.status === "queued"),
         history: meetings.filter((meeting) => !OPEN_MEETING_STATUSES.has(meeting.status) && meeting.id !== closing?.id),
       },
-      taskHourlyCheckin: this.taskCheckinSummary(),
+      taskPromptPool: this.taskPromptPoolSummary(),
       noticeUnreadReminder: this.noticeReminderSummary(),
+      dailySelfGovernance: this.dailySelfGovernanceSummary(),
       generatedAt: nowIso(),
     };
   }
@@ -4780,6 +6633,7 @@ function mapTaskRow(row: Row) {
     status: row.status as TaskStatus,
     revision: Number(row.revision),
     blockedReason: row.blocked_reason,
+    blockedAt: row.blocked_at ?? null,
     reviewFeedback: row.review_feedback,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -4819,8 +6673,37 @@ function mapTaskSubmission(row: Row) {
     status: row.status,
     reviewerId: row.reviewer_id,
     feedback: row.feedback,
+    reviewReport: parseJson<TaskReviewReport | null>(row.review_report_json, null),
     createdAt: row.created_at,
     reviewedAt: row.reviewed_at,
+  };
+}
+
+function mapTaskCancelRequest(row: Row): TaskCancelRequest {
+  return {
+    id: row.id as string,
+    taskId: row.task_id as string,
+    requesterId: row.requester_id as string,
+    reason: row.reason as string,
+    status: row.status as TaskCancelRequest["status"],
+    reviewerId: (row.reviewer_id ?? null) as string | null,
+    feedback: (row.feedback ?? null) as string | null,
+    createdAt: row.created_at as string,
+    reviewedAt: (row.reviewed_at ?? null) as string | null,
+  };
+}
+
+function mapTaskCancellationEvent(row: Row): TaskCancellationEvent {
+  return {
+    id: row.id as string,
+    taskId: row.task_id as string,
+    actorId: row.actor_id as string,
+    requestId: (row.request_id ?? null) as string | null,
+    statusBefore: row.status_before as TaskStatus,
+    reason: row.reason as string,
+    canceledAt: row.canceled_at as string,
+    restoredBy: (row.restored_by ?? null) as string | null,
+    restoredAt: (row.restored_at ?? null) as string | null,
   };
 }
 
@@ -4831,6 +6714,7 @@ function mapTaskAgentDispatch(row: Row) {
     targetMemberId: row.target_agent_id as string,
     targetAgentId: (row.target_runtime_agent_id ?? row.target_agent_id) as string,
     kind: row.kind as TaskAgentDispatchKind,
+    sourceEventId: (row.source_event_id ?? null) as string | null,
     prompt: row.prompt as string,
     status: row.status as "pending" | "running" | "succeeded" | "failed" | "canceled",
     attempts: Number(row.attempts),
@@ -4838,6 +6722,54 @@ function mapTaskAgentDispatch(row: Row) {
     createdAt: row.created_at as string,
     startedAt: (row.started_at ?? null) as string | null,
     completedAt: (row.completed_at ?? null) as string | null,
+  };
+}
+
+function mapTaskPromptTick(row: Row) {
+  return {
+    id: row.id as string,
+    slotKey: row.slot_key as string,
+    scheduledAt: row.scheduled_at as string,
+    localDate: row.local_date as string,
+    localHour: Number(row.local_hour),
+    localMinute: Number(row.local_minute),
+    createdAt: row.created_at as string,
+  };
+}
+
+function mapTaskPromptPoolItem(row: Row): TaskPromptPoolItem {
+  return {
+    id: row.id,
+    memberId: row.member_id,
+    targetAgentId: row.target_runtime_agent_id ?? row.member_id,
+    taskId: row.task_id,
+    parentTaskId: row.parent_task_id ?? null,
+    kind: row.kind,
+    position: Number(row.queue_seq),
+    enqueuedAt: row.enqueued_at,
+    updatedAt: row.updated_at,
+    lastPromptedAt: row.last_prompted_at ?? null,
+    promptCount: Number(row.prompt_count),
+  };
+}
+
+function mapTaskPromptDispatch(row: Row): TaskPromptDispatch {
+  return {
+    id: row.id,
+    tickId: row.tick_id,
+    poolItemId: row.pool_item_id ?? null,
+    targetMemberId: row.target_member_id,
+    targetAgentId: row.target_runtime_agent_id ?? row.target_member_id,
+    taskId: row.task_id ?? null,
+    kind: row.kind ?? null,
+    scheduledAt: row.scheduled_at,
+    prompt: row.prompt ?? null,
+    status: row.status,
+    started: Boolean(row.started),
+    lastError: row.last_error ?? null,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
+    completedAt: row.completed_at ?? null,
   };
 }
 
@@ -4864,7 +6796,11 @@ function mapTaskCheckinDispatch(row: Row): TaskCheckinDispatch {
 }
 
 function taskDispatchAuditAction(kind: TaskAgentDispatchKind, phase: "queued" | "recovered" | "canceled" | "delivered" | "retry" | "failed") {
-  return kind === "boss_reminder" ? `task.reminder_${phase}` : `task.review_notification_${phase}`;
+  if (kind === "boss_reminder") return `task.reminder_${phase}`;
+  if (kind === "review_accepted" || kind === "review_rejected") return `task.review_notification_${phase}`;
+  if (kind === "block_escalated" || kind === "block_guidance") return `task.block_notification_${phase}`;
+  if (kind === "cancel_request_accepted" || kind === "cancel_request_rejected") return `task.cancel_notification_${phase}`;
+  return `task.correction_notification_${phase}`;
 }
 
 function buildNoticeReminderPrompt(candidates: NoticeReminderCandidate[], scheduledAt: string, dispatchId: string) {
@@ -4971,6 +6907,57 @@ function normalizeEvidence(evidence: EvidenceInput[]) {
   });
 }
 
+function normalizeTaskReviewReport(
+  report: TaskReviewReport | undefined,
+  decision: "accept" | "reject",
+  evidenceCount: number,
+): TaskReviewReport {
+  if (!report || !Array.isArray(report.checks) || report.checks.length === 0) {
+    throw new Error("reviewReport with at least one check is required");
+  }
+  const checks = report.checks.map((check, index) => {
+    const criterion = required(check?.criterion, `reviewReport.checks[${index}].criterion`);
+    const finding = required(check?.finding, `reviewReport.checks[${index}].finding`);
+    if (check.outcome !== "pass" && check.outcome !== "fail") {
+      throw new Error(`reviewReport.checks[${index}].outcome is invalid`);
+    }
+    if (!Array.isArray(check.evidenceIndexes)) {
+      throw new Error(`reviewReport.checks[${index}].evidenceIndexes is required`);
+    }
+    const evidenceIndexes = [...new Set(check.evidenceIndexes.map((value) => Number(value)))];
+    if (evidenceIndexes.some((value) => !Number.isInteger(value) || value < 0 || value >= evidenceCount)) {
+      throw new Error(`reviewReport.checks[${index}] contains an invalid evidence index`);
+    }
+    if (check.outcome === "pass" && evidenceIndexes.length === 0) {
+      throw new Error(`reviewReport.checks[${index}] must cite evidence when passing`);
+    }
+    const remediation = check.remediation?.trim() || undefined;
+    if (check.outcome === "fail" && !remediation) {
+      throw new Error(`reviewReport.checks[${index}].remediation is required when failing`);
+    }
+    return { criterion, outcome: check.outcome, evidenceIndexes, finding, ...(remediation ? { remediation } : {}) };
+  });
+  if (decision === "accept" && checks.some((check) => check.outcome !== "pass")) {
+    throw new Error("accepted reviews cannot contain failed checks");
+  }
+  if (decision === "reject" && !checks.some((check) => check.outcome === "fail")) {
+    throw new Error("rejected reviews must contain at least one failed check");
+  }
+  return { checks, conclusion: required(report.conclusion, "reviewReport.conclusion") };
+}
+
+function taskReviewReportText(report: TaskReviewReport) {
+  return [
+    report.conclusion,
+    ...report.checks.map((check, index) => [
+      `${index + 1}. [${check.outcome === "pass" ? "通过" : "未通过"}] ${check.criterion}`,
+      `核验：${check.finding}`,
+      `证据索引：${check.evidenceIndexes.length ? check.evidenceIndexes.join(", ") : "无"}`,
+      ...(check.remediation ? [`整改：${check.remediation}`] : []),
+    ].join("；")),
+  ].join("\n");
+}
+
 function isTaskStale(row: Row, now: number, thresholdMs: number) {
   if (row.status !== "assigned" && row.status !== "in_progress") return false;
   return now - Date.parse(row.last_activity_at) >= thresholdMs;
@@ -4989,6 +6976,25 @@ function shanghaiSlot(value: number) {
   };
 }
 
+function shanghaiLocalDateDaysAgo(now: number, days: number) {
+  const local = new Date(now + SHANGHAI_OFFSET_MS);
+  const shifted = new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() - days));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
+}
+
+export function nextDailyAgentRunAt(now: number, hour: number, minute: number) {
+  const local = new Date(now + SHANGHAI_OFFSET_MS);
+  const baseYear = local.getUTCFullYear();
+  const baseMonth = local.getUTCMonth();
+  const baseDate = local.getUTCDate();
+  for (let dayOffset = 0; dayOffset < 3; dayOffset += 1) {
+    const localCandidate = Date.UTC(baseYear, baseMonth, baseDate + dayOffset, hour, minute);
+    const candidate = localCandidate - SHANGHAI_OFFSET_MS;
+    if (candidate > now) return new Date(candidate).toISOString();
+  }
+  throw new Error("unable to calculate next daily agent run");
+}
+
 export function nextTaskCheckinRunAt(now: number, startHour: number, endHour: number) {
   const local = new Date(now + SHANGHAI_OFFSET_MS);
   const baseYear = local.getUTCFullYear();
@@ -5002,6 +7008,23 @@ export function nextTaskCheckinRunAt(now: number, startHour: number, endHour: nu
     }
   }
   throw new Error("unable to calculate next task check-in run");
+}
+
+export function nextTaskPromptTickAt(now: number, startHour: number, endHour: number) {
+  const local = new Date(now + SHANGHAI_OFFSET_MS);
+  const baseYear = local.getUTCFullYear();
+  const baseMonth = local.getUTCMonth();
+  const baseDate = local.getUTCDate();
+  for (let dayOffset = 0; dayOffset < 3; dayOffset += 1) {
+    for (let hour = startHour; hour <= endHour; hour += 1) {
+      for (const minute of [0, 20, 40]) {
+        const localCandidate = Date.UTC(baseYear, baseMonth, baseDate + dayOffset, hour, minute);
+        const candidate = localCandidate - SHANGHAI_OFFSET_MS;
+        if (candidate > now) return new Date(candidate).toISOString();
+      }
+    }
+  }
+  throw new Error("unable to calculate next task prompt tick");
 }
 
 export function nextNoticeReminderRunAt(now: number, startHour: number, endHour: number) {
@@ -5063,6 +7086,30 @@ function mapNoticeReminderDispatch(row: Row): NoticeReminderDispatch {
     startedAt: row.started_at ?? null,
     completedAt: row.completed_at ?? null,
   };
+}
+
+function mapDailyAgentDispatch(row: Row): DailyAgentDispatch {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    kind: row.kind,
+    targetMemberId: row.target_member_id,
+    targetAgentId: row.target_runtime_agent_id ?? row.target_member_id,
+    position: Number(row.position),
+    scheduledAt: row.scheduled_at,
+    sessionKey: row.session_key,
+    prompt: row.prompt,
+    status: row.status,
+    attempts: Number(row.attempts),
+    lastError: row.last_error ?? null,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? null,
+    completedAt: row.completed_at ?? null,
+  };
+}
+
+function dailyAgentAuditPrefix(kind: DailyAgentKind) {
+  return kind === "daily_self_improvement" ? "daily.self_improvement" : "daily.persona_audit";
 }
 
 function mapMeetingMessage(row: Row) {

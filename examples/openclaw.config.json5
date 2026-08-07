@@ -19,16 +19,28 @@
           hostIdleTimeoutSeconds: 1800,
           meetingAutoEndDelaySeconds: 60,
           taskStaleAfterHours: 72,
-          taskHourlyCheckins: {
+          taskRollingPrompts: {
             enabled: true,
             startHour: 8,
             endHour: 17,
+            // Fixed cadence: :00, :20, :40 (Asia/Shanghai).
+            intervalMinutes: 20,
           },
           noticeUnreadReminders: {
             enabled: true,
             // Runs at :30 for each hour in this inclusive window.
             startHour: 8,
             endHour: 17,
+          },
+          dailySelfImprovement: {
+            enabled: true,
+            hour: 5,
+            minute: 0,
+          },
+          dailyPersonaAudit: {
+            enabled: true,
+            hour: 6,
+            minute: 0,
           },
           // Defaults to the OpenClaw Agent marked default: true.
           // organizationAdminAgentId: "jia-goushi",

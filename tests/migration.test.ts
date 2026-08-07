@@ -9,7 +9,7 @@ import { CompanyOsStore } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
 
 describe("database migrations", () => {
-  it("upgrades a version 1 database through schema v10 with task review, closeout, task check-in, and notice reminder state", () => {
+  it("upgrades a version 1 database through schema v13 with rolling task prompts and terminal correction state", () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-"));
     const databasePath = path.join(directory, "company-os.sqlite");
     const database = new DatabaseSync(databasePath);
@@ -53,9 +53,12 @@ describe("database migrations", () => {
       const checkinDispatches = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_checkin_dispatches'").get();
       const noticeReminderRuns = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notice_reminder_runs'").get();
       const noticeReminderDispatches = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notice_reminder_dispatches'").get();
+      const taskReviewEmails = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_review_email_notifications'").get();
+      const dailyRuns = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'daily_agent_runs'").get();
+      const dailyDispatches = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'daily_agent_dispatches'").get();
       const dispatchColumns = store.db.prepare("PRAGMA table_info(meeting_agent_dispatches)").all() as Array<{ name: string }>;
 
-      expect(version.value).toBe("10");
+      expect(version.value).toBe("13");
       expect(meetingColumns.map((column) => column.name)).toEqual(expect.arrayContaining([
         "boss_participates",
         "boss_started_at",
@@ -73,6 +76,9 @@ describe("database migrations", () => {
       expect(checkinDispatches).toBeTruthy();
       expect(noticeReminderRuns).toBeTruthy();
       expect(noticeReminderDispatches).toBeTruthy();
+      expect(taskReviewEmails).toBeTruthy();
+      expect(dailyRuns).toBeTruthy();
+      expect(dailyDispatches).toBeTruthy();
       expect(dispatchColumns.map((column) => column.name)).toContain("wait_for_context_append_id");
     } finally {
       store.close();
@@ -112,7 +118,7 @@ describe("database migrations", () => {
         "context_from_sequence",
         "context_to_sequence",
       ]));
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("10");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
     } finally {
       store.close();
       rmSync(directory, { recursive: true, force: true });
@@ -138,7 +144,7 @@ describe("database migrations", () => {
 
     store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("10");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
       expect(store.meetingView(meeting.id).status).toBe("completed");
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM meeting_closeout_dispatches").get()).toMatchObject({ count: 0 });
     } finally {
@@ -189,7 +195,7 @@ describe("database migrations", () => {
 
     const store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("10");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
       expect(store.db.prepare("SELECT kind, prompt, status FROM task_agent_dispatches WHERE id = 'dispatch-old'").get())
         .toMatchObject({ kind: "boss_reminder", prompt: "legacy reminder", status: "succeeded" });
       expect(() => store.db.prepare(`
@@ -203,7 +209,7 @@ describe("database migrations", () => {
     }
   });
 
-  it("upgrades v8 through v10 without changing existing task dispatch history", () => {
+  it("upgrades v8 through v12 without changing existing task dispatch history", () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-v9-"));
     const databasePath = path.join(directory, "company-os.sqlite");
     let store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
@@ -224,7 +230,7 @@ describe("database migrations", () => {
 
     store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("10");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
       expect(store.db.prepare("SELECT id, kind, status FROM task_agent_dispatches WHERE id = ?").get(reminder.id))
         .toMatchObject({ id: reminder.id, kind: "boss_reminder", status: "pending" });
       expect(store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_checkin_runs'").get()).toBeTruthy();
@@ -235,7 +241,7 @@ describe("database migrations", () => {
     }
   });
 
-  it("upgrades v9 to v10 without creating reminder runs or changing notice read history", () => {
+  it("upgrades v9 through v12 without creating reminder runs or changing notice read history", () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-v10-"));
     const databasePath = path.join(directory, "company-os.sqlite");
     let store = new CompanyOsStore({
@@ -260,11 +266,104 @@ describe("database migrations", () => {
       config: resolveConfig(undefined),
     });
     try {
-      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("10");
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
       expect(store.listNotices("cto").find((notice) => notice.id === readNotice.id)?.readAt).toBeTruthy();
       expect(store.listNotices("cto").find((notice) => notice.id === unreadNotice.id)?.readAt).toBeNull();
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM notice_reminder_runs").get()).toMatchObject({ count: 0 });
       expect(store.db.prepare("SELECT COUNT(*) AS count FROM notice_reminder_dispatches").get()).toMatchObject({ count: 0 });
+      expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("upgrades v10 through v12 by adding the root-task review email outbox without backfilling history", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-v11-"));
+    const databasePath = path.join(directory, "company-os.sqlite");
+    let store = new CompanyOsStore({
+      databasePath,
+      allowedAgentIds: ["main"],
+      config: resolveConfig(undefined),
+    });
+    const historical = store.createRootTask({
+      title: "历史根任务",
+      description: "v10 时已经存在",
+      acceptanceCriteria: "迁移不补发邮件",
+      assigneeId: "main",
+    });
+    store.startTask("main", historical.id);
+    store.submitTask("main", historical.id, "历史提交", [{ type: "proof", label: "tests", command: "npm test" }]);
+    store.db.exec(`
+      DROP TABLE task_review_email_notifications;
+      UPDATE schema_meta SET value = '10' WHERE key = 'schema_version';
+    `);
+    store.close();
+
+    store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
+    try {
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_review_email_notifications").get()).toMatchObject({ count: 0 });
+      expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("upgrades v11 to v12 without creating historical daily governance runs", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-v12-"));
+    const databasePath = path.join(directory, "company-os.sqlite");
+    let store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
+    store.db.exec(`
+      DROP TABLE daily_agent_dispatches;
+      DROP TABLE daily_agent_runs;
+      UPDATE schema_meta SET value = '11' WHERE key = 'schema_version';
+    `);
+    store.close();
+
+    store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
+    try {
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect(store.db.prepare("SELECT COUNT(*) AS count FROM daily_agent_runs").get()).toMatchObject({ count: 0 });
+      expect(store.db.prepare("SELECT COUNT(*) AS count FROM daily_agent_dispatches").get()).toMatchObject({ count: 0 });
+      expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("upgrades v12 to v13, preserves legacy check-in history, and seeds FIFO order from real task activity", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-migration-v13-"));
+    const databasePath = path.join(directory, "company-os.sqlite");
+    let store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
+    const newer = store.createRootTask({ title: "较新任务", description: "new", acceptanceCriteria: "done", assigneeId: "main" });
+    const older = store.createRootTask({ title: "较早任务", description: "old", acceptanceCriteria: "done", assigneeId: "main" });
+    store.db.prepare("UPDATE tasks SET last_activity_at = '2026-08-02T00:00:00.000Z' WHERE id = ?").run(newer.id);
+    store.db.prepare("UPDATE tasks SET last_activity_at = '2026-08-01T00:00:00.000Z' WHERE id = ?").run(older.id);
+    const historicalRun = store.queueTaskCheckinRun("2030-01-01T02:00:00.000Z");
+    store.db.exec(`
+      DROP TABLE task_prompt_dispatches;
+      DROP TABLE task_prompt_ticks;
+      DROP TABLE task_prompt_pool_items;
+      DROP TABLE boss_task_action_email_notifications;
+      DROP TABLE task_correction_impacts;
+      DROP TABLE task_corrections;
+      DROP TABLE task_cancellation_events;
+      DROP TABLE task_cancel_requests;
+      DROP TABLE task_review_inspections;
+      UPDATE schema_meta SET value = '12' WHERE key = 'schema_version';
+    `);
+    store.close();
+
+    store = new CompanyOsStore({ databasePath, allowedAgentIds: ["main"], config: resolveConfig(undefined) });
+    try {
+      expect((store.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe("13");
+      expect(store.db.prepare("SELECT id FROM task_checkin_runs WHERE id = ?").get(historicalRun.id)).toBeTruthy();
+      expect((store.db.prepare(`
+        SELECT task_id FROM task_prompt_pool_items WHERE member_id = 'main' ORDER BY queue_seq
+      `).all() as Array<{ task_id: string }>).map((row) => row.task_id)).toEqual([older.id, newer.id]);
       expect(store.db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
     } finally {
       store.close();

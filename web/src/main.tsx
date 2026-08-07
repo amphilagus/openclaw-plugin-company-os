@@ -10,5 +10,6 @@ import "./task-reminder.css";
 import "./task-checkin.css";
 import "./task-review.css";
 import "./notice-reminder.css";
+import "./self-governance.css";
 
 createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);

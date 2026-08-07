@@ -28,6 +28,7 @@ export type Task = {
   status: "assigned" | "in_progress" | "review" | "blocked" | "closed" | "canceled";
   revision: number;
   blockedReason: string | null;
+  blockedAt: string | null;
   reviewFeedback: string | null;
   childIds: string[];
   childCounts: { total: number; active: number; closed: number; canceled: number };
@@ -42,7 +43,7 @@ export type TaskAgentDispatch = {
   id: string;
   targetMemberId: string;
   targetAgentId: string;
-  kind: "boss_reminder" | "review_accepted" | "review_rejected";
+  kind: "boss_reminder" | "review_accepted" | "review_rejected" | "block_escalated" | "block_guidance" | "cancel_request_accepted" | "cancel_request_rejected" | "acceptance_revoked" | "cancellation_restored";
   status: "pending" | "running" | "succeeded" | "failed" | "canceled";
   attempts: number;
   lastError: string | null;
@@ -155,11 +156,56 @@ export type TaskDetail = Task & {
     evidence: Array<{ type: string; label: string; note?: string; command?: string; url?: string; path?: string }>;
     status: string;
     feedback?: string | null;
+    reviewReport?: {
+      checks: Array<{ criterion: string; outcome: "pass" | "fail"; evidenceIndexes: number[]; finding: string; remediation?: string }>;
+      conclusion: string;
+    } | null;
     createdAt: string;
   }>;
   reminderDispatch: TaskAgentDispatch | null;
   reviewNotificationDispatch: TaskAgentDispatch | null;
+  pendingCancelRequest: null | {
+    id: string;
+    requesterId: string;
+    reason: string;
+    status: "pending" | "approved" | "rejected" | "canceled";
+    createdAt: string;
+  };
+  cancellationEvents: Array<{
+    id: string;
+    actorId: string;
+    statusBefore: Task["status"];
+    reason: string;
+    canceledAt: string;
+    restoredBy: string | null;
+    restoredAt: string | null;
+  }>;
+  corrections: Array<{
+    id: string;
+    actorId: string;
+    action: "revoke_acceptance" | "restore_cancellation";
+    reason: string;
+    createdAt: string;
+    impacts: Array<{ taskId: string; statusBefore: Task["status"]; statusAfter: Task["status"]; invalidatedSubmissionId: string | null }>;
+  }>;
   audit: Array<{ id: number; actorId: string; action: string; reason: string | null; createdAt: string }>;
+};
+
+export type TaskPromptPoolSummary = {
+  enabled: boolean;
+  timeZone: "Asia/Shanghai";
+  startHour: number;
+  endHour: number;
+  intervalMinutes: 20;
+  nextTickAt: string | null;
+  totals: { employees: number; items: number; execution: number; review: number; blockedReview: number };
+  queues: Array<{
+    memberId: string;
+    memberName: string;
+    count: number;
+    head: null | { taskId: string; title: string; parentTitle: string | null; kind: "execution" | "review" | "blocked_review"; enqueuedAt: string; lastPromptedAt: string | null; promptCount: number };
+    lastDispatch: null | { status: "running" | "succeeded" | "failed" | "skipped_busy" | "skipped_empty" | "canceled"; taskId: string | null; kind: "execution" | "review" | "blocked_review" | null; scheduledAt: string; completedAt: string | null; lastError: string | null };
+  }>;
 };
 
 export type TaskHourlyCheckinSummary = {
@@ -227,12 +273,70 @@ export type NoticeUnreadReminderSummary = {
   };
 };
 
+export type DailyAgentKind = "daily_self_improvement" | "daily_persona_audit";
+export type DailyAgentDispatchStatus = "pending" | "running" | "succeeded" | "failed" | "canceled";
+
+export type DailyAgentDispatch = {
+  id: string;
+  runId: string;
+  kind: DailyAgentKind;
+  targetMemberId: string;
+  targetAgentId: string;
+  position: number;
+  scheduledAt: string;
+  sessionKey: string;
+  status: DailyAgentDispatchStatus;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
+export type DailyAgentRunSummary = {
+  id: string;
+  kind: DailyAgentKind;
+  localDate: string;
+  scheduledAt: string;
+  planned: number;
+  pending: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  canceled: number;
+  dispatches: DailyAgentDispatch[];
+};
+
+export type DailySelfGovernanceSummary = {
+  timeZone: "Asia/Shanghai";
+  sessionName: "self-audit";
+  backlog: number;
+  mechanisms: {
+    selfImprovement: {
+      enabled: boolean;
+      hour: number;
+      minute: number;
+      nextRunAt: string | null;
+      today: DailyAgentRunSummary | null;
+    };
+    personaAudit: {
+      enabled: boolean;
+      hour: number;
+      minute: number;
+      nextRunAt: string | null;
+      today: DailyAgentRunSummary | null;
+    };
+  };
+  history: DailyAgentRunSummary[];
+};
+
 export type Snapshot = {
   organization: Member[];
   tasks: Task[];
   notices: Notice[];
   meetings: { active: MeetingSummary | null; closing: MeetingSummary | null; queue: MeetingSummary[]; history: MeetingSummary[] };
-  taskHourlyCheckin: TaskHourlyCheckinSummary;
+  taskPromptPool: TaskPromptPoolSummary;
   noticeUnreadReminder: NoticeUnreadReminderSummary;
+  dailySelfGovernance: DailySelfGovernanceSummary;
   generatedAt: string;
 };

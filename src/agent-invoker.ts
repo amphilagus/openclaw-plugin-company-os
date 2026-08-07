@@ -18,6 +18,7 @@ export type AgentInvocationResult =
 export type AgentInvocation = {
   agentId: string;
   prompt: string;
+  sessionKey?: string;
   timeoutSeconds: number;
   maxInFlightRetries?: number;
   signal?: AbortSignal;
@@ -82,6 +83,7 @@ export class OpenClawCliAgentInvoker implements AgentInvoker {
       output = await this.execFile("openclaw", [
         "agent",
         "--agent", input.agentId,
+        ...(input.sessionKey ? ["--session-key", input.sessionKey] : []),
         "--message-file", promptFile,
         "--json",
         "--timeout", String(input.timeoutSeconds),

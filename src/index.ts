@@ -32,10 +32,26 @@ const ConfigSchema = Type.Object({
     startHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 8 })),
     endHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 17 })),
   }, { additionalProperties: false })),
+  taskRollingPrompts: Type.Optional(Type.Object({
+    enabled: Type.Optional(Type.Boolean({ default: true })),
+    startHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 8 })),
+    endHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 17 })),
+    intervalMinutes: Type.Optional(Type.Literal(20, { default: 20 })),
+  }, { additionalProperties: false })),
   noticeUnreadReminders: Type.Optional(Type.Object({
     enabled: Type.Optional(Type.Boolean({ default: true })),
     startHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 8 })),
     endHour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 17 })),
+  }, { additionalProperties: false })),
+  dailySelfImprovement: Type.Optional(Type.Object({
+    enabled: Type.Optional(Type.Boolean({ default: true })),
+    hour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 5 })),
+    minute: Type.Optional(Type.Integer({ minimum: 0, maximum: 59, default: 0 })),
+  }, { additionalProperties: false })),
+  dailyPersonaAudit: Type.Optional(Type.Object({
+    enabled: Type.Optional(Type.Boolean({ default: true })),
+    hour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 6 })),
+    minute: Type.Optional(Type.Integer({ minimum: 0, maximum: 59, default: 0 })),
   }, { additionalProperties: false })),
   databasePath: Type.Optional(Type.String({ minLength: 1 })),
   organizationAdminAgentId: Type.Optional(Type.String({ minLength: 1 })),
