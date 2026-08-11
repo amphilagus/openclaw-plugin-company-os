@@ -75,7 +75,7 @@ async function readJson(req: IncomingMessage) {
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > 1_000_000) throw new Error("request body exceeds 1 MB");
+    if (size > 20_000_000) throw new Error("request body exceeds 20 MB");
     chunks.push(buffer);
   }
   if (chunks.length === 0) return {};

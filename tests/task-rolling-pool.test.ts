@@ -79,10 +79,96 @@ describe("persistent rolling task prompt pool", () => {
     expect(blockedPrompt.prompt).toContain("子任务 b");
     expect(blockedPrompt.prompt).toContain("依赖接口不可用");
     expect(blockedPrompt.prompt).toContain("company_task_unblock");
-    expect(blockedPrompt.prompt).toContain(`company_task_block 阻塞父任务 ${root.id}`);
+    expect(blockedPrompt.prompt).toContain(`自动阻塞父任务 ${root.id}`);
+    expect(blockedPrompt.prompt).not.toContain("company_task_cancel");
     store.finishTaskPromptDispatch(blockedPrompt.id, { status: "canceled", error: "test inspection only" });
     store.unblockTask("cto", child.id, "使用稳定的本地适配器继续推进");
     expect(poolRows()).toEqual([expect.objectContaining({ member_id: "eng-a", task_id: child.id, kind: "execution" })]);
+  });
+
+  it("automatically escalates a started blocked review that ends without unblocking", () => {
+    const root = store.createRootTask({
+      title: "需要向上升级的根任务",
+      description: "验证阻塞审查兜底",
+      acceptanceCriteria: "阻塞不会在本级空转",
+      assigneeId: "cto",
+    });
+    const child = store.createChildTask("cto", {
+      parentId: root.id,
+      title: "持续阻塞的子任务",
+      description: "本级无法解决",
+      acceptanceCriteria: "向上获得协助",
+      assigneeId: "eng-a",
+    });
+    store.blockTask("eng-a", child.id, "需要公司级外部账号权限");
+
+    const dueAt = store.peekNextTaskPromptDueAt();
+    expect(dueAt).not.toBeNull();
+    const dispatch = store.createTaskPromptCycleDispatch("cto", false, undefined, Date.parse(dueAt!));
+    store.markTaskPromptCycleDispatchStarted(dispatch.id);
+    store.finishTaskPromptCycleDispatch(dispatch.id, { status: "succeeded" });
+
+    expect(store.readTask("boss", child.id, false).status).toBe("blocked");
+    const escalatedRoot = store.readTask("boss", root.id, false);
+    expect(escalatedRoot.status).toBe("blocked");
+    expect(escalatedRoot.blockedReason).toContain(child.id);
+    expect(poolRows("cto")).toEqual([]);
+    expect(store.listAudit("task", child.id).some((event) => event.action === "task.blocked_review_auto_escalated")).toBe(true);
+  });
+
+  it("does not escalate when the reviewer actually unblocks the child before the started run ends", () => {
+    const root = store.createRootTask({
+      title: "可在本级解决的根任务",
+      description: "验证解除优先",
+      acceptanceCriteria: "父任务不被误阻塞",
+      assigneeId: "cto",
+    });
+    const child = store.createChildTask("cto", {
+      parentId: root.id,
+      title: "可解除的子任务",
+      description: "已有解决方案",
+      acceptanceCriteria: "继续执行",
+      assigneeId: "eng-a",
+    });
+    store.blockTask("eng-a", child.id, "等待本级配置建议");
+
+    const dueAt = store.peekNextTaskPromptDueAt();
+    const dispatch = store.createTaskPromptCycleDispatch("cto", false, undefined, Date.parse(dueAt!));
+    store.markTaskPromptCycleDispatchStarted(dispatch.id);
+    store.unblockTask("cto", child.id, "改用本地测试配置并继续");
+    store.finishTaskPromptCycleDispatch(dispatch.id, { status: "succeeded" });
+
+    expect(store.readTask("boss", root.id, false).status).toBe("assigned");
+    expect(store.readTask("boss", child.id, false).status).toBe("in_progress");
+    expect(poolRows("eng-a")).toEqual([expect.objectContaining({ task_id: child.id, kind: "execution" })]);
+    expect(store.listAudit("task", child.id).some((event) => event.action === "task.blocked_review_auto_escalated")).toBe(false);
+  });
+
+  it("escalates an unresolved started blocked review during Gateway recovery", () => {
+    const root = store.createRootTask({
+      title: "恢复时升级的根任务",
+      description: "验证中断恢复",
+      acceptanceCriteria: "已启动审查不重复回转",
+      assigneeId: "cto",
+    });
+    const child = store.createChildTask("cto", {
+      parentId: root.id,
+      title: "恢复时仍阻塞的子任务",
+      description: "Agent run 启动后 Gateway 中断",
+      acceptanceCriteria: "恢复时自动向上",
+      assigneeId: "eng-a",
+    });
+    store.blockTask("eng-a", child.id, "外部权限尚未解决");
+
+    const dueAt = store.peekNextTaskPromptDueAt();
+    const dispatch = store.createTaskPromptCycleDispatch("cto", false, undefined, Date.parse(dueAt!));
+    store.markTaskPromptCycleDispatchStarted(dispatch.id);
+    expect(store.recoverTaskPromptCycleDispatches()).toBe(1);
+
+    expect(store.readTask("boss", root.id, false).status).toBe("blocked");
+    expect(poolRows("cto")).toEqual([]);
+    expect(store.db.prepare("SELECT status FROM task_prompt_cycle_dispatches WHERE id = ?").get(dispatch.id))
+      .toMatchObject({ status: "failed" });
   });
 
   it("keeps strict FIFO order and rotates only after injection has started", () => {

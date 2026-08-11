@@ -1,4 +1,4 @@
-import type { MeetingDetail, MemberIdentity, Snapshot, TaskDetail } from "./types";
+import type { MeetingDetail, MemberIdentity, Snapshot, TaskDetail, TaskImageAttachmentContent } from "./types";
 import { COMPANY_OS_GATEWAY_METHOD, getControlUiGatewayClient } from "./gateway-bridge";
 
 const API = "/plugins/company-os/api/v1";
@@ -16,12 +16,19 @@ export async function getTask(id: string) {
   return request<TaskDetail>(`/tasks/${encodeURIComponent(id)}`);
 }
 
+export async function getTaskImageAttachment(taskId: string, attachmentId: string) {
+  return request<TaskImageAttachmentContent>(`/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(attachmentId)}`);
+}
+
 export function getMemberIdentity(id: string) {
   const cached = identityRequests.get(id);
   if (cached) return cached;
   const pending = request<MemberIdentity>(`/identities/${encodeURIComponent(id)}`);
   identityRequests.set(id, pending);
-  void pending.catch(() => identityRequests.delete(id));
+  void pending.then(
+    () => { if (identityRequests.get(id) === pending) identityRequests.delete(id); },
+    () => { if (identityRequests.get(id) === pending) identityRequests.delete(id); },
+  );
   return pending;
 }
 

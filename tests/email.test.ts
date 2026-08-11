@@ -110,6 +110,12 @@ describe("Boss root-task review email", () => {
         commit: "a".repeat(40),
         verifiedAt: "2026-08-06T06:29:00.000Z",
       },
+      attachments: [{ evidenceIndex: 0, fileName: "report.pdf", byteSize: 1234, sha256: "b".repeat(64), data: Buffer.from("report") }],
+      functionalVerification: {
+        workingDirectory: "/workspace/cto/project",
+        command: "npm run verify",
+        oneLineCommand: "cd -- '/workspace/cto/project' && npm run verify",
+      },
     });
 
     expect(text).toContain("一级员工已提交根任务验收");
@@ -123,6 +129,8 @@ describe("Boss root-task review email", () => {
     expect(text).toContain("应由 Boss 在本验收阶段执行");
     expect(text).toContain("不是负责人提交前的前置条件");
     expect(text).toContain("[proof] tests — npm test");
-    expect(text).toContain("批准或驳回");
+    expect(text).toContain("report.pdf · 证据 #1 · 1234 bytes");
+    expect(text).toContain("cd -- '/workspace/cto/project' && npm run verify");
+    expect(text).toContain("验收通过、驳回整改或判定任务失败");
   });
 });

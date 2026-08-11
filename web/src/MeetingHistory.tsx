@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { getMeeting } from "./api";
 import { AgentAvatar, memberIdentity, memberName, type MemberIdentityMap } from "./member-identity";
+import { CompanyOsSystemAvatar } from "./CompanyOsSystemAvatar";
 import type { MeetingDetail, MeetingSummary } from "./types";
 import "./meeting-history.css";
 import "./history-identity.css";
@@ -92,7 +93,9 @@ export function MeetingHistoryDetail({ meeting, identities = {}, close }: { meet
               const id = message.authorKind === "boss" ? "boss" : message.authorId ?? "system";
               const identity = message.authorKind === "system" ? { id: "system", name: "系统", title: "", avatarUrl: null, emoji: null } : memberIdentity(identities, id);
               return <article className={`history-message ${message.authorKind}`} key={message.id}>
-                <AgentAvatar identity={identity} className="history-avatar" fallback={message.authorKind === "system" ? "·" : undefined} />
+                {message.authorKind === "system"
+                  ? <CompanyOsSystemAvatar className="history-avatar" />
+                  : <AgentAvatar identity={identity} className="history-avatar" />}
                 <div><div className="history-message-meta"><b>{identity.name}</b>{message.authorKind === "member" ? <small className="speaker-id">{id}</small> : null}{message.targetId ? <span>@{memberName(identities, message.targetId)}</span> : null}<time>{formatTime(message.createdAt)}</time></div><p>{message.body}</p></div>
               </article>;
             }) : <p className="history-empty">这场会议没有留下发言记录。</p>}

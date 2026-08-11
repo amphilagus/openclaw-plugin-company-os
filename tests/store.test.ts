@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -10,6 +10,12 @@ import { VERIFIED_GIT } from "./test-git.js";
 
 const AGENTS = ["main", "jia-goushi", "cto", "eng-a", "eng-b", "dev-a", "dev-b", "advisor", "new-hire"];
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
+const PNG_BYTES = Buffer.from("89504e470d0a1a0a00000000", "hex");
+const PNG_ATTACHMENT = {
+  fileName: "任务参考图.png",
+  mimeType: "image/png" as const,
+  dataUrl: `data:image/png;base64,${PNG_BYTES.toString("base64")}`,
+};
 
 let tempDir: string;
 let databasePath: string;
@@ -91,6 +97,43 @@ describe("organization", () => {
 });
 
 describe("hierarchical tasks", () => {
+  it("persists validated root-task images and exposes metadata separately from image content", () => {
+    addOrg();
+    const root = store.createRootTask({
+      ...taskFields("带图根任务"),
+      assigneeId: "cto",
+      attachments: [PNG_ATTACHMENT],
+    });
+
+    expect(root.attachments).toHaveLength(1);
+    expect(root.attachments[0]).toMatchObject({
+      fileName: "任务参考图.png",
+      mimeType: "image/png",
+      byteSize: PNG_BYTES.length,
+    });
+    expect(root.attachments[0]).not.toHaveProperty("dataUrl");
+    expect(existsSync(root.attachments[0].localPath)).toBe(true);
+
+    const content = store.readTaskImageAttachment("cto", root.id, root.attachments[0].id);
+    expect(content.dataUrl).toBe(PNG_ATTACHMENT.dataUrl);
+    expect(() => store.readTaskImageAttachment("eng-a", root.id, root.attachments[0].id)).toThrow(/outside the caller/);
+  });
+
+  it("rejects excessive, spoofed, or malformed root-task image attachments before creating a task", () => {
+    addOrg();
+    expect(() => store.createRootTask({
+      ...taskFields("图片过多"),
+      assigneeId: "cto",
+      attachments: Array.from({ length: 5 }, (_, index) => ({ ...PNG_ATTACHMENT, fileName: `${index}.png` })),
+    })).toThrow(/at most 4/);
+    expect(() => store.createRootTask({
+      ...taskFields("伪造图片"),
+      assigneeId: "cto",
+      attachments: [{ ...PNG_ATTACHMENT, dataUrl: "data:image/png;base64,aGVsbG8=" }],
+    })).toThrow(/content does not match/);
+    expect(store.listTasks("boss")).toHaveLength(0);
+  });
+
   it("lets Boss reassign a task anywhere in the tree while preserving the issuer's direct-report review chain", () => {
     addOrg();
     const root = store.createRootTask({ ...taskFields("全局重派根"), assigneeId: "cto" });
@@ -121,6 +164,7 @@ describe("hierarchical tasks", () => {
       ...taskFields("错误拆解的根任务"),
       assigneeId: "cto",
       requireTaskMeeting: false,
+      taskMeetingBossParticipates: false,
     });
     for (const taskId of [root.id, branch.id, leaf.id]) {
       expect(store.readTask("boss", taskId, false)).toMatchObject({
@@ -149,9 +193,11 @@ describe("hierarchical tasks", () => {
       ...taskFields("需重新开会的任务"),
       assigneeId: "cto",
       requireTaskMeeting: true,
+      taskMeetingBossParticipates: true,
     });
     const result = store.abortTaskByBoss(root.id, "重新审题后再派发");
     expect(result.draft.requireTaskMeeting).toBe(true);
+    expect(result.draft.taskMeetingBossParticipates).toBe(true);
   });
 
   it("rejects agent roots, cross-level delegation, empty proof, and cascade cancellation", () => {
@@ -214,7 +260,7 @@ describe("hierarchical tasks", () => {
     store.markTaskReviewEmailSent(first[0]!.id);
     store.reviewTask("boss", root.id, "reject", "继续整改");
 
-    store.submitTask("cto", root.id, "根任务再次提交", [{ type: "artifact", label: "report", path: "/tmp/report.md" }], VERIFIED_GIT);
+    store.submitTask("cto", root.id, "根任务再次提交", [{ type: "proof", label: "report", note: "report ready" }], VERIFIED_GIT);
     const second = store.pendingTaskReviewEmailNotifications();
     expect(second).toHaveLength(1);
     expect(second[0]).toMatchObject({ taskId: root.id, summary: "根任务再次提交" });
@@ -223,6 +269,58 @@ describe("hierarchical tasks", () => {
       "task.review_email_queued",
       "task.review_email_sent",
     ]));
+  });
+
+  it("lets Boss terminally fail only a root task during review and preserves its submission history", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("无法继续整改的根任务"), assigneeId: "cto" });
+    store.startTask("cto", root.id);
+    store.submitTask("cto", root.id, "多轮整改后的最终提交", PROOF, VERIFIED_GIT);
+
+    expect(() => store.reviewTask("boss", root.id, "fail")).toThrow(/feedback/);
+    const failed = store.reviewTask("boss", root.id, "fail", "核心方案反复整改仍无法满足验收目标");
+
+    expect(failed).toMatchObject({
+      status: "failed",
+      failedReason: "核心方案反复整改仍无法满足验收目标",
+      reviewFeedback: "核心方案反复整改仍无法满足验收目标",
+      reviewNotificationDispatch: {
+        kind: "review_failed",
+        targetMemberId: "cto",
+        status: "pending",
+      },
+    });
+    expect(failed.failedAt).toBeTruthy();
+    expect(failed.submissions[0]).toMatchObject({
+      summary: "多轮整改后的最终提交",
+      status: "rejected",
+      feedback: "核心方案反复整改仍无法满足验收目标",
+      gitLocation: VERIFIED_GIT,
+    });
+    expect(store.pendingTaskReviewEmailNotifications()).toEqual([]);
+    expect(store.db.prepare("SELECT status, failed_at, failed_reason FROM tasks WHERE id = ?").get(root.id))
+      .toMatchObject({ status: "closed", failed_reason: "核心方案反复整改仍无法满足验收目标" });
+
+    const notification = store.claimNextTaskDispatch();
+    expect(notification).toMatchObject({ kind: "review_failed", targetAgentId: "cto" });
+    expect(notification?.prompt).toContain("Boss 判定为失败");
+    expect(notification?.prompt).toContain("不会回到执行池，也不能再次提交验收");
+    expect(() => store.startTask("cto", root.id)).toThrow(/assigned tasks/);
+    expect(() => store.abortTaskByBoss(root.id, "换一种终态")).toThrow(/failed root task is terminal/);
+    expect(() => store.correctTaskTerminalDecision("boss", root.id, "revoke_acceptance", "重新打开"))
+      .toThrow(/failed root task is terminal/);
+    expect(store.listAudit("task", root.id).some((event) => event.action === "task.failed")).toBe(true);
+  });
+
+  it("rejects the fail decision for non-root or non-Boss reviews", () => {
+    addOrg();
+    const root = store.createRootTask({ ...taskFields("根任务"), assigneeId: "cto" });
+    const child = store.createChildTask("cto", { ...taskFields("子任务"), parentId: root.id, assigneeId: "eng-a" });
+    store.startTask("eng-a", child.id);
+    store.submitTask("eng-a", child.id, "子任务提交", PROOF, VERIFIED_GIT);
+
+    expect(() => store.reviewTask("cto", child.id, "fail", "不应允许")).toThrow(/only Boss can mark a root task as failed/);
+    expect(store.readTask("boss", child.id, false).status).toBe("review");
   });
 
   it("keeps blocked and stale as risks and requires a newly canceled child to be restored before parent review", () => {
@@ -323,7 +421,8 @@ describe("hierarchical tasks", () => {
     expect(blockedReminder).toMatchObject({ targetMemberId: "cto", status: "pending" });
     expect(blockedReminder.prompt).toContain("催促你审查被阻塞的子任务");
     expect(blockedReminder.prompt).toContain("company_task_unblock");
-    expect(blockedReminder.prompt).toContain("company_task_cancel");
+    expect(blockedReminder.prompt).toContain("只有二选一");
+    expect(blockedReminder.prompt).not.toContain("company_task_cancel");
   });
 
   it("enforces issuer-only review and durably notifies each task assignee", () => {
@@ -425,7 +524,7 @@ describe("hierarchical tasks", () => {
     expect(store.inbox("main").tasksAwaitingReview).toHaveLength(0);
     store.reviewTask("boss", root.id, "reject", "proof is incomplete");
     expect(store.inbox("cto").assignedOrChangedTasks.map((task) => task.id)).toContain(root.id);
-    store.submitTask("cto", root.id, "second submission", [{ type: "artifact", label: "report", path: "/tmp/report.md" }], VERIFIED_GIT);
+    store.submitTask("cto", root.id, "second submission", [{ type: "proof", label: "report", note: "report ready" }], VERIFIED_GIT);
     store.reviewTask("boss", root.id, "accept");
     expect(store.readTask("boss", root.id, false).submissions.map((item: any) => item.status)).toEqual(["accepted", "rejected"]);
   });

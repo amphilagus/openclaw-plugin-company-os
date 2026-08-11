@@ -1,0 +1,33 @@
+.company-os-system-avatar {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: linear-gradient(145deg, #07131d, #09251e) !important;
+  border-radius: 9px !important;
+  box-shadow: inset 0 0 10px rgba(48, 236, 186, .16), 0 0 0 1px rgba(42, 210, 165, .16);
+  opacity: 1 !important;
+}
+
+.company-os-system-avatar svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.message.system,
+.history-message.system {
+  opacity: 1 !important;
+}
+
+.history-avatar {
+  width: 31px;
+  height: 31px;
+}
+
+.message.system > div:last-child {
+  opacity: .72;
+}
+
+.history-message.system > div:last-child {
+  opacity: .7;
+}

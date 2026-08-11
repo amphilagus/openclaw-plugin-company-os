@@ -2,7 +2,7 @@
   "id": "company-os",
   "name": "Company OS",
   "description": "公司级会议、多级任务和告示板治理系统。",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "configSchema": {
     "type": "object",
     "properties": {
@@ -194,6 +194,8 @@
       "company_meeting_speak",
       "company_meeting_delegate",
       "company_meeting_set_task_drafts",
+      "company_meeting_yield_to_boss",
+      "company_meeting_submit_summary",
       "company_meeting_end",
       "company_meeting_cancel",
       "company_task_list",

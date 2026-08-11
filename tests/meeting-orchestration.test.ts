@@ -435,7 +435,7 @@ describe("synchronous meeting orchestration", () => {
       conclusion: "子任务满足验收标准",
     });
     await waitFor(() => expect(service.store.readTask("boss", child.id, false).reviewNotificationDispatch?.status).toBe("succeeded"));
-    service.store.submitTask("cto", root.id, "root ready", [{ type: "artifact", label: "report", path: "/tmp/report.md" }], VERIFIED_GIT);
+    service.store.submitTask("cto", root.id, "root ready", [{ type: "proof", label: "report", note: "report ready" }], VERIFIED_GIT);
     service.reviewTask("boss", root.id, "reject", "根任务报告需要补充");
     await waitFor(() => expect(service.store.readTask("boss", root.id, false).reviewNotificationDispatch?.status).toBe("succeeded"));
 

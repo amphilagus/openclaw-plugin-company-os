@@ -136,6 +136,12 @@ describe("agent tool runtime lifecycle", () => {
       getService: () => service,
       toolContext: { agentId: "cto" } as any,
     }).find((tool) => tool.name === "company_task_submit")!;
+    const submitSchema = submitTool.parameters as any;
+    const evidenceVariants = submitSchema.properties.evidence.items.anyOf;
+    expect(evidenceVariants.find((variant: any) => variant.properties.type.const === "proof").properties.path).toBeUndefined();
+    expect(evidenceVariants.find((variant: any) => variant.properties.type.const === "artifact").required).toContain("path");
+    expect(submitSchema.properties.reviewHandoff.properties.filePaths).toBeUndefined();
+    expect(submitSchema.properties.reviewHandoff.required).toContain("functionalVerification");
     const evidence = [{ type: "proof", label: "tests", command: "npm test" }];
 
     const result = await submitTool.execute("call-submit", {
@@ -145,7 +151,7 @@ describe("agent tool runtime lifecycle", () => {
       gitLocation: GIT_INPUT,
     });
 
-    expect(submitTask).toHaveBeenCalledWith("cto", "task-root", "根任务完成", evidence, GIT_INPUT);
+    expect(submitTask).toHaveBeenCalledWith("cto", "task-root", "根任务完成", evidence, GIT_INPUT, undefined);
     expect(JSON.stringify(result)).toContain('"status":"review"');
   });
 

@@ -69,4 +69,24 @@ describe("agent visual identity", () => {
     });
     await service.stop();
   });
+
+  it("reloads an Agent avatar when the configured file is replaced in place", async () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), "company-os-live-avatar-"));
+    directories.push(workspace);
+    mkdirSync(path.join(workspace, "assets"));
+    const avatar = path.join(workspace, "assets", "avatar.png");
+    writeFileSync(avatar, Buffer.from([1, 2, 3]));
+    const service = new CompanyOsService({
+      databasePath: path.join(workspace, "company-os.sqlite"),
+      allowedAgentIds: ["main"],
+      config: resolveConfig({ bossEmailNotifications: { enabled: false } }),
+      runtimeConfig: { agents: { list: [{ id: "main", default: true, workspace, identity: { avatar: "assets/avatar.png" } }] } },
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+    });
+
+    expect(service.memberIdentity("main").avatarUrl).toBe("data:image/png;base64,AQID");
+    writeFileSync(avatar, Buffer.from([4, 5, 6]));
+    expect(service.memberIdentity("main").avatarUrl).toBe("data:image/png;base64,BAUG");
+    await service.stop();
+  });
 });

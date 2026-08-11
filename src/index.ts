@@ -16,6 +16,7 @@ import {
 } from "./http.js";
 import { COMPANY_OS_GATEWAY_METHOD, createCompanyOsGatewayHandler } from "./rpc.js";
 import { CompanyOsService } from "./service.js";
+import { OpenClawMeetingSessionRuntime } from "./meeting-session-runtime.js";
 import { COMPANY_TOOL_NAMES, createCompanyOsTools } from "./tools.js";
 import { resolveConfig, type CompanyOsConfig } from "./types.js";
 
@@ -84,6 +85,11 @@ const entry: ReturnType<typeof definePluginEntry> = definePluginEntry({
           config,
           runtimeConfig,
           logger,
+          meetingSessionRuntime: new OpenClawMeetingSessionRuntime(
+            runtimeConfig,
+            ({ agentId, sessionKey }) => api.runtime.agent.session.getSessionEntry({ agentId, sessionKey }),
+            ({ agentId }) => api.runtime.agent.session.listSessionEntries({ agentId }),
+          ),
         });
       }
       return service;

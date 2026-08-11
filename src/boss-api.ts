@@ -31,6 +31,18 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 200, data: store.readTask("boss", decodeURIComponent(taskDetail[1]!), false) };
   }
 
+  const taskImageAttachment = route.match(/^\/tasks\/([^/]+)\/attachments\/([^/]+)$/);
+  if (method === "GET" && taskImageAttachment) {
+    return {
+      status: 200,
+      data: store.readTaskImageAttachment(
+        "boss",
+        decodeURIComponent(taskImageAttachment[1]!),
+        decodeURIComponent(taskImageAttachment[2]!),
+      ),
+    };
+  }
+
   const meetingDetail = route.match(/^\/meetings\/([^/]+)$/);
   if (method === "GET" && meetingDetail) {
     return { status: 200, data: store.meetingView(decodeURIComponent(meetingDetail[1]!)) };
@@ -47,6 +59,22 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return {
       status: 200,
       data: service.setTaskPromptWorkHours(startHour, endHour),
+    };
+  }
+
+  if (method === "PUT" && route === "/task-prompt-settings/global") {
+    const minutesPerLevel = body.minutesPerLevel === null ? null : Number(body.minutesPerLevel);
+    return {
+      status: 200,
+      data: service.setTaskPromptMinutesPerLevel(minutesPerLevel),
+    };
+  }
+
+  if (method === "PUT" && route === "/task-prompt-settings/pause") {
+    if (typeof body.paused !== "boolean") throw new Error("paused must be a boolean");
+    return {
+      status: 200,
+      data: service.setTaskPromptPaused(body.paused),
     };
   }
 
@@ -112,7 +140,7 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
     return { status: 200, data };
   }
 
-  const meetingAction = route.match(/^\/meetings\/([^/]+)\/(interject|reorder|cancel|start|reject|approve-end|reject-end)$/);
+  const meetingAction = route.match(/^\/meetings\/([^/]+)\/(interject|reorder|cancel|start|reject|entry\/retry|request-summary|end|approve-end|reject-end)$/);
   if (method === "POST" && meetingAction) {
     const meetingId = decodeURIComponent(meetingAction[1]!);
     const action = meetingAction[2]!;
@@ -128,6 +156,21 @@ export async function executeBossApi(service: CompanyOsService, request: BossApi
       const advance = store.startMeetingByBoss(meetingId);
       await service.dispatchAdvance(advance);
       return { status: 200, data: store.meetingView(meetingId) };
+    }
+    if (action === "entry/retry") {
+      const meeting = store.retryMeetingEntry(meetingId);
+      service.kickMeetingEntryRetry();
+      return { status: 200, data: meeting };
+    }
+    if (action === "request-summary") {
+      const advance = store.requestMeetingSummaryByBoss(meetingId);
+      await service.dispatchAdvance(advance);
+      return { status: 200, data: store.meetingView(meetingId) };
+    }
+    if (action === "end") {
+      const result = store.endMeetingByBoss(meetingId, body.summary, Boolean(body.publishNotice));
+      await service.dispatchAdvance(result.advance);
+      return { status: 200, data: result };
     }
     if (action === "reject") {
       const result = store.rejectMeetingByBoss(meetingId, body.reason);

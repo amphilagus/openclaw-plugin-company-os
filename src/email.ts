@@ -6,7 +6,7 @@ import nodemailer, { type Transporter } from "nodemailer";
 
 import type { EvidenceInput, ResolvedCompanyOsConfig, VerifiedGitLocation } from "./types.js";
 
-export type MeetingEmailKind = "created" | "room_entered";
+export type MeetingEmailKind = "created" | "room_entered" | "completed" | "canceled";
 
 export type MeetingEmailNotification = {
   id: string;
@@ -19,6 +19,11 @@ export type MeetingEmailNotification = {
   hostName: string;
   createdAt: string;
   startedAt: string | null;
+  endedAt: string | null;
+  summary: string | null;
+  canceledReason: string | null;
+  taskOutputs: Array<{ id: string; title: string; assigneeId: string }>;
+  noticeOutput: { id: string; title: string } | null;
 };
 
 export type TaskCheckinEmailItem = {
@@ -57,6 +62,18 @@ export type TaskReviewEmailNotification = {
   summary: string;
   evidence: EvidenceInput[];
   gitLocation: VerifiedGitLocation;
+  attachments: Array<{
+    evidenceIndex: number | null;
+    fileName: string;
+    byteSize: number;
+    sha256: string;
+    data: Buffer;
+  }>;
+  functionalVerification: {
+    workingDirectory: string;
+    command: string;
+    oneLineCommand: string;
+  } | null;
 };
 
 export type BossTaskActionEmailNotification = {
@@ -135,6 +152,10 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
         to: settings.recipient,
         subject: `[Company OS] 根任务待验收：${notification.title}`,
         text: buildTaskReviewEmailText(notification),
+        attachments: (notification.attachments ?? []).map((attachment) => ({
+          filename: attachment.fileName,
+          content: attachment.data,
+        })),
       });
       return;
     }
@@ -150,7 +171,17 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
       });
       return;
     }
-    if (notification.kind !== "created" && notification.kind !== "room_entered") return;
+    if (notification.kind === "completed" || notification.kind === "canceled") {
+      const completed = notification.kind === "completed";
+      await transporter.sendMail({
+        from: settings.from,
+        to: settings.recipient,
+        subject: `[Company OS] 会议${completed ? "已完成" : "已取消"}：${notification.title}`,
+        text: buildMeetingResultEmailText(notification),
+      });
+      return;
+    }
+    if (!("meetingId" in notification)) return;
     const entered = notification.kind === "room_entered";
     const eventTime = entered ? notification.startedAt ?? notification.createdAt : notification.createdAt;
     await transporter.sendMail({
@@ -161,7 +192,7 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
         : `[Company OS] 会议已创建：${notification.title}`,
       text: [
         entered
-          ? "这场需要 Boss 直接参与的会议已经进入会议室，所有参会者正在等待你进入 WebUI 并点击“开始会议”。"
+          ? "这场需要 Boss 直接参与的会议已经进入会议室，正在等待你进入 WebUI 并点击“开始会议”；点击后系统才会通知全体 Agent 入会。"
           : "一场需要 Boss 直接参与的会议已经创建。",
         "",
         `会议：${notification.title}`,
@@ -177,6 +208,25 @@ export class SmtpMeetingEmailSender implements MeetingEmailSender {
       ].join("\n"),
     });
   }
+}
+
+function buildMeetingResultEmailText(notification: MeetingEmailNotification) {
+  const lines = [
+    `会议：${notification.title}`,
+    `会议 ID：${notification.meetingId}`,
+    `结果：${notification.kind === "completed" ? "已完成" : "已取消"}`,
+    `时间：${formatShanghaiTime(notification.endedAt ?? notification.startedAt ?? notification.createdAt)}`,
+  ];
+  if (notification.summary) lines.push("", "最终总结：", notification.summary);
+  if (notification.canceledReason) lines.push("", `取消原因：${notification.canceledReason}`);
+  if (notification.taskOutputs.length > 0) {
+    lines.push("", `任务产出（${notification.taskOutputs.length}）：`);
+    notification.taskOutputs.forEach((task, index) => lines.push(`${index + 1}. ${task.title} → ${task.assigneeId} (${task.id})`));
+  }
+  lines.push("", notification.noticeOutput
+    ? `公告结果：已发布《${notification.noticeOutput.title}》(${notification.noticeOutput.id})`
+    : "公告结果：未发布公告");
+  return lines.join("\n");
 }
 
 export function buildTaskCheckinEmailText(notification: TaskCheckinEmailNotification) {
@@ -247,7 +297,22 @@ export function buildTaskReviewEmailText(notification: TaskReviewEmailNotificati
     const detail = item.command ?? item.url ?? item.path ?? item.note;
     lines.push(`${index + 1}. [${item.type}] ${item.label}${detail ? ` — ${detail}` : ""}`);
   });
-  lines.push("", "请打开 OpenClaw 的“公司 → 任务”页面，批准或驳回该根任务。");
+  const attachments = notification.attachments ?? [];
+  if (attachments.length > 0) {
+    lines.push("", `验收附件（${attachments.length}）：`);
+    attachments.forEach((attachment, index) => {
+      const evidence = attachment.evidenceIndex === null ? "历史附件" : `证据 #${attachment.evidenceIndex + 1}`;
+      lines.push(`${index + 1}. ${attachment.fileName} · ${evidence} · ${attachment.byteSize} bytes · SHA-256 ${attachment.sha256}`);
+    });
+  }
+  if (notification.functionalVerification) {
+    lines.push(
+      "",
+      "一行功能验收命令（请在本机终端复制运行）：",
+      notification.functionalVerification.oneLineCommand,
+    );
+  }
+  lines.push("", "请打开 OpenClaw 的“公司 → 任务”页面，选择验收通过、驳回整改或判定任务失败。");
   return lines.join("\n");
 }
 

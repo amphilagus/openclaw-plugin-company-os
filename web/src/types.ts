@@ -25,7 +25,7 @@ export type Task = {
   title: string;
   description: string;
   acceptanceCriteria: string;
-  status: "assigned" | "in_progress" | "review" | "blocked" | "closed" | "canceled" | "aborted";
+  status: "assigned" | "in_progress" | "review" | "blocked" | "closed" | "canceled" | "aborted" | "failed";
   revision: number;
   blockedReason: string | null;
   blockedAt: string | null;
@@ -38,6 +38,8 @@ export type Task = {
   lastActivityAt: string;
   abortedAt: string | null;
   abortedReason: string | null;
+  failedAt?: string | null;
+  failedReason?: string | null;
   sourceMeetingId?: string | null;
   availability: "active" | "waiting_stage" | "suspended_stage" | "retired";
   flowStage: null | {
@@ -57,13 +59,14 @@ export type TaskAbortDraft = {
   acceptanceCriteria: string;
   assigneeId: string;
   requireTaskMeeting: boolean;
+  taskMeetingBossParticipates: boolean;
 };
 
 export type TaskAgentDispatch = {
   id: string;
   targetMemberId: string;
   targetAgentId: string;
-  kind: "boss_reminder" | "review_accepted" | "review_rejected" | "block_escalated" | "block_guidance" | "cancel_request_accepted" | "cancel_request_rejected" | "acceptance_revoked" | "cancellation_restored" | "submission_git_required";
+  kind: "boss_reminder" | "review_accepted" | "review_rejected" | "review_failed" | "block_escalated" | "block_guidance" | "cancel_request_accepted" | "cancel_request_rejected" | "acceptance_revoked" | "cancellation_restored" | "submission_git_required" | "submission_materials_required";
   status: "pending" | "running" | "succeeded" | "failed" | "canceled";
   attempts: number;
   lastError: string | null;
@@ -112,6 +115,27 @@ export type MeetingSummary = {
   summary: string | null;
   bossParticipates: boolean;
   bossStartedAt: string | null;
+  sessionMode: "dedicated" | "legacy_main";
+  entryState: "idle" | "notifying" | "provisioning" | "ready";
+  entryStatus: {
+    state: "idle" | "notifying" | "provisioning" | "ready";
+    total: number;
+    notified: number;
+    ready: number;
+    waitingMembers: Array<{
+      memberId: string;
+      memberName: string;
+      status: string;
+      lastError: string | null;
+      nextRetryAt: string | null;
+    }>;
+    nextRetryAt: string | null;
+  };
+  controlState: "host" | "participant" | "waiting_boss" | "host_summary" | "closing";
+  waitingOnBossSince: string | null;
+  latestHostSummary: string | null;
+  latestHostSummaryAt: string | null;
+  bossEndBlockedReason: string | null;
   awaitingBossStart: boolean;
   endRequestedAt: string | null;
   endRequestedSummary: string | null;
@@ -153,6 +177,20 @@ export type MeetingDetail = MeetingSummary & {
     lastError: string | null;
     reason: string;
   } | null;
+  memberSessions: Array<{
+    id: string;
+    memberId: string;
+    memberName: string;
+    runtimeAgentId: string;
+    sessionKey: string;
+    sessionId: string | null;
+    label: string;
+    status: "pending" | "provisioning" | "ready" | "archive_pending" | "archiving" | "archived" | "failed";
+    attempts: number;
+    lastError: string | null;
+    nextAttemptAt: string;
+    archivedAt: string | null;
+  }>;
   closeoutDispatches: Array<{
     id: string;
     memberId: string;
@@ -174,6 +212,15 @@ export type MeetingDetail = MeetingSummary & {
 };
 
 export type TaskDetail = Task & {
+  attachments: Array<{
+    id: string;
+    taskId: string;
+    fileName: string;
+    mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+    byteSize: number;
+    localPath: string;
+    createdAt: string;
+  }>;
   childFlow: null | {
     id: string;
     parentTaskId: string;
@@ -199,6 +246,7 @@ export type TaskDetail = Task & {
   taskMeetingRequirement: null | {
     status: "required" | "scheduled" | "active" | "fulfilled";
     meetingId: string | null;
+    bossParticipates: boolean;
     requiredAt: string;
     fulfilledAt: string | null;
   };
@@ -215,6 +263,22 @@ export type TaskDetail = Task & {
       conclusion: string;
     } | null;
     gitLocation: null | { remoteUrl: string; branch: string; commit: string; verifiedAt: string };
+    reviewHandoff: null | {
+      files: Array<{ id: string; evidenceIndex: number | null; fileName: string; sourcePath: string; byteSize: number; sha256: string }>;
+      functionalVerification: null | {
+        workingDirectory: string;
+        command: string;
+        oneLineCommand: string;
+      };
+      delivery: {
+        channel: "boss_email" | "issuer_workspace";
+        status: "pending" | "delivering" | "delivered" | "failed";
+        targetPath: string | null;
+        attempts: number;
+        lastError: string | null;
+        deliveredAt: string | null;
+      };
+    };
     createdAt: string;
   }>;
   reminderDispatch: TaskAgentDispatch | null;
@@ -246,12 +310,20 @@ export type TaskDetail = Task & {
   audit: Array<{ id: number; actorId: string; action: string; reason: string | null; createdAt: string }>;
 };
 
+export type TaskImageAttachmentContent = TaskDetail["attachments"][number] & {
+  dataUrl: string;
+};
+
 export type TaskPromptPoolSummary = {
   enabled: boolean;
+  paused?: boolean;
+  pausedAt?: string | null;
   timeZone: "Asia/Shanghai";
   startHour: number;
   endHour: number;
   workHoursSource?: "config_default" | "boss_override";
+  minutesPerLevel?: number;
+  minutesPerLevelSource?: "system_default" | "boss_override";
   nextDueAt: string | null;
   totals: { employees: number; items: number; execution: number; review: number; blockedReview: number };
   queues: Array<{

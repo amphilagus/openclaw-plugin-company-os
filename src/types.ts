@@ -6,6 +6,7 @@ export const TASK_STATUSES = [
   "closed",
   "canceled",
   "aborted",
+  "failed",
 ] as const;
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
@@ -13,13 +14,15 @@ export type TaskAgentDispatchKind =
   | "boss_reminder"
   | "review_accepted"
   | "review_rejected"
+  | "review_failed"
   | "block_escalated"
   | "block_guidance"
   | "cancel_request_accepted"
   | "cancel_request_rejected"
   | "acceptance_revoked"
   | "cancellation_restored"
-  | "submission_git_required";
+  | "submission_git_required"
+  | "submission_materials_required";
 export type TaskCheckinActionKind = "review" | "execute" | "boss_digest";
 export type TaskCheckinChannel = "agent" | "boss_email";
 export type TaskCheckinDispatchStatus = "pending" | "running" | "succeeded" | "failed" | "skipped" | "canceled";
@@ -33,6 +36,9 @@ export type TaskAvailability = "active" | "waiting_stage" | "suspended_stage" | 
 export type MeetingType = "task" | "discussion";
 export type MeetingStatus = "queued" | "active" | "completed" | "canceled" | "timed_out";
 export type MeetingCloseoutOutcome = "completed" | "canceled" | "timed_out";
+export type MeetingSessionMode = "dedicated" | "legacy_main";
+export type MeetingEntryState = "idle" | "notifying" | "provisioning" | "ready";
+export type MeetingControlState = "host" | "participant" | "waiting_boss" | "host_summary" | "closing";
 export type ParticipantRole = "worker" | "advisor";
 export type Actor = "boss" | string;
 
@@ -124,13 +130,89 @@ export type ResolvedCompanyOsConfig = {
   };
 };
 
-export type EvidenceInput = {
-  type: "proof" | "artifact";
-  label: string;
-  note?: string;
-  command?: string;
-  url?: string;
-  path?: string;
+export type EvidenceInput =
+  | {
+      type: "proof";
+      label: string;
+      note?: string;
+      command?: string;
+      url?: string;
+      path?: never;
+    }
+  | {
+      type: "artifact";
+      label: string;
+      path: string;
+      note?: string;
+      command?: never;
+      url?: never;
+    };
+
+export type TaskReviewHandoffInput = {
+  functionalVerification: {
+    workingDirectory: string;
+    command: string;
+  };
+};
+
+export type PreparedTaskReviewHandoff = {
+  files: Array<{
+    evidenceIndex: number;
+    fileName: string;
+    sourcePath: string;
+    byteSize: number;
+    sha256: string;
+    data: Buffer;
+  }>;
+  functionalVerification: {
+    workingDirectory: string;
+    command: string;
+    oneLineCommand: string;
+  } | null;
+};
+
+export type TaskSubmissionReviewHandoff = {
+  files: Array<{
+    id: string;
+    evidenceIndex: number | null;
+    fileName: string;
+    sourcePath: string;
+    byteSize: number;
+    sha256: string;
+  }>;
+  functionalVerification: {
+    workingDirectory: string;
+    command: string;
+    oneLineCommand: string;
+  } | null;
+  delivery: {
+    channel: "boss_email" | "issuer_workspace";
+    status: "pending" | "delivering" | "delivered" | "failed";
+    targetPath: string | null;
+    attempts: number;
+    lastError: string | null;
+    deliveredAt: string | null;
+  };
+};
+
+export type TaskImageAttachmentInput = {
+  fileName: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  dataUrl: string;
+};
+
+export type TaskImageAttachment = {
+  id: string;
+  taskId: string;
+  fileName: string;
+  mimeType: TaskImageAttachmentInput["mimeType"];
+  byteSize: number;
+  localPath: string;
+  createdAt: string;
+};
+
+export type TaskImageAttachmentContent = TaskImageAttachment & {
+  dataUrl: string;
 };
 
 export type GitLocationInput = {
@@ -239,6 +321,7 @@ export type TaskFlow = {
 export type TaskMeetingRequirement = {
   status: "required" | "scheduled" | "active" | "fulfilled";
   meetingId: string | null;
+  bossParticipates: boolean;
   requiredAt: string;
   fulfilledAt: string | null;
 };
@@ -251,6 +334,7 @@ export type MeetingParticipantInput = {
 export type MeetingAdvance = {
   hostDispatchId?: string;
   activatedMeetingId?: string;
+  entryMeetingId?: string;
 };
 
 export type MeetingContextEnvelope = {
@@ -265,10 +349,42 @@ export type MeetingTurnDispatch = MeetingContextEnvelope & {
   turnId: string;
   speakerId: string;
   agentId: string;
+  sessionKey: string;
   messageId?: string;
   messageSequence?: number;
   roundNumber?: number;
   contextAppendId?: string;
+};
+
+export type MeetingEntryNotification = {
+  id: string;
+  meetingId: string;
+  memberId: string;
+  runtimeAgentId: string;
+  role: "host" | "worker" | "advisor";
+  mainSessionKey: string;
+  meetingSessionKey: string;
+  prompt: string;
+  status: "pending" | "running" | "succeeded" | "failed";
+  attempts: number;
+  lastError: string | null;
+  nextAttemptAt: string;
+};
+
+export type MeetingMemberSession = {
+  id: string;
+  meetingId: string;
+  memberId: string;
+  memberName: string;
+  runtimeAgentId: string;
+  sessionKey: string;
+  sessionId: string | null;
+  label: string;
+  status: "pending" | "provisioning" | "ready" | "archive_pending" | "archiving" | "archived" | "failed";
+  attempts: number;
+  lastError: string | null;
+  nextAttemptAt: string;
+  archivedAt: string | null;
 };
 
 export type MeetingToolSessionIdentity = {
@@ -379,10 +495,14 @@ export type TaskPromptDispatch = {
 
 export type TaskPromptPoolSummary = {
   enabled: boolean;
+  paused: boolean;
+  pausedAt: string | null;
   timeZone: "Asia/Shanghai";
   startHour: number;
   endHour: number;
   workHoursSource: "config_default" | "boss_override";
+  minutesPerLevel: number;
+  minutesPerLevelSource: "system_default" | "boss_override";
   nextDueAt: string | null;
   totals: {
     employees: number;

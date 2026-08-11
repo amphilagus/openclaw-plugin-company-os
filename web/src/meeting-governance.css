@@ -1,0 +1,120 @@
+.meeting-entry-gate {
+  border-color: #9dcfc2;
+  background: linear-gradient(145deg, #edf9f5, #fff);
+}
+
+.entry-member-list,
+.entry-session-list {
+  display: grid;
+  gap: 7px;
+  margin: 14px 0;
+  text-align: left;
+}
+
+.entry-member-list > div,
+.entry-session {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) 1fr auto;
+  gap: 9px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .8);
+  font-size: 11px;
+}
+
+.entry-member-list span,
+.entry-member-list time,
+.entry-session small,
+.entry-session span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.entry-session-list {
+  padding: 0 12px;
+}
+
+.entry-session {
+  grid-template-columns: 8px 1fr;
+}
+
+.entry-session i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #a9b2ad;
+}
+
+.entry-session.ready i,
+.entry-session.archived i {
+  background: #25a26d;
+  box-shadow: 0 0 0 3px #e1f4e9;
+}
+
+.entry-session.failed i {
+  background: var(--red);
+}
+
+.entry-session b,
+.entry-session small,
+.entry-session span {
+  display: block;
+}
+
+.boss-decision-gate {
+  width: min(650px, 100%);
+  border-color: #8fcbbb;
+  background: linear-gradient(145deg, #eaf8f3, #fff);
+}
+
+.boss-decision-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 9px;
+}
+
+.boss-decision-actions button {
+  min-height: 48px;
+}
+
+.boss-decision-actions button b {
+  margin-right: 6px;
+  font: 800 11px var(--mono);
+}
+
+.latest-host-summary b {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--green);
+}
+
+.boss-direct-end textarea {
+  margin-bottom: 12px;
+  text-align: left;
+}
+
+.publish-choice {
+  display: flex;
+  grid-template-columns: none;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.publish-choice input {
+  width: auto;
+}
+
+.end-blocked-reason {
+  display: block;
+  margin-top: 12px;
+  color: var(--red);
+}
+
+@media (max-width: 680px) {
+  .boss-decision-actions { grid-template-columns: 1fr; }
+  .entry-member-list > div { grid-template-columns: 1fr; }
+}

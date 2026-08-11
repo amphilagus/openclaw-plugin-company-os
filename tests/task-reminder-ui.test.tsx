@@ -33,6 +33,52 @@ const task: TaskDetail = {
 };
 
 describe("Boss task reminder control", () => {
+  it("shows review material delivery, files, and the copyable verification command", () => {
+    const html = renderToStaticMarkup(<TaskDetailView detail={{
+      ...task,
+      status: "review",
+      submissions: [{
+        id: "submission-1",
+        summary: "请验收",
+        evidence: [{ type: "proof", label: "tests", command: "npm test" }],
+        status: "pending",
+        gitLocation: { remoteUrl: "https://example.test/repo.git", branch: "agents/cto", commit: "a".repeat(40), verifiedAt: task.updatedAt },
+        reviewHandoff: {
+          files: [{ id: "file-1", evidenceIndex: 0, fileName: "report.pdf", sourcePath: "report.pdf", byteSize: 2048, sha256: "b".repeat(64) }],
+          functionalVerification: { workingDirectory: "/workspace/cto", command: "npm run verify", oneLineCommand: "cd -- '/workspace/cto' && npm run verify" },
+          delivery: { channel: "boss_email", status: "delivered", targetPath: null, attempts: 1, lastError: null, deliveredAt: task.updatedAt },
+        },
+        createdAt: task.updatedAt,
+      }],
+    }} members={[]} reload={vi.fn()} />);
+
+    expect(html).toContain("验收材料");
+    expect(html).toContain("Boss 邮件");
+    expect(html).toContain("report.pdf");
+    expect(html).toContain("复制验收命令");
+    expect(html).toContain("npm run verify");
+  });
+
+  it("shows root-task image attachment metadata and a lazy-loading gallery", () => {
+    const html = renderToStaticMarkup(<TaskDetailView detail={{
+      ...task,
+      attachments: [{
+        id: "image-1",
+        taskId: task.id,
+        fileName: "交互参考图.png",
+        mimeType: "image/png",
+        byteSize: 2048,
+        localPath: "/tmp/task-attachments/image-1.png",
+        createdAt: task.createdAt,
+      }],
+    }} members={[]} reload={vi.fn()} />);
+
+    expect(html).toContain("图片附件 · 1");
+    expect(html).toContain("交互参考图.png");
+    expect(html).toContain("正在加载图片");
+    expect(html).toContain("/tmp/task-attachments/image-1.png");
+  });
+
   it("shows the reminder action on an active task", () => {
     const html = renderToStaticMarkup(<TaskDetailView detail={task} members={[]} reload={vi.fn()} />);
 
@@ -126,6 +172,7 @@ describe("Boss task reminder control", () => {
 
     expect(html).toContain("验收并关闭");
     expect(html).toContain("驳回");
+    expect(html).toContain("判定任务失败");
   });
 
   it("renders the frozen Git remote location for the latest submission", () => {
@@ -185,6 +232,39 @@ describe("Boss task reminder control", () => {
     expect(html).toContain("验收意见（可选）");
     expect(html).toContain("确认验收并关闭");
     expect(html).not.toContain("disabled");
+  });
+
+  it("requires an explicit reason before terminally failing a root task", () => {
+    const html = renderToStaticMarkup(<TaskReviewActions
+      mode="fail"
+      feedback=""
+      busy={false}
+      choose={vi.fn()}
+      changeFeedback={vi.fn()}
+      submit={vi.fn()}
+      cancel={vi.fn()}
+    />);
+
+    expect(html).toContain("BOSS FINAL FAILURE");
+    expect(html).toContain("失败原因（必填）");
+    expect(html).toContain("不再退回执行池，也不能重新提交");
+    expect(html).toContain("确认判定失败并终结");
+    expect(html).toContain("disabled");
+  });
+
+  it("renders a failed root as a terminal result without further management actions", () => {
+    const html = renderToStaticMarkup(<TaskDetailView detail={{
+      ...task,
+      status: "failed",
+      failedAt: "2026-08-09T04:00:00.000Z",
+      failedReason: "多轮整改仍无法达到目标",
+    }} members={[]} reload={vi.fn()} />);
+
+    expect(html).toContain("任务失败");
+    expect(html).toContain("该根任务已被 Boss 判定失败并终结");
+    expect(html).toContain("多轮整改仍无法达到目标");
+    expect(html).not.toContain("中止任务");
+    expect(html).not.toContain("二次审查不通过");
   });
 
   it("renders the irreversible task-tree abort form without browser prompts", () => {

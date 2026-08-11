@@ -4,8 +4,10 @@ import { resolveActiveEmbeddedRunSessionId } from "openclaw/plugin-sdk/agent-har
 import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
 import { GitCliRemoteVerifier, type GitRemoteVerifier } from "./git-verifier.js";
-import { resolveAgentVisualIdentity, resolveStandaloneAvatar, type AgentVisualIdentity } from "./identity.js";
+import { materializeWorkspaceReviewMaterial, prepareTaskReviewHandoff, resolveAgentWorkspace } from "./review-handoff.js";
+import { resolveAgentVisualIdentity, resolveStandaloneAvatar } from "./identity.js";
 import { OpenClawSessionContextAppender, type SessionContextAppender } from "./session-context.js";
+import { InMemoryMeetingSessionRuntime, type MeetingSessionRuntime } from "./meeting-session-runtime.js";
 import { CompanyOsStore, nextDailyAgentRunAt, nextNoticeReminderRunAt, nextTaskCheckinRunAt } from "./store.js";
 import type {
   Actor,
@@ -20,7 +22,10 @@ import type {
   ResolvedCompanyOsConfig,
   ServiceEvent,
   TaskReviewReport,
+  TaskReviewHandoffInput,
 } from "./types.js";
+
+const TASK_PROMPT_SCHEDULE_REFRESH_MS = 250;
 
 export class CompanyOsService {
   readonly store: CompanyOsStore;
@@ -31,21 +36,28 @@ export class CompanyOsService {
   private readonly agentInvoker: AgentInvoker;
   private readonly gitRemoteVerifier: GitRemoteVerifier;
   private readonly sessionContextAppender: SessionContextAppender;
+  private readonly meetingSessionRuntime: MeetingSessionRuntime;
+  private readonly directMeetingSystemDelivery: boolean;
   private readonly isSessionActive: (sessionKey: string) => boolean;
-  private readonly identityCache = new Map<string, AgentVisualIdentity>();
   private readonly listeners = new Set<(event: ServiceEvent) => void>();
   private readonly eventHistory: ServiceEvent[] = [];
   private scanTimer?: NodeJS.Timeout;
   private automaticEndTimer?: NodeJS.Timeout;
   private emailFlush?: Promise<void>;
+  private submissionMaterialFlush?: Promise<void>;
+  private submissionMaterialRetryTimer?: NodeJS.Timeout;
   private dispatchFlush?: Promise<void>;
   private closeoutDispatchFlush?: Promise<void>;
   private closeoutRetryTimer?: NodeJS.Timeout;
+  private meetingEntryFlush?: Promise<void>;
+  private meetingEntryRetryTimer?: NodeJS.Timeout;
   private taskDispatchFlush?: Promise<void>;
   private taskCheckinFlush?: Promise<void>;
   private taskCheckinRunTimer?: NodeJS.Timeout;
   private taskCheckinDispatchTimer?: NodeJS.Timeout;
   private taskPromptTickTimer?: NodeJS.Timeout;
+  private taskPromptScheduleRefreshTimer?: NodeJS.Timeout;
+  private taskPromptScheduledAt: string | null = null;
   private readonly activeTaskPromptDeliveries = new Set<Promise<void>>();
   private readonly reservedMainSessions = new Set<string>();
   private noticeReminderFlush?: Promise<void>;
@@ -73,6 +85,7 @@ export class CompanyOsService {
     agentInvoker?: AgentInvoker;
     gitRemoteVerifier?: GitRemoteVerifier;
     sessionContextAppender?: SessionContextAppender;
+    meetingSessionRuntime?: MeetingSessionRuntime;
     isSessionActive?: (sessionKey: string) => boolean;
   }) {
     this.config = options.config;
@@ -82,22 +95,28 @@ export class CompanyOsService {
     this.agentInvoker = options.agentInvoker ?? new OpenClawCliAgentInvoker();
     this.gitRemoteVerifier = options.gitRemoteVerifier ?? new GitCliRemoteVerifier();
     this.sessionContextAppender = options.sessionContextAppender ?? new OpenClawSessionContextAppender(options.runtimeConfig);
+    this.directMeetingSystemDelivery = Boolean(options.meetingSessionRuntime);
+    this.meetingSessionRuntime = options.meetingSessionRuntime ?? new InMemoryMeetingSessionRuntime();
     this.isSessionActive = options.isSessionActive ?? ((sessionKey) => Boolean(resolveActiveEmbeddedRunSessionId(sessionKey)));
     this.store = new CompanyOsStore({
       databasePath: options.databasePath,
       allowedAgentIds: options.allowedAgentIds,
       config: options.config,
       organizationAdminAgentId: resolveOrganizationAdminAgentId(options.runtimeConfig, options.config.organizationAdminAgentId),
+      defaultMeetingSessionMode: options.meetingSessionRuntime ? "dedicated" : "legacy_main",
+      enforceBossExclusiveEnd: Boolean(options.meetingSessionRuntime),
       onEvent: (event) => this.emit(event),
     });
   }
 
   async start() {
+    this.store.recoverMeetingEntryWork();
     this.store.recoverAgentDispatches();
     this.store.recoverMeetingCloseoutDispatches();
     this.store.recoverTaskDispatches();
     this.store.recoverTaskPromptDispatches();
     this.store.recoverTaskPromptCycleDispatches();
+    this.store.recoverSubmissionMaterialDeliveries();
     this.store.recoverOverdueTaskPromptSchedules();
     this.store.recoverNoticeReminderDispatches();
     this.store.recoverDailyAgentDispatches();
@@ -105,13 +124,19 @@ export class CompanyOsService {
     await this.recover();
     await this.flushSessionContextAppends();
     await this.flushMeetingEmails();
+    await this.flushSubmissionMaterialDeliveries();
     this.kickHostDispatches();
+    this.kickMeetingEntryWork();
     this.kickMeetingCloseoutDispatches();
     this.kickTaskDispatches();
     this.kickNoticeReminderDispatches();
     this.kickDailyAgentDispatches();
     this.started = true;
     this.scheduleNextTaskPromptCountdown();
+    this.taskPromptScheduleRefreshTimer = setInterval(() => {
+      this.refreshTaskPromptCountdown();
+    }, TASK_PROMPT_SCHEDULE_REFRESH_MS);
+    this.taskPromptScheduleRefreshTimer.unref();
     this.scheduleNextNoticeReminderRun();
     this.scheduleNextDailySelfImprovementRun();
     this.scheduleNextDailyPersonaAuditRun();
@@ -129,22 +154,27 @@ export class CompanyOsService {
     if (this.automaticEndTimer) clearTimeout(this.automaticEndTimer);
     if (this.contextAppendIdleTimer) clearTimeout(this.contextAppendIdleTimer);
     if (this.closeoutRetryTimer) clearTimeout(this.closeoutRetryTimer);
+    if (this.meetingEntryRetryTimer) clearTimeout(this.meetingEntryRetryTimer);
     if (this.taskCheckinRunTimer) clearTimeout(this.taskCheckinRunTimer);
     if (this.taskCheckinDispatchTimer) clearTimeout(this.taskCheckinDispatchTimer);
     if (this.taskPromptTickTimer) clearTimeout(this.taskPromptTickTimer);
+    if (this.taskPromptScheduleRefreshTimer) clearInterval(this.taskPromptScheduleRefreshTimer);
     if (this.noticeReminderRunTimer) clearTimeout(this.noticeReminderRunTimer);
     if (this.dailySelfImprovementRunTimer) clearTimeout(this.dailySelfImprovementRunTimer);
     if (this.dailyPersonaAuditRunTimer) clearTimeout(this.dailyPersonaAuditRunTimer);
     if (this.dailyAgentDispatchTimer) clearTimeout(this.dailyAgentDispatchTimer);
+    if (this.submissionMaterialRetryTimer) clearTimeout(this.submissionMaterialRetryTimer);
     this.lifecycleAbort.abort();
     await Promise.allSettled([
       ...(this.dispatchFlush ? [this.dispatchFlush] : []),
       ...(this.closeoutDispatchFlush ? [this.closeoutDispatchFlush] : []),
+      ...(this.meetingEntryFlush ? [this.meetingEntryFlush] : []),
       ...(this.taskDispatchFlush ? [this.taskDispatchFlush] : []),
       ...(this.taskCheckinFlush ? [this.taskCheckinFlush] : []),
       ...this.activeTaskPromptDeliveries,
       ...(this.noticeReminderFlush ? [this.noticeReminderFlush] : []),
       ...(this.emailFlush ? [this.emailFlush] : []),
+      ...(this.submissionMaterialFlush ? [this.submissionMaterialFlush] : []),
       ...(this.contextAppendFlush ? [this.contextAppendFlush] : []),
       ...this.activeDailyAgentDeliveries,
       ...this.activeTurnDeliveries,
@@ -161,15 +191,14 @@ export class CompanyOsService {
   memberIdentity(memberId: string) {
     const member = this.store.listMembers(true).find((candidate) => candidate.id === memberId);
     if (!member) throw new Error(`member ${memberId} not found`);
-    const visual = this.identityCache.get(memberId) ?? (member.kind === "boss"
+    const visual = member.kind === "boss"
       ? {
           agentId: "boss",
           configuredName: member.name,
           emoji: null,
           avatarUrl: resolveStandaloneAvatar(this.config.bossAvatarPath),
         }
-      : resolveAgentVisualIdentity(this.runtimeConfig, member.agentId ?? memberId));
-    this.identityCache.set(memberId, visual);
+      : resolveAgentVisualIdentity(this.runtimeConfig, member.agentId ?? memberId);
     return {
       id: member.id,
       name: member.name,
@@ -212,9 +241,17 @@ export class CompanyOsService {
 
   async dispatchAdvance(advance: MeetingAdvance | null | undefined) {
     await this.flushMeetingEmails();
+    this.kickMeetingEntryWork();
     if (advance?.hostDispatchId) this.kickHostDispatches();
     this.kickMeetingCloseoutDispatches();
+    this.kickTaskDispatches();
+    this.kickTaskCheckinDispatches();
+    this.kickNoticeReminderDispatches();
     this.scheduleNextAutomaticEnd();
+  }
+
+  kickMeetingEntryRetry() {
+    this.kickMeetingEntryWork();
   }
 
   remindTaskByBoss(taskId: string) {
@@ -229,7 +266,7 @@ export class CompanyOsService {
   reviewTask(
     actorId: Actor,
     taskId: string,
-    decision: "accept" | "reject",
+    decision: "accept" | "reject" | "fail",
     feedback?: string,
     reviewReport?: TaskReviewReport,
   ) {
@@ -238,12 +275,28 @@ export class CompanyOsService {
     return task;
   }
 
-  async submitTask(actorId: string, taskId: string, summary: string, evidence: EvidenceInput[], gitLocation: GitLocationInput) {
+  async submitTask(
+    actorId: string,
+    taskId: string,
+    summary: string,
+    evidence: EvidenceInput[],
+    gitLocation: GitLocationInput,
+    reviewHandoff?: TaskReviewHandoffInput,
+  ) {
+    const prepared = prepareTaskReviewHandoff(this.runtimeConfig, actorId, evidence, reviewHandoff);
     const verifiedGitLocation = await this.gitRemoteVerifier.verify(gitLocation);
-    const task = this.store.submitTask(actorId, taskId, summary, evidence, verifiedGitLocation);
+    const task = this.store.submitTask(
+      actorId,
+      taskId,
+      summary,
+      prepared.evidence,
+      verifiedGitLocation,
+      prepared.reviewHandoff,
+    );
     void this.flushMeetingEmails().catch((error) => {
       this.logger.error(`company-os task review email flush failed after submission ${taskId}: ${formatError(error)}`);
     });
+    this.kickSubmissionMaterialDeliveries();
     return task;
   }
 
@@ -454,7 +507,10 @@ export class CompanyOsService {
   }
 
   private mainSessionIsBusy(agentId: string) {
-    const sessionKey = this.mainSessionKey(agentId);
+    return this.sessionIsBusy(this.mainSessionKey(agentId));
+  }
+
+  private sessionIsBusy(sessionKey: string) {
     if (this.reservedMainSessions.has(sessionKey)) return true;
     try {
       return this.isSessionActive(sessionKey);
@@ -465,15 +521,22 @@ export class CompanyOsService {
   }
 
   private tryReserveMainSession(agentId: string) {
-    const sessionKey = this.mainSessionKey(agentId);
-    if (this.mainSessionIsBusy(agentId)) return false;
+    return this.tryReserveSession(this.mainSessionKey(agentId));
+  }
+
+  private tryReserveSession(sessionKey: string) {
+    if (this.sessionIsBusy(sessionKey)) return false;
     this.reservedMainSessions.add(sessionKey);
     return true;
   }
 
   private async reserveMainSession(agentId: string, mode: "wait" | "skip") {
+    return this.reserveSession(this.mainSessionKey(agentId), mode);
+  }
+
+  private async reserveSession(sessionKey: string, mode: "wait" | "skip") {
     while (!this.stopping && !this.lifecycleAbort.signal.aborted) {
-      if (this.tryReserveMainSession(agentId)) return true;
+      if (this.tryReserveSession(sessionKey)) return true;
       if (mode === "skip") return false;
       await shortWait(100, this.lifecycleAbort.signal);
     }
@@ -482,6 +545,10 @@ export class CompanyOsService {
 
   private releaseMainSession(agentId: string) {
     this.reservedMainSessions.delete(this.mainSessionKey(agentId));
+  }
+
+  private releaseSession(sessionKey: string) {
+    this.reservedMainSessions.delete(sessionKey);
   }
 
   private async invokeMainSession(input: {
@@ -499,6 +566,21 @@ export class CompanyOsService {
       });
     } finally {
       this.releaseMainSession(input.agentId);
+    }
+  }
+
+  private async invokeMeetingSession(input: {
+    agentId: string;
+    sessionKey: string;
+    prompt: string;
+    timeoutSeconds: number;
+  }) {
+    const reserved = await this.reserveSession(input.sessionKey, "wait");
+    if (!reserved) throw new Error("Company OS is stopping before the meeting session could be reserved");
+    try {
+      return await this.agentInvoker.invoke({ ...input, signal: this.lifecycleAbort.signal });
+    } finally {
+      this.releaseSession(input.sessionKey);
     }
   }
 
@@ -525,6 +607,18 @@ export class CompanyOsService {
 
   setTaskPromptWorkHours(startHour: number | null, endHour: number | null) {
     const result = this.store.setTaskPromptWorkHours(startHour, endHour);
+    this.scheduleNextTaskPromptCountdown();
+    return result;
+  }
+
+  setTaskPromptMinutesPerLevel(minutesPerLevel: number | null) {
+    const result = this.store.setTaskPromptMinutesPerLevel(minutesPerLevel);
+    this.scheduleNextTaskPromptCountdown();
+    return result;
+  }
+
+  setTaskPromptPaused(paused: boolean) {
+    const result = this.store.setTaskPromptPaused(paused);
     this.scheduleNextTaskPromptCountdown();
     return result;
   }
@@ -596,8 +690,9 @@ export class CompanyOsService {
   private async runTurnDelivery(turn: MeetingTurnDispatch): Promise<MeetingTurnDelivery> {
     let invoked;
     try {
-      invoked = await this.invokeMainSession({
+      invoked = await this.invokeMeetingSession({
         agentId: turn.agentId,
+        sessionKey: turn.sessionKey,
         prompt: turn.prompt,
         timeoutSeconds: this.config.participantTurnTimeoutSeconds,
       });
@@ -609,16 +704,16 @@ export class CompanyOsService {
     }
     if (!this.store.isMeetingTurnWaiting(turn.turnId)) {
       const verified = this.store.meetingTurnDelivery(turn.turnId);
-      this.logger.info(`company-os verified meeting turn ${turn.turnId} from agent:${turn.agentId}:main via ${verified.completionSource}`);
+      this.logger.info(`company-os verified meeting turn ${turn.turnId} from ${turn.sessionKey} via ${verified.completionSource}`);
       return verified;
     }
     if (invoked.ok) {
       const fallback = this.store.completeMeetingTurnFallback(turn.turnId, turn.speakerId, turn.agentId, invoked.text, invoked.raw);
-      this.logger.warn(`company-os auto-recorded fallback speech for meeting turn ${turn.turnId} from agent:${turn.agentId}:main`);
+      this.logger.warn(`company-os auto-recorded fallback speech for meeting turn ${turn.turnId} from ${turn.sessionKey}`);
       return fallback;
     }
     const failed = this.store.failMeetingTurn(turn.turnId, invoked.error);
-    this.logger.error(`company-os meeting turn ${turn.turnId} failed for agent:${turn.agentId}:main: ${invoked.error}`);
+    this.logger.error(`company-os meeting turn ${turn.turnId} failed for ${turn.sessionKey}: ${invoked.error}`);
     return failed;
   }
 
@@ -630,6 +725,90 @@ export class CompanyOsService {
       deliveries.push(await this.deliverTurn(turn));
     }
     throw new Error("too many pending Boss interventions in one meeting advance");
+  }
+
+  private kickMeetingEntryWork() {
+    if (this.stopping || this.meetingEntryFlush) return;
+    if (this.meetingEntryRetryTimer) {
+      clearTimeout(this.meetingEntryRetryTimer);
+      this.meetingEntryRetryTimer = undefined;
+    }
+    this.meetingEntryFlush = this.flushMeetingEntryWork()
+      .catch((error) => this.logger.error(`company-os meeting entry loop failed: ${formatError(error)}`))
+      .finally(() => {
+        this.meetingEntryFlush = undefined;
+        if (this.stopping) return;
+        if (this.store.hasReadyMeetingEntryWork()) this.kickMeetingEntryWork();
+        else this.scheduleNextMeetingEntryWork();
+      });
+  }
+
+  private scheduleNextMeetingEntryWork() {
+    if (this.stopping || this.meetingEntryRetryTimer) return;
+    const nextAttemptAt = this.store.nextMeetingEntryWorkAt();
+    if (!nextAttemptAt) return;
+    const delay = Math.max(0, Date.parse(nextAttemptAt) - Date.now());
+    this.meetingEntryRetryTimer = setTimeout(() => {
+      this.meetingEntryRetryTimer = undefined;
+      this.kickMeetingEntryWork();
+    }, delay);
+    this.meetingEntryRetryTimer.unref();
+  }
+
+  private async flushMeetingEntryWork() {
+    while (!this.stopping) {
+      const notification = this.store.claimNextMeetingEntryNotification();
+      if (notification) {
+        const reserved = await this.reserveMainSession(notification.runtimeAgentId, "wait");
+        if (!reserved) return;
+        try {
+          await this.meetingSessionRuntime.appendMainSystemMessage({
+            agentId: notification.runtimeAgentId,
+            sessionKey: notification.mainSessionKey,
+            text: notification.prompt,
+            idempotencyKey: `company-os:meeting-entry:${notification.id}`,
+          });
+          this.store.completeMeetingEntryNotification(notification.id);
+          this.logger.info(`company-os delivered meeting entry ${notification.id} to ${notification.mainSessionKey}`);
+        } catch (error) {
+          this.store.retryMeetingEntryNotification(notification.id, formatError(error));
+          this.logger.error(`company-os meeting entry ${notification.id} failed: ${formatError(error)}`);
+        } finally {
+          this.releaseMainSession(notification.runtimeAgentId);
+        }
+        continue;
+      }
+
+      const session = this.store.claimNextMeetingSessionProvision();
+      if (session) {
+        try {
+          const ensured = await this.meetingSessionRuntime.ensureSession({
+            agentId: session.runtimeAgentId,
+            sessionKey: session.sessionKey,
+            label: session.label,
+            category: "Company OS 会议",
+          });
+          const advance = this.store.completeMeetingSessionProvision(session.id, ensured.sessionId, ensured.sessionKey);
+          if (advance.hostDispatchId) this.kickHostDispatches();
+          this.logger.info(`company-os provisioned meeting session ${session.sessionKey}`);
+        } catch (error) {
+          this.store.retryMeetingSessionProvision(session.id, formatError(error));
+          this.logger.error(`company-os meeting session ${session.sessionKey} failed: ${formatError(error)}`);
+        }
+        continue;
+      }
+
+      const archive = this.store.claimNextMeetingSessionArchive();
+      if (!archive) return;
+      try {
+        await this.meetingSessionRuntime.releaseSession({ agentId: archive.runtimeAgentId, sessionKey: archive.sessionKey });
+        this.store.completeMeetingSessionArchive(archive.id);
+        this.logger.info(`company-os released fixed meeting session ${archive.sessionKey}`);
+      } catch (error) {
+        this.store.retryMeetingSessionArchive(archive.id, formatError(error));
+        this.logger.error(`company-os meeting session archive ${archive.sessionKey} failed: ${formatError(error)}`);
+      }
+    }
   }
 
   private kickHostDispatches() {
@@ -653,20 +832,29 @@ export class CompanyOsService {
           instruction: dispatch.reason,
         });
         this.store.setHostDispatchContext(dispatch.id, context);
-        const result = await this.invokeMainSession({
+        const session = this.store.meetingSessionForMember(dispatch.meetingId, dispatch.targetMemberId);
+        const result = await this.invokeMeetingSession({
           agentId: dispatch.targetAgentId,
+          sessionKey: session.sessionKey,
           prompt: context.prompt,
           timeoutSeconds: this.config.hostIdleTimeoutSeconds,
         });
-        if (result.ok || this.store.hostDispatchHasProgress(dispatch.id)) {
+        const verifiedProgress = this.store.hostDispatchHasProgress(dispatch.id);
+        if (dispatch.kind === "host_summary" && !verifiedProgress) {
+          const reason = result.ok
+            ? "host returned without calling company_meeting_submit_summary"
+            : result.error;
+          this.store.failHostDispatch(dispatch.id, reason);
+          this.logger.error(`company-os host summary dispatch ${dispatch.id} failed for ${session.sessionKey}: ${reason}`);
+        } else if (result.ok || verifiedProgress) {
           this.store.completeHostDispatch(dispatch.id, context.toSequence);
           if (!result.ok) {
             this.logger.warn(`company-os accepted host dispatch ${dispatch.id} after verified meeting progress despite CLI result: ${result.error}`);
           }
-          this.logger.info(`company-os completed host dispatch ${dispatch.id} for agent:${dispatch.targetAgentId}:main`);
+          this.logger.info(`company-os completed host dispatch ${dispatch.id} for ${session.sessionKey}`);
         } else {
           this.store.failHostDispatch(dispatch.id, result.error);
-          this.logger.error(`company-os host dispatch ${dispatch.id} failed for agent:${dispatch.targetAgentId}:main: ${result.error}`);
+          this.logger.error(`company-os host dispatch ${dispatch.id} failed for ${session.sessionKey}: ${result.error}`);
         }
       } catch (error) {
         this.store.failHostDispatch(dispatch.id, formatError(error));
@@ -707,27 +895,34 @@ export class CompanyOsService {
     while (!this.stopping) {
       const dispatch = this.store.claimNextMeetingCloseoutDispatch();
       if (!dispatch) return;
+      const reserved = await this.reserveMainSession(dispatch.runtimeAgentId, "wait");
+      if (!reserved) return;
       try {
-        const result = await this.invokeMainSession({
-          agentId: dispatch.runtimeAgentId,
-          prompt: dispatch.prompt,
-          timeoutSeconds: this.config.participantTurnTimeoutSeconds,
-        });
-        if (result.ok || (result.code === "empty_reply" && result.completed)) {
-          const advance = this.store.completeMeetingCloseoutDispatch(dispatch.id);
-          if (!result.ok) {
-            this.logger.warn(`company-os accepted meeting closeout ${dispatch.id} after a completed CLI turn returned no text payload`);
-          }
-          this.logger.info(`company-os delivered meeting closeout ${dispatch.id} to agent:${dispatch.runtimeAgentId}:main`);
-          await this.dispatchAdvance(advance);
+        if (this.directMeetingSystemDelivery) {
+          await this.meetingSessionRuntime.appendMainSystemMessage({
+            agentId: dispatch.runtimeAgentId,
+            sessionKey: this.mainSessionKey(dispatch.runtimeAgentId),
+            text: dispatch.prompt,
+            idempotencyKey: `company-os:meeting-closeout:${dispatch.id}`,
+          });
         } else {
-          this.store.retryMeetingCloseoutDispatch(dispatch.id, result.error);
-          this.logger.error(`company-os meeting closeout ${dispatch.id} failed for agent:${dispatch.runtimeAgentId}:main: ${result.error}`);
+          const result = await this.agentInvoker.invoke({
+            agentId: dispatch.runtimeAgentId,
+            prompt: dispatch.prompt,
+            timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+            signal: this.lifecycleAbort.signal,
+          });
+          if (!result.ok && !(result.code === "empty_reply" && result.completed)) throw new Error(result.error);
         }
+        const advance = this.store.completeMeetingCloseoutDispatch(dispatch.id);
+        this.logger.info(`company-os delivered meeting closeout ${dispatch.id} to agent:${dispatch.runtimeAgentId}:main`);
+        await this.dispatchAdvance(advance);
       } catch (error) {
         const message = formatError(error);
         this.store.retryMeetingCloseoutDispatch(dispatch.id, message);
         this.logger.error(`company-os meeting closeout ${dispatch.id} crashed: ${message}`);
+      } finally {
+        this.releaseMainSession(dispatch.runtimeAgentId);
       }
     }
   }
@@ -788,8 +983,12 @@ export class CompanyOsService {
   private scheduleNextTaskPromptCountdown() {
     if (this.taskPromptTickTimer) clearTimeout(this.taskPromptTickTimer);
     this.taskPromptTickTimer = undefined;
-    if (this.stopping || !this.config.taskRollingPrompts.enabled) return;
+    if (this.stopping || !this.config.taskRollingPrompts.enabled) {
+      this.taskPromptScheduledAt = null;
+      return;
+    }
     const scheduledAt = this.store.nextTaskPromptDueAt();
+    this.taskPromptScheduledAt = scheduledAt;
     if (!scheduledAt) return;
     const delay = Math.max(0, Date.parse(scheduledAt) - Date.now());
     this.taskPromptTickTimer = setTimeout(() => {
@@ -800,6 +999,19 @@ export class CompanyOsService {
     }, delay);
     this.taskPromptTickTimer.unref();
     this.logger.info(`company-os scheduled next personal task prompt countdown at ${scheduledAt} (Asia/Shanghai)`);
+  }
+
+  private refreshTaskPromptCountdown() {
+    if (this.stopping || !this.config.taskRollingPrompts.enabled) return;
+    try {
+      const scheduledAt = this.store.peekNextTaskPromptDueAt();
+      if (scheduledAt !== this.taskPromptScheduledAt
+        || (!this.taskPromptTickTimer && this.activeTaskPromptDeliveries.size === 0)) {
+        this.scheduleNextTaskPromptCountdown();
+      }
+    } catch (error) {
+      this.logger.error(`company-os personal task prompt schedule refresh failed: ${formatError(error)}`);
+    }
   }
 
   private async dispatchDueTaskPrompts(now = Date.now()) {
@@ -817,7 +1029,7 @@ export class CompanyOsService {
   private async deliverTaskPromptCountdownMember(memberId: string, now: number) {
     const member = this.store.listMembers(true).find((candidate) => candidate.id === memberId);
     if (!member?.agentId) return;
-    const activeMeeting = this.store.activeMeetingForMember(memberId);
+    const activeMeeting = this.store.meetingFocusForMember(memberId);
     if (activeMeeting) {
       const reason = `member is participating in active meeting ${activeMeeting.id}: ${activeMeeting.title}`;
       this.store.createTaskPromptCycleDispatch(memberId, true, reason, now);
@@ -887,7 +1099,7 @@ export class CompanyOsService {
   private async deliverTaskPromptTickMember(tickId: string, memberId: string) {
     const member = this.store.listMembers(true).find((candidate) => candidate.id === memberId);
     if (!member?.agentId) return;
-    const activeMeeting = this.store.activeMeetingForMember(memberId);
+    const activeMeeting = this.store.meetingFocusForMember(memberId);
     if (activeMeeting) {
       const reason = `member is participating in active meeting ${activeMeeting.id}: ${activeMeeting.title}`;
       this.store.createTaskPromptDispatch(tickId, memberId, true, reason);
@@ -1248,6 +1460,57 @@ export class CompanyOsService {
     } finally {
       this.emailFlush = undefined;
     }
+  }
+
+  private kickSubmissionMaterialDeliveries() {
+    void this.flushSubmissionMaterialDeliveries().catch((error) => {
+      this.logger.error(`company-os review material delivery flush failed: ${formatError(error)}`);
+    });
+  }
+
+  private async flushSubmissionMaterialDeliveries(): Promise<void> {
+    if (this.submissionMaterialFlush) {
+      await this.submissionMaterialFlush;
+      return;
+    }
+    if (this.submissionMaterialRetryTimer) {
+      clearTimeout(this.submissionMaterialRetryTimer);
+      this.submissionMaterialRetryTimer = undefined;
+    }
+    this.submissionMaterialFlush = (async () => {
+      while (!this.stopping) {
+        const delivery = this.store.claimNextWorkspaceMaterialDelivery();
+        if (!delivery) return;
+        try {
+          const workspace = resolveAgentWorkspace(this.runtimeConfig, delivery.reviewerId);
+          const targetPath = materializeWorkspaceReviewMaterial(workspace, delivery);
+          this.store.completeWorkspaceMaterialDelivery(delivery.id, targetPath);
+          this.logger.info(`company-os delivered review material ${delivery.submissionId} to ${targetPath}`);
+        } catch (error) {
+          const message = formatError(error);
+          this.store.failWorkspaceMaterialDelivery(delivery.id, message);
+          this.logger.error(`company-os failed review material delivery ${delivery.submissionId}: ${message}`);
+        }
+      }
+    })();
+    try {
+      await this.submissionMaterialFlush;
+    } finally {
+      this.submissionMaterialFlush = undefined;
+      this.scheduleNextSubmissionMaterialDelivery();
+    }
+  }
+
+  private scheduleNextSubmissionMaterialDelivery() {
+    if (this.stopping || this.submissionMaterialRetryTimer) return;
+    const dueAt = this.store.nextWorkspaceMaterialDeliveryAt();
+    if (!dueAt) return;
+    const delay = Math.max(0, Date.parse(dueAt) - Date.now());
+    this.submissionMaterialRetryTimer = setTimeout(() => {
+      this.submissionMaterialRetryTimer = undefined;
+      this.kickSubmissionMaterialDeliveries();
+    }, Math.min(delay, 2_147_000_000));
+    this.submissionMaterialRetryTimer.unref();
   }
 }
 

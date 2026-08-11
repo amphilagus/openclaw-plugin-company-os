@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { addShanghaiWorkMinutes, CompanyOsStore } from "../src/store.js";
 import { resolveConfig } from "../src/types.js";
@@ -35,6 +35,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   store.close();
   rmSync(directory, { recursive: true, force: true });
 });
@@ -126,7 +127,11 @@ describe("schema v15 staged task flows", () => {
   });
 
   it("keeps a required task meeting in FIFO and fulfills it only when the Boss-participating meeting atomically creates a staged flow", () => {
-    const root = store.createRootTask({ ...task("需要任务会", "cto"), requireTaskMeeting: true });
+    const root = store.createRootTask({
+      ...task("需要任务会", "cto"),
+      requireTaskMeeting: true,
+      taskMeetingBossParticipates: true,
+    });
     expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_agent_dispatches WHERE task_id = ?").get(root.id)).toMatchObject({ count: 0 });
     const originalSequence = (store.db.prepare("SELECT queue_seq FROM task_prompt_pool_items WHERE task_id = ?").get(root.id) as { queue_seq: number }).queue_seq;
     expect(() => store.createTaskFlow("cto", { parentId: root.id, stages: [{ name: "绕过", objective: "不允许", tasks: [task("A", "eng-a")] }] }))
@@ -141,22 +146,22 @@ describe("schema v15 staged task flows", () => {
     expect((store.db.prepare("SELECT queue_seq FROM task_prompt_pool_items WHERE task_id = ?").get(root.id) as { queue_seq: number }).queue_seq).toBe(originalSequence);
 
     expect(() => store.requestMeeting("cto", {
-      type: "task", title: "不完整会议", agenda: "拆解", parentTaskId: root.id,
-      participants: [{ agentId: "eng-a", role: "worker" }], bossParticipates: true,
-    })).toThrow(/every active direct report/);
+      type: "task", title: "没有执行者的会议", agenda: "拆解", parentTaskId: root.id,
+      participants: [{ agentId: "eng-a", role: "advisor" }], bossParticipates: true,
+    })).toThrow(/at least one active direct report as worker/);
     const meeting = store.requestMeeting("cto", {
       type: "task", title: "正式任务拆解会", agenda: "形成阶段流", parentTaskId: root.id,
-      participants: [{ agentId: "eng-a", role: "worker" }, { agentId: "eng-b", role: "worker" }], bossParticipates: true,
+      participants: [{ agentId: "eng-a", role: "worker" }], bossParticipates: true,
     }).meeting;
     expect(store.readTask("boss", root.id, false).taskMeetingRequirement).toMatchObject({ status: "active", meetingId: meeting.id });
     expect(() => store.requestMeeting("cto", {
       type: "task", title: "重复会议", agenda: "重复", parentTaskId: root.id,
-      participants: [{ agentId: "eng-a", role: "worker" }, { agentId: "eng-b", role: "worker" }], bossParticipates: true,
+      participants: [{ agentId: "eng-a", role: "worker" }], bossParticipates: true,
     })).toThrow(/already open/);
 
     store.startMeetingByBoss(meeting.id);
     store.setMeetingTaskDrafts("cto", meeting.id, [
-      { name: "阶段一", objective: "并行实现", tasks: [task("A", "eng-a"), task("B", "eng-b")] },
+      { name: "阶段一", objective: "实现", tasks: [task("A", "eng-a")] },
       { name: "阶段二", objective: "验证", tasks: [task("C", "eng-a")] },
     ]);
     store.endMeeting("cto", meeting.id, "形成两阶段任务流");
@@ -170,7 +175,11 @@ describe("schema v15 staged task flows", () => {
   });
 
   it("restores an unfulfilled meeting requirement after Boss rejects the meeting", () => {
-    const root = store.createRootTask({ ...task("重开任务会", "cto"), requireTaskMeeting: true });
+    const root = store.createRootTask({
+      ...task("重开任务会", "cto"),
+      requireTaskMeeting: true,
+      taskMeetingBossParticipates: true,
+    });
     const meeting = store.requestMeeting("cto", {
       type: "task", title: "准备不足的任务会", agenda: "拆解", parentTaskId: root.id,
       participants: [{ agentId: "eng-a", role: "worker" }, { agentId: "eng-b", role: "worker" }], bossParticipates: true,
@@ -181,6 +190,48 @@ describe("schema v15 staged task flows", () => {
     const prompt = store.createTaskPromptDispatch(tick.id, "cto", false);
     expect(prompt.prompt).toContain("实际调用 company_meeting_request");
     expect(prompt.prompt).not.toContain("不要重复创建会议");
+  });
+
+  it("fulfills a required task meeting without Boss when the root registry selects that policy", () => {
+    const root = store.createRootTask({
+      ...task("无需 Boss 参加的任务会", "cto"),
+      requireTaskMeeting: true,
+      taskMeetingBossParticipates: false,
+    });
+    expect(store.readTask("boss", root.id, false).taskMeetingRequirement).toMatchObject({
+      status: "required",
+      bossParticipates: false,
+    });
+    const input = {
+      type: "task" as const,
+      title: "负责人自主拆解会",
+      agenda: "生成阶段任务流",
+      parentTaskId: root.id,
+      participants: [
+        { agentId: "eng-a", role: "worker" as const },
+        { agentId: "eng-b", role: "worker" as const },
+      ],
+    };
+    expect(() => store.requestMeeting("cto", { ...input, bossParticipates: true }))
+      .toThrow(/must not include Boss/);
+
+    const meeting = store.requestMeeting("cto", { ...input, bossParticipates: false }).meeting;
+    expect(meeting).toMatchObject({ status: "active", bossParticipates: false });
+    store.setMeetingTaskDrafts("cto", meeting.id, [{
+      name: "执行阶段",
+      objective: "并行交付",
+      tasks: [task("A", "eng-a"), task("B", "eng-b")],
+    }]);
+    store.endMeeting("cto", meeting.id, "负责人完成拆解");
+    const completed = store.finalizeDueAutomaticMeetingEnd(Date.now() + 120_000);
+
+    expect(completed?.meeting).toMatchObject({ status: "completed", bossParticipates: false });
+    expect(completed?.createdTasks).toHaveLength(2);
+    expect(store.readTask("boss", root.id, false).taskMeetingRequirement).toMatchObject({
+      status: "fulfilled",
+      meetingId: meeting.id,
+      bossParticipates: false,
+    });
   });
 
   it("appends or replaces only waiting stages, keeps retired history, and supports a nested child flow", () => {
@@ -247,15 +298,67 @@ describe("schema v15 staged task flows", () => {
 });
 
 describe("personal task prompt countdowns", () => {
+  it("lets Boss tune the company-wide minutes-per-level coefficient without overriding personal settings", () => {
+    store.createRootTask({ ...task("全局节奏任务", "cto") });
+    const start = Date.parse("2026-08-08T02:00:00.000Z");
+
+    expect(store.setTaskPromptMinutesPerLevel(8, start)).toEqual({
+      minutesPerLevel: 8,
+      minutesPerLevelSource: "boss_override",
+    });
+    expect(store.taskPromptPoolSummary(start)).toMatchObject({
+      minutesPerLevel: 8,
+      minutesPerLevelSource: "boss_override",
+      queues: expect.arrayContaining([
+        expect.objectContaining({ memberId: "cto", defaultIntervalMinutes: 8, intervalMinutes: 8, nextDueAt: "2026-08-08T02:08:00.000Z" }),
+        expect.objectContaining({ memberId: "eng-a", defaultIntervalMinutes: 16, intervalMinutes: 16 }),
+      ]),
+    });
+
+    store.setTaskPromptInterval("cto", 13, start);
+    store.setTaskPromptMinutesPerLevel(6, start + 60_000);
+    expect(store.taskPromptPoolSummary(start + 60_000).queues.find((queue) => queue.memberId === "cto"))
+      .toMatchObject({ defaultIntervalMinutes: 6, intervalMinutes: 13, intervalOverrideMinutes: 13, nextDueAt: "2026-08-08T02:13:00.000Z" });
+    expect(store.taskPromptPoolSummary(start + 60_000).queues.find((queue) => queue.memberId === "eng-a"))
+      .toMatchObject({ defaultIntervalMinutes: 12, intervalMinutes: 12 });
+    expect(store.setTaskPromptMinutesPerLevel(null, start + 120_000)).toEqual({
+      minutesPerLevel: 5,
+      minutesPerLevelSource: "system_default",
+    });
+  });
+
+  it("pauses the whole rolling pool without consuming queue position and resumes from the preserved remainder", () => {
+    const root = store.createRootTask({ ...task("额度暂停任务", "cto") });
+    const start = Date.parse("2026-08-08T02:00:00.000Z");
+    store.setTaskPromptInterval("cto", 10, start);
+
+    const pausedAt = start + 3 * 60_000;
+    expect(store.setTaskPromptPaused(true, pausedAt)).toMatchObject({ paused: true, pausedAt: "2026-08-08T02:03:00.000Z" });
+    const pausedSummary = store.taskPromptPoolSummary(start + 30 * 60_000);
+    expect(pausedSummary).toMatchObject({ paused: true, nextDueAt: null });
+    expect(pausedSummary.queues.find((queue) => queue.memberId === "cto")).toMatchObject({
+      nextDueAt: null,
+      remainingWorkMinutes: 7,
+      head: { taskId: root.id },
+    });
+    expect(store.dueTaskPromptMembers(start + 30 * 60_000)).toEqual([]);
+    expect(() => store.createTaskPromptCycleDispatch("cto", false, undefined, start + 30 * 60_000)).toThrow(/paused by Boss/);
+
+    const resumedAt = Date.parse("2026-08-08T03:00:00.000Z");
+    expect(store.setTaskPromptPaused(false, resumedAt)).toMatchObject({ paused: false, pausedAt: null });
+    expect(store.taskPromptPoolSummary(resumedAt).queues.find((queue) => queue.memberId === "cto"))
+      .toMatchObject({ nextDueAt: "2026-08-08T03:07:00.000Z", head: { taskId: root.id } });
+  });
+
   it("uses level defaults, supports Boss overrides, pauses across the work-window boundary, and resets without moving a busy head", () => {
     const root = store.createRootTask({ ...task("倒计时任务", "cto") });
     const start = Date.parse("2026-08-07T09:55:00.000Z"); // 17:55 Asia/Shanghai
     const overridden = store.setTaskPromptInterval("cto", 10, start);
-    expect(overridden).toMatchObject({ level: 1, defaultIntervalMinutes: 10, intervalMinutes: 10 });
+    expect(overridden).toMatchObject({ level: 1, defaultIntervalMinutes: 5, intervalMinutes: 10 });
     expect(overridden.nextDueAt).toBe("2026-08-08T00:05:00.000Z");
     expect(addShanghaiWorkMinutes(start, 10, 8, 17)).toBe("2026-08-08T00:05:00.000Z");
     expect(store.taskPromptPoolSummary(start).queues.find((queue) => queue.memberId === "eng-a"))
-      .toMatchObject({ level: 2, defaultIntervalMinutes: 20, intervalMinutes: 20, intervalOverrideMinutes: null });
+      .toMatchObject({ level: 2, defaultIntervalMinutes: 10, intervalMinutes: 10, intervalOverrideMinutes: null });
 
     const sequence = (store.db.prepare("SELECT queue_seq FROM task_prompt_pool_items WHERE task_id = ?").get(root.id) as { queue_seq: number }).queue_seq;
     const busy = store.createTaskPromptCycleDispatch("cto", true, "main session is active", Date.parse(overridden.nextDueAt!));
@@ -269,7 +372,7 @@ describe("personal task prompt countdowns", () => {
     });
 
     const restored = store.setTaskPromptInterval("cto", null, Date.parse("2026-08-08T00:06:00.000Z"));
-    expect(restored).toMatchObject({ intervalOverrideMinutes: null, intervalMinutes: 10, nextDueAt: "2026-08-08T00:16:00.000Z" });
+    expect(restored).toMatchObject({ intervalOverrideMinutes: null, intervalMinutes: 5, nextDueAt: "2026-08-08T00:11:00.000Z" });
 
     const workHours = store.setTaskPromptWorkHours(9, 16, Date.parse("2026-08-08T00:06:00.000Z"));
     expect(workHours).toEqual({ startHour: 9, endHour: 16, workHoursSource: "boss_override" });
@@ -277,7 +380,7 @@ describe("personal task prompt countdowns", () => {
       startHour: 9,
       endHour: 16,
       workHoursSource: "boss_override",
-      queues: expect.arrayContaining([expect.objectContaining({ memberId: "cto", intervalMinutes: 10, nextDueAt: "2026-08-08T01:10:00.000Z" })]),
+      queues: expect.arrayContaining([expect.objectContaining({ memberId: "cto", intervalMinutes: 5, nextDueAt: "2026-08-08T01:05:00.000Z" })]),
     });
     store.close();
     store = new CompanyOsStore({
@@ -302,5 +405,39 @@ describe("personal task prompt countdowns", () => {
       lastDispatch: { status: "skipped_offline", scheduledAt: dueAt },
     });
     expect(store.db.prepare("SELECT COUNT(*) AS count FROM task_prompt_ticks").get()).toMatchObject({ count: 0 });
+  });
+
+  it("rearms persisted level defaults once while preserving Boss interval overrides", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-07T02:00:00.000Z"));
+    store.createRootTask({ ...task("默认周期迁移", "cto") });
+    store.createRootTask({ ...task("人工周期保留", "main") });
+    store.setTaskPromptInterval("main", 17);
+    store.db.prepare(`
+      UPDATE task_prompt_schedules SET next_due_at = '2030-01-01T00:00:00.000Z'
+      WHERE member_id IN ('cto', 'main')
+    `).run();
+    store.db.prepare("DELETE FROM schema_meta WHERE key = 'task_prompt_minutes_per_level'").run();
+
+    store.close();
+    store = new CompanyOsStore({
+      databasePath: path.join(directory, "company-os.sqlite"),
+      allowedAgentIds: ["main", "cto", "eng-a", "eng-b", "dev-a"],
+      config: resolveConfig({ bossEmailNotifications: { enabled: false } }),
+    });
+
+    expect(store.db.prepare("SELECT value FROM schema_meta WHERE key = 'task_prompt_minutes_per_level'").get())
+      .toMatchObject({ value: "5" });
+    expect(store.taskPromptPoolSummary().queues.find((queue) => queue.memberId === "cto")).toMatchObject({
+      defaultIntervalMinutes: 5,
+      intervalMinutes: 5,
+      nextDueAt: "2026-08-07T02:05:00.000Z",
+    });
+    expect(store.taskPromptPoolSummary().queues.find((queue) => queue.memberId === "main")).toMatchObject({
+      defaultIntervalMinutes: 5,
+      intervalOverrideMinutes: 17,
+      intervalMinutes: 17,
+      nextDueAt: "2030-01-01T00:00:00.000Z",
+    });
   });
 });

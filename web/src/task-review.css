@@ -61,7 +61,8 @@
 .task-management-form p { color: var(--muted); font-size: 10px; line-height: 1.55; }
 .task-management-error { padding: 8px 10px; border-radius: 7px; background: #fae9e7; color: var(--red); font-size: 10px; line-height: 1.5; }
 
-.tone-aborted { background: #f6dfdc; color: #8f2e27; }
+.tone-aborted,
+.tone-failed { background: #f6dfdc; color: #8f2e27; }
 .new-root.has-abort-draft { border-color: #dca49f; box-shadow: 0 0 0 3px #f8e9e7; }
 .task-management-form.is-abort { border-color: #e2aaa6; background: #fff8f7; }
 .task-aborted-summary { display: grid; gap: 5px; margin-top: 18px; padding: 12px; border: 1px solid #e2aaa6; border-radius: 9px; background: #fff4f3; color: var(--red); font-size: 12px; }

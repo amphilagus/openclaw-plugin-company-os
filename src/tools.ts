@@ -18,6 +18,8 @@ export const COMPANY_TOOL_NAMES = [
   "company_meeting_speak",
   "company_meeting_delegate",
   "company_meeting_set_task_drafts",
+  "company_meeting_yield_to_boss",
+  "company_meeting_submit_summary",
   "company_meeting_end",
   "company_meeting_cancel",
   "company_task_list",
@@ -60,18 +62,31 @@ const TaskFlowStage = Type.Object({
   objective: Id,
   tasks: Type.Array(TaskDraft, { minItems: 1 }),
 }, { additionalProperties: false });
-const Evidence = Type.Object({
-  type: Type.Union([Type.Literal("proof"), Type.Literal("artifact")]),
-  label: Type.String({ minLength: 1 }),
-  note: Type.Optional(Type.String({ minLength: 1 })),
-  command: Type.Optional(Type.String({ minLength: 1 })),
-  url: Type.Optional(Type.String({ minLength: 1 })),
-  path: Type.Optional(Type.String({ minLength: 1 })),
-}, { additionalProperties: false });
+const Evidence = Type.Union([
+  Type.Object({
+    type: Type.Literal("proof"),
+    label: Type.String({ minLength: 1 }),
+    note: Type.Optional(Type.String({ minLength: 1 })),
+    command: Type.Optional(Type.String({ minLength: 1 })),
+    url: Type.Optional(Type.String({ minLength: 1 })),
+  }, { additionalProperties: false }),
+  Type.Object({
+    type: Type.Literal("artifact"),
+    label: Type.String({ minLength: 1 }),
+    path: Type.String({ minLength: 1 }),
+    note: Type.Optional(Type.String({ minLength: 1 })),
+  }, { additionalProperties: false }),
+]);
 const GitLocation = Type.Object({
   remoteUrl: Type.String({ minLength: 1 }),
   branch: Type.String({ minLength: 1 }),
   commit: Type.String({ pattern: "^[0-9A-Fa-f]{40}$" }),
+}, { additionalProperties: false });
+const ReviewHandoff = Type.Object({
+  functionalVerification: Type.Object({
+    workingDirectory: Id,
+    command: Id,
+  }, { additionalProperties: false }),
 }, { additionalProperties: false });
 const ReviewReport = Type.Object({
   checks: Type.Array(Type.Object({
@@ -122,14 +137,14 @@ export function createCompanyOsTools(options: {
       supersedesNoticeId: Type.Optional(Id),
     }, { additionalProperties: false }), async (p) => store.publishNotice(actorId(), p as any)),
 
-    tool("company_meeting_request", "申请会议", "申请任务会议或普通讨论会；bossParticipates=true 时会议进入会议室后必须等待 Boss 从 WebUI 开始和批准结束。", Type.Object({
+    tool("company_meeting_request", "申请会议", "申请任务会议或普通讨论会；bossParticipates=true 时会议进入会议室后必须等待 Boss 从 WebUI 开始，且只有 Boss 可以结束。", Type.Object({
       type: Type.Union([Type.Literal("task"), Type.Literal("discussion")]),
       title: Id,
       agenda: Id,
       parentTaskId: Type.Optional(Id),
       participants: Type.Optional(Type.Array(Participant)),
       bossParticipates: Type.Optional(Type.Boolean()),
-    }, { additionalProperties: false }), async (p) => {
+    }, { additionalProperties: false }), async (p, toolCallId) => {
       const result = store.requestMeeting(actorId(), p as any);
       await service.dispatchAdvance(result.advance);
       return result.meeting;
@@ -172,20 +187,35 @@ export function createCompanyOsTools(options: {
     }),
     tool("company_meeting_set_task_drafts", "会议任务流草案", "为当前任务会议整体替换分阶段任务流草案；阶段内并行、阶段间顺序执行，每个 worker 结束前必须至少得到一项。", Type.Object({
       stages: Type.Array(TaskFlowStage, { minItems: 1 }),
-    }, { additionalProperties: false }), async (p) => {
+    }, { additionalProperties: false }), async (p, toolCallId) => {
       const actor = actorId();
       const meetingId = store.activeMeetingId(actor);
-      const meeting = store.setMeetingTaskDrafts(actor, meetingId, p.stages);
+      const meeting = store.setMeetingTaskDrafts(actor, meetingId, p.stages, meetingToolSession(options.toolContext, toolCallId));
       store.acknowledgeHostContext(meetingId, actor);
       return meeting;
     }),
-    tool("company_meeting_end", "申请结束会议", "申请结束当前活动会议；未邀请 Boss 时倒计时自动结束，Boss 直接参会时由 Boss 在 WebUI 决定。", Type.Object({
+    terminatingTool("company_meeting_yield_to_boss", "让渡给 Boss", "Boss 参会且主持人没有更多内容需要推进时，将会议稳定交给 Boss 决策；会议不会自动结束。", Empty,
+      async (_p, toolCallId) => {
+        const actor = actorId();
+        const meetingId = store.activeMeetingId(actor);
+        store.yieldMeetingToBoss(actor, meetingId, meetingToolSession(options.toolContext, toolCallId));
+        return { accepted: true, receipt: "控制权已交给 Boss，会议保持等待" };
+      }),
+    terminatingTool("company_meeting_submit_summary", "提交主持人总结", "仅在 Boss 要求总结时提交一版主持人总结；提交后控制权回到 Boss，但会议不会结束。", Type.Object({
       summary: Id,
-      publishNotice: Type.Optional(Type.Boolean()),
-    }, { additionalProperties: false }), async (p) => {
+    }, { additionalProperties: false }), async (p, toolCallId) => {
       const actor = actorId();
       const meetingId = store.activeMeetingId(actor);
-      const result = store.endMeeting(actor, meetingId, p.summary, Boolean(p.publishNotice));
+      store.submitMeetingSummary(actor, meetingId, p.summary, meetingToolSession(options.toolContext, toolCallId));
+      return { accepted: true, receipt: "主持人总结已提交，会议等待 Boss 决策" };
+    }),
+    tool("company_meeting_end", "结束普通会议", "仅用于 Boss 未参会的活动会议；Boss 直接参会时只有 Boss WebUI 可以结束，主持人不能申请。", Type.Object({
+      summary: Id,
+      publishNotice: Type.Optional(Type.Boolean()),
+    }, { additionalProperties: false }), async (p, toolCallId) => {
+      const actor = actorId();
+      const meetingId = store.activeMeetingId(actor);
+      const result = store.endMeeting(actor, meetingId, p.summary, Boolean(p.publishNotice), meetingToolSession(options.toolContext, toolCallId));
       store.acknowledgeHostContext(meetingId, actor);
       await service.dispatchAdvance(result.advance);
       return result;
@@ -231,12 +261,13 @@ export function createCompanyOsTools(options: {
     tool("company_task_unblock", "解除阻塞", "负责人或派发者解除阻塞并回到 in_progress。", Type.Object({
       taskId: Id, reason: Reason,
     }, { additionalProperties: false }), async (p) => service.unblockTask(actorId(), p.taskId, p.reason)),
-    tool("company_task_submit", "提交验收", "负责人完成本人可执行交付后，提交摘要、至少一项 proof/artifact 和已推送且通过远端校验的 Git 分支定位；所有直接子任务必须先终结。Boss/派发者亲测等验收人专属动作留在 review 阶段，不要求提交前完成。", Type.Object({
+    tool("company_task_submit", "提交验收", "负责人完成本人可执行交付后，提交摘要、至少一项 proof/artifact 和已推送且通过远端校验的 Git 分支定位。每个 artifact.path 必须指向本人 workspace 内的真实文件，系统会自动冻结并随根任务 Boss 邮件发送，或投递到子任务派发者 workspace；相对路径按 workspace 解析，例如 projects/<repo>/docs/report.md。最多 5 个文件、合计 15 MB，更多文件或目录请先打包。可选 reviewHandoff 仅用于生成一行功能验收命令。不得仅在摘要中声称已附材料。", Type.Object({
       taskId: Id,
       summary: Id,
       evidence: Type.Array(Evidence, { minItems: 1 }),
       gitLocation: GitLocation,
-    }, { additionalProperties: false }), async (p) => service.submitTask(actorId(), p.taskId, p.summary, p.evidence, p.gitLocation)),
+      reviewHandoff: Type.Optional(ReviewHandoff),
+    }, { additionalProperties: false }), async (p) => service.submitTask(actorId(), p.taskId, p.summary, p.evidence, p.gitLocation, p.reviewHandoff)),
     tool("company_task_review", "任务验收", "派发者读取当前提交后逐项核验证据，并用结构化报告批准或驳回任务。", Type.Object({
       taskId: Id,
       decision: Type.Union([Type.Literal("accept"), Type.Literal("reject")]),
@@ -261,18 +292,18 @@ export function createCompanyOsTools(options: {
   return tools;
 }
 
-function tool(name: ToolName, label: string, description: string, parameters: TSchema, execute: (params: Params) => Promise<unknown> | unknown): AnyAgentTool {
+function tool(name: ToolName, label: string, description: string, parameters: TSchema, execute: (params: Params, toolCallId: string) => Promise<unknown> | unknown): AnyAgentTool {
   return {
     name,
     label,
     description,
     parameters,
-    execute: async (_toolCallId: string, rawParams: unknown) => jsonResult(await execute((rawParams ?? {}) as Params)),
+    execute: async (toolCallId: string, rawParams: unknown) => jsonResult(await execute((rawParams ?? {}) as Params, toolCallId)),
   };
 }
 
 function terminatingTool(
-  name: "company_meeting_speak" | "company_meeting_delegate",
+  name: "company_meeting_speak" | "company_meeting_delegate" | "company_meeting_yield_to_boss" | "company_meeting_submit_summary",
   label: string,
   description: string,
   parameters: TSchema,
@@ -301,7 +332,7 @@ function meetingToolSession(context: OpenClawPluginToolContext, toolCallId: stri
   const agentId = requireAgentId(context);
   const sessionKey = context.sessionKey?.trim();
   const sessionId = context.sessionId?.trim();
-  if (!sessionKey || !sessionId) throw new Error("meeting tools require a trusted OpenClaw main-session identity");
+  if (!sessionKey || !sessionId) throw new Error("meeting write tools require a trusted OpenClaw session identity");
   return { agentId, sessionKey, sessionId, toolCallId };
 }
 

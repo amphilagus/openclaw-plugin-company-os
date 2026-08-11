@@ -50,6 +50,7 @@ describe("meeting history UI", () => {
       ...summary,
       participants: [{ agentId: "engineer", role: "worker", name: "高级工程师", title: "工程师" }],
       messages: [
+        { id: "message-system", sequence: 1, authorKind: "system", authorId: null, targetId: null, body: "全员已到齐。", createdAt: summary.startedAt! },
         { id: "message-0", sequence: 1, authorKind: "boss", authorId: "boss", targetId: null, body: "现在开始会议。", createdAt: summary.startedAt! },
         { id: "message-1", sequence: 2, authorKind: "member", authorId: "engineer", targetId: null, body: "建议优先完成任务树。", createdAt: summary.startedAt! },
       ],
@@ -65,6 +66,8 @@ describe("meeting history UI", () => {
     expect(html).toContain("高级工程师");
     expect(html).toContain("实现任务树");
     expect(html).toContain("Boss 直接参会");
+    expect(html).toContain("aria-label=\"Company OS 系统\"");
+    expect(html).not.toContain("system-dot");
     expect(html).toContain("data:image/png;base64,Ym9zcw==");
     expect(html).toContain("data:image/png;base64,aW1hZ2U=");
   });

@@ -43,6 +43,20 @@ describe("Company OS Gateway bridge", () => {
     expect(respond).toHaveBeenCalledWith(true, identity);
   });
 
+  it("returns root-task image content only through the authenticated attachment endpoint", async () => {
+    const attachment = { id: "image-1", taskId: "task-1", dataUrl: "data:image/png;base64,iVBORw0KGgo=" };
+    const readTaskImageAttachment = vi.fn(() => attachment);
+    const handler = createCompanyOsGatewayHandler({
+      getService: () => ({ store: { readTaskImageAttachment } }) as any,
+    });
+    const respond = vi.fn();
+
+    await handler({ params: { method: "GET", path: "/tasks/task-1/attachments/image-1" }, respond } as any);
+
+    expect(readTaskImageAttachment).toHaveBeenCalledWith("boss", "task-1", "image-1");
+    expect(respond).toHaveBeenCalledWith(true, attachment);
+  });
+
   it("routes Boss start, meeting rejection, and final end approval through the authenticated API", async () => {
     const startAdvance = { schedule: { agentId: "cto" } };
     const rejection = { meeting: { status: "canceled" }, advance: { activatedMeetingId: "next-after-rejection" } };
@@ -66,6 +80,30 @@ describe("Company OS Gateway bridge", () => {
     expect(dispatchAdvance).toHaveBeenNthCalledWith(1, startAdvance);
     expect(dispatchAdvance).toHaveBeenNthCalledWith(2, rejection.advance);
     expect(dispatchAdvance).toHaveBeenNthCalledWith(3, completion.advance);
+  });
+
+  it("routes dedicated-entry retry, host summary request, and Boss direct end", async () => {
+    const summaryAdvance = { hostDispatchId: "host-summary-1" };
+    const completion = { meeting: { status: "completed", summary: "Boss 最终总结" }, advance: {} };
+    const store = {
+      retryMeetingEntry: vi.fn(() => ({ id: "meeting-1", entryState: "notifying" })),
+      requestMeetingSummaryByBoss: vi.fn(() => summaryAdvance),
+      endMeetingByBoss: vi.fn(() => completion),
+      meetingView: vi.fn(() => ({ id: "meeting-1", controlState: "host_summary" })),
+    };
+    const service = { store, kickMeetingEntryRetry: vi.fn(), dispatchAdvance: vi.fn(async () => undefined) } as any;
+
+    const retried = await executeBossApi(service, { method: "POST", path: "/meetings/meeting-1/entry/retry", body: {} });
+    const summary = await executeBossApi(service, { method: "POST", path: "/meetings/meeting-1/request-summary", body: {} });
+    const ended = await executeBossApi(service, { method: "POST", path: "/meetings/meeting-1/end", body: { summary: "Boss 最终总结", publishNotice: true } });
+
+    expect(retried.data).toMatchObject({ entryState: "notifying" });
+    expect(summary.data).toMatchObject({ controlState: "host_summary" });
+    expect(ended.data).toBe(completion);
+    expect(service.kickMeetingEntryRetry).toHaveBeenCalledOnce();
+    expect(store.endMeetingByBoss).toHaveBeenCalledWith("meeting-1", "Boss 最终总结", true);
+    expect(service.dispatchAdvance).toHaveBeenNthCalledWith(1, summaryAdvance);
+    expect(service.dispatchAdvance).toHaveBeenNthCalledWith(2, completion.advance);
   });
 
   it("routes Boss task reminders through the persistent dispatcher", async () => {
@@ -94,5 +132,19 @@ describe("Company OS Gateway bridge", () => {
 
     expect(result).toEqual({ status: 200, data: task });
     expect(reviewTask).toHaveBeenCalledWith("boss", "task-1", "accept", "验收通过");
+  });
+
+  it("routes the Boss root-task failure decision through the same review endpoint", async () => {
+    const task = { id: "task-1", status: "failed", failedReason: "反复整改仍不合格" };
+    const reviewTask = vi.fn(() => task);
+
+    const result = await executeBossApi({ store: {}, reviewTask } as any, {
+      method: "POST",
+      path: "/tasks/task-1/review",
+      body: { decision: "fail", feedback: "反复整改仍不合格" },
+    });
+
+    expect(result).toEqual({ status: 200, data: task });
+    expect(reviewTask).toHaveBeenCalledWith("boss", "task-1", "fail", "反复整改仍不合格");
   });
 });

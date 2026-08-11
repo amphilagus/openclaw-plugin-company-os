@@ -71,6 +71,28 @@ describe("Boss task correction API", () => {
     expect(setTaskPromptWorkHours).toHaveBeenNthCalledWith(2, null, null);
   });
 
+  it("routes the company-wide countdown coefficient and pause switch", async () => {
+    const setTaskPromptMinutesPerLevel = vi.fn((minutesPerLevel: number | null) => ({ minutesPerLevel }));
+    const setTaskPromptPaused = vi.fn((paused: boolean) => ({ paused }));
+    const service = { store: {}, setTaskPromptMinutesPerLevel, setTaskPromptPaused } as any;
+
+    const coefficient = await executeBossApi(service, {
+      method: "PUT",
+      path: "/task-prompt-settings/global",
+      body: { minutesPerLevel: 8 },
+    });
+    const paused = await executeBossApi(service, {
+      method: "PUT",
+      path: "/task-prompt-settings/pause",
+      body: { paused: true },
+    });
+
+    expect(coefficient).toEqual({ status: 200, data: { minutesPerLevel: 8 } });
+    expect(paused).toEqual({ status: 200, data: { paused: true } });
+    expect(setTaskPromptMinutesPerLevel).toHaveBeenCalledWith(8);
+    expect(setTaskPromptPaused).toHaveBeenCalledWith(true);
+  });
+
   it("routes irreversible task-tree aborts through the Boss task panel", async () => {
     const service = {
       store: {},

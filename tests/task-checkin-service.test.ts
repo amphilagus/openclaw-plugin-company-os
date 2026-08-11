@@ -11,7 +11,7 @@ import { VERIFIED_GIT } from "./test-git.js";
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
 
 describe("legacy task check-in delivery and personal prompt scheduler", () => {
-  it("dispatches an empty-pool first item immediately, then uses the level-one employee's ten-minute countdown", async () => {
+  it("dispatches an empty-pool first item immediately, then uses the level-one employee's five-minute countdown", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-06T02:30:00.000Z")); // 10:30 in Shanghai
     const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-checkin-timer-"));
@@ -26,17 +26,17 @@ describe("legacy task check-in delivery and personal prompt scheduler", () => {
     try {
       await service.start();
       service.store.createRootTask({
-        title: "个人倒计时", description: "首项立即、之后十分钟", acceptanceCriteria: "完成两次投递", assigneeId: "main",
+        title: "个人倒计时", description: "首项立即、之后五分钟", acceptanceCriteria: "完成两次投递", assigneeId: "main",
       });
       expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_checkin_runs").get()).toMatchObject({ count: 0 });
       await vi.advanceTimersByTimeAsync(1);
       expect(service.store.db.prepare("SELECT scheduled_at, interval_minutes FROM task_prompt_cycles ORDER BY created_at LIMIT 1").get())
-        .toMatchObject({ scheduled_at: "2026-08-06T02:30:00.000Z", interval_minutes: 10 });
+        .toMatchObject({ scheduled_at: "2026-08-06T02:30:00.000Z", interval_minutes: 5 });
       expect(service.store.db.prepare("SELECT next_due_at FROM task_prompt_schedules WHERE member_id = 'main'").get())
-        .toMatchObject({ next_due_at: "2026-08-06T02:40:00.000Z" });
-      await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+        .toMatchObject({ next_due_at: "2026-08-06T02:35:00.000Z" });
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
       expect(service.store.db.prepare("SELECT scheduled_at, interval_minutes FROM task_prompt_cycles ORDER BY created_at DESC LIMIT 1").get())
-        .toMatchObject({ scheduled_at: "2026-08-06T02:40:00.000Z", interval_minutes: 10 });
+        .toMatchObject({ scheduled_at: "2026-08-06T02:35:00.000Z", interval_minutes: 5 });
       expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_prompt_cycles").get()).toMatchObject({ count: 2 });
       expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_prompt_ticks").get()).toMatchObject({ count: 0 });
       expect(service.store.db.prepare("SELECT COUNT(*) AS count FROM task_checkin_runs").get()).toMatchObject({ count: 0 });

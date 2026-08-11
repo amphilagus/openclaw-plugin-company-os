@@ -96,4 +96,35 @@ describe("Boss direct meeting controls", () => {
     expect(html).not.toContain("批准并结束");
     expect(html).not.toContain("暂不结束");
   });
+
+  it("shows the three fixed Boss decisions without exposing legacy end approval", () => {
+    const html = renderToStaticMarkup(<BossMeetingGate
+      meeting={{
+        ...meeting,
+        sessionMode: "dedicated",
+        entryState: "ready",
+        entryStatus: { state: "ready", total: 2, notified: 2, ready: 2, waitingMembers: [], nextRetryAt: null },
+        controlState: "waiting_boss",
+        waitingOnBossSince: "2026-08-05T09:00:00.000Z",
+        latestHostSummary: "主持人总结第一版",
+        latestHostSummaryAt: "2026-08-05T09:00:00.000Z",
+        bossEndBlockedReason: null,
+        bossStartedAt: "2026-08-05T08:05:00.000Z",
+        awaitingBossStart: false,
+        memberSessions: [],
+      }}
+      busy={false}
+      start={vi.fn()}
+      rejectMeeting={vi.fn()}
+      speak={vi.fn()}
+      requestSummary={vi.fn()}
+      endMeeting={vi.fn()}
+    />);
+
+    expect(html).toContain("1</b> 我要发言");
+    expect(html).toContain("2</b> 请主持人总结");
+    expect(html).toContain("3</b> 结束会议");
+    expect(html).toContain("主持人总结第一版");
+    expect(html).not.toContain("批准并结束");
+  });
 });

@@ -9,34 +9,72 @@ const members = [
   { id: "boss", kind: "boss", name: "Boss", title: "CEO", managerId: null, level: 0, active: true },
   { id: "main", kind: "agent", name: "架构师", title: "首席架构师", managerId: "boss", level: 1, active: true },
   { id: "cto", kind: "agent", name: "CTO", title: "首席技术官", managerId: "boss", level: 1, active: true },
+  { id: "lin-zhiheng", kind: "agent", name: "林知衡", title: "项目负责人", managerId: "boss", level: 1, active: true },
   { id: "eng-a", kind: "agent", name: "高工 A", title: "高级工程师", managerId: "cto", level: 2, active: true },
   { id: "eng-b", kind: "agent", name: "高工 B", title: "高级工程师", managerId: "cto", level: 2, active: true },
 ];
 const tasks = [
-  task("root-001", null, "交付 Company OS v1", "boss", "cto", "in_progress", ["child-001", "child-002"]),
+  task("root-001", null, "交付 Company OS v1", "boss", "cto", "in_progress", ["child-001", "child-002", "child-003"]),
   task("root-review", null, "等待 Boss 验收的根任务", "boss", "main", "review", []),
-  { ...task("child-001", "root-001", "完成原生会议引擎", "cto", "eng-a", "blocked", []), blockedReason: "等待 Session 调度接口确认" },
-  task("child-002", "root-001", "完成任务树与审计", "cto", "eng-b", "review", []),
+  {
+    ...task("child-001", "root-001", "完成原生会议引擎", "cto", "eng-a", "blocked", []),
+    blockedReason: "等待 Session 调度接口确认",
+    flowStage: flowStage(0, "核心基础设施", "并行完成会议与任务两条关键链路", "active"),
+  },
+  {
+    ...task("child-002", "root-001", "完成任务树与审计", "cto", "eng-b", "closed", []),
+    flowStage: flowStage(0, "核心基础设施", "并行完成会议与任务两条关键链路", "active"),
+  },
+  {
+    ...task("child-003", "root-001", "完成端到端治理验收", "cto", "eng-a", "assigned", []),
+    availability: "waiting_stage",
+    flowStage: flowStage(1, "集成与验收", "在核心基础设施关闭后执行完整治理演练", "waiting"),
+  },
 ];
-const activeMeeting = { id: "meeting-001", type: "task", status: "active", title: "Company OS 战略拆解会", agenda: "确定首版交付边界、负责人和验收标准", hostId: "cto", requestedBy: "cto", parentTaskId: "root-001", summary: null, bossParticipates: true, bossStartedAt: null, awaitingBossStart: true, endRequestedAt: null, endRequestedSummary: null, endRequestedPublishNotice: false, queuePosition: 0, participantCount: 3, currentTurnId: null, createdAt: now, startedAt: now, endedAt: null, canceledReason: null };
+const activeMeeting = { id: "meeting-001", type: "task", status: "active", title: "卡路里系统升级改造 - 任务拆解会", agenda: "以 calorie-recognition-research.md 调研报告为参考，对卡路里系统升级改造，验收标准为能正常使用、精确识别食物种类和分量。本次会议产出分阶段任务流，明确各阶段任务、负责人、验收标准。", hostId: "lin-zhiheng", requestedBy: "lin-zhiheng", parentTaskId: "12231f19-4b9a-4cf2-8c5c-113af60df0a7", summary: null, bossParticipates: true, bossStartedAt: null, awaitingBossStart: true, endRequestedAt: null, endRequestedSummary: null, endRequestedPublishNotice: false, queuePosition: 0, participantCount: 3, currentTurnId: null, createdAt: now, startedAt: now, endedAt: null, canceledReason: null };
 const meeting = {
   ...activeMeeting,
   participants: [{ agentId: "eng-a", role: "worker", name: "高工 A", title: "高级工程师" }, { agentId: "eng-b", role: "worker", name: "高工 B", title: "高级工程师" }, { agentId: "main", role: "advisor", name: "架构师", title: "首席架构师" }],
   messages: [
     { id: "m1", sequence: 1, authorKind: "system", authorId: null, targetId: null, body: "会议已进入会议室，正在等待 Boss 点击“开始会议”。", createdAt: now },
-    { id: "m2", sequence: 2, authorKind: "member", authorId: "cto", targetId: "eng-a", body: "请说明会议引擎的主要风险。", createdAt: now },
+    { id: "m2", sequence: 2, authorKind: "member", authorId: "lin-zhiheng", targetId: "eng-a", body: "请说明会议引擎的主要风险。", createdAt: now },
     { id: "m3", sequence: 3, authorKind: "boss", authorId: "boss", targetId: "main", body: "请从整体架构一致性上做一次判断。", createdAt: now },
   ],
-  taskDrafts: [{ id: "d1", position: 0, title: "实现会议状态机", description: "队列与发言编排", acceptanceCriteria: "超时和恢复测试通过", assigneeId: "eng-a" }, { id: "d2", position: 1, title: "完成任务 API", description: "严格层级校验", acceptanceCriteria: "逐层验收演练通过", assigneeId: "eng-b" }],
+  taskDraftStages: [{
+    id: "stage-1",
+    position: 0,
+    name: "核心能力交付",
+    objective: "完成会议与任务两条关键链路",
+    tasks: [{ id: "d1", position: 0, title: "实现会议状态机", description: "队列与发言编排", acceptanceCriteria: "超时和恢复测试通过", assigneeId: "eng-a" }, { id: "d2", position: 1, title: "完成任务 API", description: "严格层级校验", acceptanceCriteria: "逐层验收演练通过", assigneeId: "eng-b" }],
+  }],
   currentTurn: null,
+  hostDispatchStatus: null,
+  closeoutDispatches: [],
 };
 const historySummary = { ...activeMeeting, id: "meeting-history-001", status: "completed", title: "Company OS 立项会", summary: "确定会议、任务和告示板三大模块。", currentTurnId: null, endedAt: now };
 const historyMeeting = { ...meeting, ...historySummary, currentTurn: null };
+const promptQueues = [
+  promptQueue("main", "架构师", 1),
+  promptQueue("cto", "CTO", 1),
+  promptQueue("lin-zhiheng", "林知衡", 1),
+  promptQueue("eng-a", "高工 A", 2),
+  promptQueue("eng-b", "高工 B", 2, true),
+];
 const snapshot = {
   organization: members,
   tasks,
   notices: [{ id: "notice-001", authorId: "main", kind: "manual", title: "Company OS 架构基线", body: "所有治理行为统一进入会议、任务和公告三个模块。\n任务关闭严格遵循自下而上原则。", sourceMeetingId: null, supersedesNoticeId: null, supersededById: null, effective: true, activeEmployeeCount: 4, readCount: 3, createdAt: now }],
   meetings: { active: activeMeeting, closing: null, queue: [{ ...activeMeeting, id: "meeting-002", type: "discussion", status: "queued", title: "前端交互评审", hostId: "eng-a", parentTaskId: null, queuePosition: 1, currentTurnId: null }], history: [historySummary] },
+  taskPromptPool: {
+    enabled: true,
+    timeZone: "Asia/Shanghai",
+    startHour: 8,
+    endHour: 17,
+    workHoursSource: "config_default",
+    nextDueAt: now,
+    totals: { employees: 1, items: 1, execution: 1, review: 0, blockedReview: 0 },
+    queues: promptQueues,
+  },
   taskHourlyCheckin: {
     enabled: true,
     timeZone: "Asia/Shanghai",
@@ -74,7 +112,7 @@ const server = createServer((req, res) => {
   if (url.pathname.includes("/api/v1/identities/")) {
     const id = decodeURIComponent(url.pathname.split("/").at(-1));
     const member = members.find((candidate) => candidate.id === id);
-    return json(res, { id, name: member?.name ?? id, title: member?.title ?? "", emoji: id === "main" ? "⚙️" : "🔧", avatarUrl: "data:image/png;base64,iVBORw0KGgo=" });
+    return json(res, { id, name: member?.name ?? id, title: member?.title ?? "", emoji: id === "main" ? "⚙️" : "🔧", avatarUrl: null });
   }
   if (url.pathname.includes("/api/v1/tasks/")) return json(res, { ...tasks.find((item) => url.pathname.endsWith(item.id)), versions: [], progress: [], submissions: [], audit: [] });
   if (url.pathname.endsWith("/api/v1/events")) {
@@ -93,7 +131,30 @@ const server = createServer((req, res) => {
 server.listen(4174, "127.0.0.1", () => console.log("Company OS fixture: http://127.0.0.1:4174/plugins/company-os-ui/meeting-room"));
 
 function task(id, parentId, title, issuerId, assigneeId, status, childIds) {
-  return { id, parentId, issuerId, assigneeId, title, description: `${title} 的具体说明`, acceptanceCriteria: "相关测试与验收证据完整", status, revision: 1, blockedReason: null, reviewFeedback: null, childIds, childCounts: { total: childIds.length, active: childIds.length, closed: 0, canceled: 0 }, risks: { blockedDescendants: id === "root-001" ? 1 : 0, staleDescendants: 0, stale: false }, createdAt: now, updatedAt: now, lastActivityAt: now };
+  return { id, parentId, issuerId, assigneeId, title, description: `${title} 的具体说明`, acceptanceCriteria: "相关测试与验收证据完整", status, revision: 1, blockedReason: null, blockedAt: null, reviewFeedback: null, childIds, childCounts: { total: childIds.length, active: childIds.length, closed: 0, canceled: 0 }, risks: { blockedDescendants: id === "root-001" ? 1 : 0, staleDescendants: 0, stale: false }, createdAt: now, updatedAt: now, lastActivityAt: now, availability: "active", flowStage: null, abortedAt: null, abortedReason: null };
+}
+
+function flowStage(position, name, objective, status) {
+  return { flowId: "preview-flow", stageId: `preview-stage-${position}`, position, name, objective, status };
+}
+
+function promptQueue(memberId, memberName, level, active = false) {
+  const item = { taskId: "root-001", parentTaskId: null, title: "识别层：识别种类+分量（重试上限1次）+回归验证", parentTitle: "卡路里系统升级改造", kind: "execution", enqueuedAt: now, lastPromptedAt: null, promptCount: 1 };
+  return {
+    memberId,
+    memberName,
+    level,
+    defaultIntervalMinutes: level * 5,
+    intervalMinutes: level * 5,
+    intervalOverrideMinutes: null,
+    intervalSource: "level_default",
+    nextDueAt: active ? now : null,
+    remainingWorkMinutes: active ? level * 5 : null,
+    count: active ? 1 : 0,
+    head: active ? item : null,
+    items: active ? [item] : [],
+    lastDispatch: active ? { status: "failed", taskId: item.taskId, kind: item.kind, scheduledAt: now, completedAt: now, lastError: "openclaw CLI failed: GatewayClientRequestError: AbortError caused by an intentionally long diagnostic message that must never stretch the queue card" } : null,
+  };
 }
 
 function json(res, value) { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(value)); }
