@@ -1,6 +1,6 @@
 # OpenClaw Company OS
 
-`company-os` 是一个原生 OpenClaw 插件，把公司治理收敛到一套共享基础设施和三种业务对象：会议、严格层级任务、公司公告。Boss 在统一 WebUI 操作，Agent 只能通过 `company_*` 工具参与。
+`company-os` 是**自研的 OpenClaw 独立插件**（针对 OpenClaw 平台用其 Plugin SDK 开发，非 OpenClaw 内置或官方插件），把公司治理收敛到一套共享基础设施和三种业务对象：会议、严格层级任务、公司公告。Boss 在统一 WebUI 操作，Agent 只能通过 `company_*` 工具参与。
 
 ## 核心约束
 
