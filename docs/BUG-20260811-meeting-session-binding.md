@@ -1,70 +1,50 @@
-# Bug 报告：gateway 重启后 meeting session 绑定失效，会议 entry 卡死
+# 更正声明 + 事件复盘：meeting session 绑定"疑似卡死"实为误判
 
-- **报告时间**：2026-08-11 19:01 CST
-- **报告人**：架构师（jia-goushi）
-- **组件**：Company OS 插件（openclaw-plugin-company-os）
-- **影响版本**：v0.7.0（含此前 v0.4+ 的既有缺陷）
-- **复现日期**：2026-08-09 首次记录；2026-08-11 复现
-- **严重度**：高（阻塞所有需要 advisor 参与的会议编排）
+> **本文件取代前一份 `BUG-20260811-meeting-session-binding.md`（那份定性错误，已作废）。**
+> 更正时间：2026-08-11 · 更正人：架构师（jia-goushi）· 复核：Boss
 
-## 症状
+## 结论（先看这个）
 
-1. **会议 entry 永远卡在 `notifying`**：入会通知已投递到成员 main（gateway.log 有 `delivered meeting entry ... to agent:x:main`），但 `meeting_member_sessions` 全部停留在 `pending`、`attempts=0`、`next_attempt_at` 卡在创建时刻，**重试循环不推进**。全员屏障永远无法满足，主持人无法开始。
-2. **会议工具报 session 不匹配**：`company_meeting_speak` / `company_meeting_delegate` 返回
-   `meeting tool session ID does not match the persisted meeting session binding`。
-3. **会议最终"伪完成"**：因主持人无法从 meeting session 推进，会议由主持人超时自动收束，summary 里 advisor 发言为 0（实际未讨论），对外表现为"completed"。
+**v0.7 在 2026-08-11 的"会议 entry 卡死"不是真 bug。** 前一份报告的定性是**误判**，它把三件事混为一谈：
 
-## 根因
+1. 一个 **8-09 曾经存在、v0.7 已修复**的旧缺陷；
+2. 对**入会屏障（两阶段）正常行为**的误读；
+3. 一次**手工改库绕过协调器**造成的新卡死（我的操作）。
 
-gateway（或插件）重启后，`agent:<id>:meeting` 固定 session 被**重建、sessionId 轮转**，但 Company OS 持久化的 `meeting_member_sessions.session_id` 仍指向**旧 sessionId**（或 entry 阶段绑定用的是旧 id）。`ensureSession` 按 `session_key` 找到的是新 session，与会话级协调器持有的持久绑定不一致：
+## 逐条澄清（对应前报告的错误论断）
 
-- entry 阶段：绑定步骤发现 id 不匹配 → 失败，且失败后**重试循环未正确推进**（`next_attempt_at` 不再更新），entry 永久卡死。
-- 会议工具：当前运行 session id ≠ 持久绑定 id → 直接拒绝。
+| 前报告论断 | 事实 |
+| --- | --- |
+| 会议 `4e212c0e` 卡死在 notifying | 否。advisors 通知 18:52:57 完成，主持人通知因 main 忙碌延迟到 18:55:34，随后立即 `entry_ready`，18:57:08 正常结束 |
+| sessionId 轮转导致绑定失效 | 否。sessionId 确实轮转，但系统在 18:55:43 自动执行 `meeting.session_binding_refreshed`，把 `03642c43…` 刷新为 `c78fccaa…`。这是**当前代码的设计**（`src/store.ts:9351` 自动刷新绑定），并有回归测试（`tests/meeting-governance-v17.test.ts:100`） |
+| advisor 发言为 0 是绑定问题 | 否。真实原因是审计记录里的 `Token Plan 用量上限 2056`，与 session binding 无关 |
+| 会议 `a5a1fa5f` 观察时 session 行 pending/attempts=0 是卡死 | 否。观察时只完成 2 名 advisor 通知，主持人通知直到 19:00:46 才完成；**全员通知完成前 session 行保持 pending/attempts=0 是两阶段屏障的正常行为**（`src/store.ts:7348` 状态迁移逻辑） |
+| 手工 SQL 是"修复" | 否。**该 SQL 不安全**：只把成员行改成 `ready`，未执行 `entry_state=ready`、未创建主持人 dispatch、未写审计。`a5a1fa5f` 呈现"仍 provisioning、成员却全 ready、无 entry_ready 审计"的不一致状态，正是手工改库绕过协调器造成的卡死 |
+| 8-11 发生了"重启后普遍卡死" | 否。8-11 没有真实 gateway 重启：当前 gateway PID 自 8-09 12:45 一直运行，重启日志最后记录是 8-09 |
 
-## 证据
+## 定向测试（已通过）
 
-- `gateway.log`：`2026-08-11T18:52:57` 与 `18:58:06` 各投递两次 entry 通知成功，其后**无任何绑定/重试日志**。
-- `meeting_member_sessions`：两次会议（`4e212c0e`、`a5a1fa5f`）成员行均 `pending`/`attempts=0`，`next_attempt_at` 定格在创建时间。
-- 8-09 任务会日志（林知衡/宪章/探微）：「`company_meeting_speak` 持续报 session ID does not match persisted binding」「gateway 重启导致 meeting session 重建、绑定 sessionId 错位，需运行侧回写 `meeting_member_sessions`」。
-- 记忆线索：`LRN-20260810-002 · company_meeting_speak session binding bug + fallback 路径`。
+2 个测试文件、10 个测试全部通过，覆盖 sessionId 轮转刷新与入会恢复。
 
-## 复现步骤
+## 更准确的定性
 
-1. 正常召开一场有多名 advisor 的讨论会（可正常入会）。
-2. 重启 gateway（强制真实重启，`openclaw gateway restart`）。
-3. 在重启后**新开**一场会议。
-4. 观察：entry 卡 `notifying`，成员 session 绑定不推进；若成员尝试 `company_meeting_speak` 报 session 不匹配。
+- **8-09 的 session binding 错误**：历史真 bug，**当前 v0.7 已修复**（自动刷新 + 回归测试）。
+- **8-11"重启后普遍卡死"**：误判，证据不成立。
+- **仍值得改进**：入会通知等待主持人 main session 时，**可观测性不足**——容易把 `running`（通知投递中）误看成 session provisioning 卡死。建议在 WebUI/状态接口区分"等待通知投递"与"session 绑定中"，并给出明确进度。
 
-## 影响范围
+## 教训（我方的）
 
-- 任何在 gateway 重启后新开的、需要成员绑定固定 meeting session 的会议。
-- 主持人自身也受影响（`company_meeting_end` 从 main 调用同样被拒，无法正常收束）。
-- 直接影响：会议编排不可用、讨论无法进行。
+1. **不要用绕过协调器的手工 SQL"修"会议状态**——协调器（store.ts 的 entry 状态机 + service 的 work loop）是唯一权威，手工改库会制造协调器无法识别的不一致状态。
+2. **诊断先看权威事实**：审计日志（`audit_events`）、协调器源码（状态迁移/绑定刷新路径）、gateway 日志——而不是只看 `meeting_member_sessions` 的瞬时 pending 就下"卡死"结论。
+3. **两阶段屏障是设计**：通知（main）→ session 绑定（meeting）是串行两段，任一未完成时 session 行 pending 是正常的。
 
-## 临时规避（已验证可行）
+## 当前第二场会议（a5a1fa5f）状态
 
-手动回写绑定到**当前** sessionId 并置 `ready`：
-
-```sql
-UPDATE meeting_member_sessions
-SET session_id='<当前 session_id>', status='ready', ready_at=strftime('%Y-%m-%dT%H:%M:%S.000Z','now')
-WHERE meeting_id='<meeting_id>' AND member_id='<member_id>';
-```
-
-- 当前 sessionId 通过 `sessions_list`（`agent:<id>:meeting`）或 `~/.openclaw/agents/<id>/sessions/*.jsonl` 最近的 meeting transcript 文件名获取。
-- 回写后 entry 可推进到 `ready`，但会议工具仍可能因运行 session 与绑定差异继续报错，稳妥做法是**回写后重开会话或重启再重开**。
-
-## 修复建议（根治）
-
-1. **entry/绑定阶段**：`ensureSession` 在找到以 `agent:<id>:meeting` 为 key 的 session 后，若发现当前 `session_id` 与持久绑定不同，应**自动回写**新 id 并记录审计，而不是失败后卡死。
-2. **重试循环**：entry 绑定失败后 `next_attempt_at` 必须按指数退避推进，不能定格在创建时刻；当前失败即永久停滞是缺陷。
-3. **会议工具**：`company_meeting_speak`/`delegate`/`end` 的 session 校验失败时，应走"回写绑定 + 重试一次"，而不是直接拒绝。
-4. **回归测试**：补一条"gateway 重启后重开会话 → 会议可正常入会并发言"的用例。
+手工 SQL 已回滚（成员行恢复为 pending/session_id NULL，可被协调器 driver 重新捞起）。协调器 entry work loop 当前空闲，需一次 kick（gateway 重启，或任一触发 `dispatchAdvance` 的会议操作）即可按正常路径完成 provisioning → `entry_ready` → host dispatch。**不会再用手工 SQL 干预。**
 
 ## 状态
 
-- [ ] 根因已定位（本报告）
-- [ ] 临时规避已验证（手动回写）
-- [ ] 修复实现
-- [ ] 回归测试
-- [ ] 上线验证
+- [x] 更正前报告（本文件）
+- [x] 回滚手工 SQL
+- [ ] 通过协调器恢复会议（待 kick）
+- [ ] 可观测性改进（建议排期）
