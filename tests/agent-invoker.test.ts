@@ -79,6 +79,43 @@ describe("OpenClaw CLI agent invoker", () => {
     expect(wait).not.toHaveBeenCalled();
   });
 
+  it("retries retryable errors (invalid_json / exit) with exponential backoff when maxErrorRetries > 0", async () => {
+    const execFile: AgentExecFile = vi.fn(async () => ({ stdout: "not-json", stderr: "" }));
+    const wait = vi.fn(async () => undefined);
+    const invoker = new OpenClawCliAgentInvoker({ execFile, wait, retryDelayMs: 5_000 });
+
+    await expect(invoker.invoke({
+      agentId: "engineer",
+      prompt: "x",
+      timeoutSeconds: 60,
+      maxInFlightRetries: 0,
+      maxErrorRetries: 2,
+    })).resolves.toMatchObject({ ok: false, code: "invalid_json", attempts: 3 });
+    expect(execFile).toHaveBeenCalledTimes(3);
+    expect(wait).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenNthCalledWith(1, 5_000, undefined);
+    expect(wait).toHaveBeenNthCalledWith(2, 10_000, undefined);
+  });
+
+  it("succeeds on an error retry and stops retrying", async () => {
+    const execFile: AgentExecFile = vi.fn(async () => {
+      const attempt = (execFile as ReturnType<typeof vi.fn>).mock.calls.length;
+      return attempt < 3
+        ? { stdout: "bad", stderr: "" }
+        : { stdout: JSON.stringify({ status: "ok", payloads: [{ text: "recovered" }] }), stderr: "" };
+    });
+    const wait = vi.fn(async () => undefined);
+    const invoker = new OpenClawCliAgentInvoker({ execFile, wait, retryDelayMs: 1_000 });
+
+    await expect(invoker.invoke({
+      agentId: "engineer",
+      prompt: "x",
+      timeoutSeconds: 60,
+      maxErrorRetries: 3,
+    })).resolves.toMatchObject({ ok: true, text: "recovered", attempts: 3 });
+    expect(execFile).toHaveBeenCalledTimes(3);
+  });
+
   it("targets an explicit custom session without enabling delivery", async () => {
     const execFile: AgentExecFile = vi.fn(async (_file, args) => {
       expect(args).toEqual(expect.arrayContaining([

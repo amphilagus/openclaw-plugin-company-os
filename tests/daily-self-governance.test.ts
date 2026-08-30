@@ -13,12 +13,14 @@ describe("daily self-governance store", () => {
       enabled: true,
       hour: 5,
       minute: 0,
+      maxErrorRetries: 2,
       timeZone: "Asia/Shanghai",
     });
     expect(resolveConfig(undefined).dailyPersonaAudit).toEqual({
       enabled: true,
       hour: 6,
       minute: 0,
+      maxErrorRetries: 2,
       timeZone: "Asia/Shanghai",
     });
     expect(resolveConfig({

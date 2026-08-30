@@ -48,11 +48,13 @@ const ConfigSchema = Type.Object({
     enabled: Type.Optional(Type.Boolean({ default: true })),
     hour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 5 })),
     minute: Type.Optional(Type.Integer({ minimum: 0, maximum: 59, default: 0 })),
+    maxErrorRetries: Type.Optional(Type.Integer({ minimum: 0, maximum: 10, default: 2 })),
   }, { additionalProperties: false })),
   dailyPersonaAudit: Type.Optional(Type.Object({
     enabled: Type.Optional(Type.Boolean({ default: true })),
     hour: Type.Optional(Type.Integer({ minimum: 0, maximum: 23, default: 6 })),
     minute: Type.Optional(Type.Integer({ minimum: 0, maximum: 59, default: 0 })),
+    maxErrorRetries: Type.Optional(Type.Integer({ minimum: 0, maximum: 10, default: 2 })),
   }, { additionalProperties: false })),
   databasePath: Type.Optional(Type.String({ minLength: 1 })),
   organizationAdminAgentId: Type.Optional(Type.String({ minLength: 1 })),

@@ -21,6 +21,7 @@ export type AgentInvocation = {
   sessionKey?: string;
   timeoutSeconds: number;
   maxInFlightRetries?: number;
+  maxErrorRetries?: number;
   signal?: AbortSignal;
 };
 
@@ -41,17 +42,20 @@ export class OpenClawCliAgentInvoker implements AgentInvoker {
   private readonly execFile: AgentExecFile;
   private readonly retryDelayMs: number;
   private readonly maxInFlightRetries: number;
+  private readonly maxErrorRetries: number;
   private readonly wait: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(options: {
     execFile?: AgentExecFile;
     retryDelayMs?: number;
     maxInFlightRetries?: number;
+    maxErrorRetries?: number;
     wait?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   } = {}) {
     this.execFile = options.execFile ?? defaultExecFile;
     this.retryDelayMs = options.retryDelayMs ?? 10_000;
     this.maxInFlightRetries = options.maxInFlightRetries ?? 3;
+    this.maxErrorRetries = options.maxErrorRetries ?? 0;
     this.wait = options.wait ?? abortableWait;
   }
 
@@ -59,18 +63,49 @@ export class OpenClawCliAgentInvoker implements AgentInvoker {
     const directory = await mkdtemp(path.join(os.tmpdir(), "company-os-agent-"));
     const promptFile = path.join(directory, "prompt.txt");
     const maxInFlightRetries = input.maxInFlightRetries ?? this.maxInFlightRetries;
+    const maxErrorRetries = input.maxErrorRetries ?? this.maxErrorRetries;
+    const retryableErrorCodes = new Set<string>([
+      "invalid_json",
+      "exit",
+      "timeout",
+      "in_flight",
+    ]);
     try {
       await writeFile(promptFile, input.prompt, { encoding: "utf8", mode: 0o600 });
-      for (let attempt = 1; attempt <= maxInFlightRetries + 1; attempt += 1) {
+      let attempt = 1;
+      let errorRetriesUsed = 0;
+      let inFlightRetriesUsed = 0;
+      while (true) {
         const result = await this.invokeOnce(input, promptFile, attempt);
-        if (result.ok || result.code !== "in_flight" || attempt > maxInFlightRetries) return result;
-        try {
-          await this.wait(this.retryDelayMs, input.signal);
-        } catch {
-          return { ok: false, code: "aborted", error: "agent invocation aborted", attempts: attempt };
+        if (result.ok) return result;
+
+        // in_flight 有独立的重试预算（短间隔，等其它会话释放）
+        if (result.code === "in_flight" && inFlightRetriesUsed < maxInFlightRetries) {
+          inFlightRetriesUsed += 1;
+          attempt += 1;
+          try {
+            await this.wait(this.retryDelayMs, input.signal);
+          } catch {
+            return { ok: false, code: "aborted", error: "agent invocation aborted", attempts: attempt - 1 };
+          }
+          continue;
         }
+
+        // 其它可重试错误走指数退避的错误重试预算
+        if (retryableErrorCodes.has(result.code) && errorRetriesUsed < maxErrorRetries) {
+          errorRetriesUsed += 1;
+          attempt += 1;
+          const backoffMs = this.retryDelayMs * 2 ** (errorRetriesUsed - 1);
+          try {
+            await this.wait(backoffMs, input.signal);
+          } catch {
+            return { ok: false, code: "aborted", error: "agent invocation aborted", attempts: attempt - 1 };
+          }
+          continue;
+        }
+
+        return result;
       }
-      return { ok: false, code: "in_flight", error: "agent session remained in flight", attempts: maxInFlightRetries + 1 };
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

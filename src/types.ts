@@ -67,11 +67,13 @@ export type CompanyOsConfig = {
     enabled?: boolean;
     hour?: number;
     minute?: number;
+    maxErrorRetries?: number;
   };
   dailyPersonaAudit?: {
     enabled?: boolean;
     hour?: number;
     minute?: number;
+    maxErrorRetries?: number;
   };
   databasePath?: string;
   organizationAdminAgentId?: string;
@@ -111,12 +113,14 @@ export type ResolvedCompanyOsConfig = {
     enabled: boolean;
     hour: number;
     minute: number;
+    maxErrorRetries: number;
     timeZone: "Asia/Shanghai";
   };
   dailyPersonaAudit: {
     enabled: boolean;
     hour: number;
     minute: number;
+    maxErrorRetries: number;
     timeZone: "Asia/Shanghai";
   };
   databasePath?: string;
@@ -705,12 +709,14 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
       enabled: dailySelfImprovement?.enabled !== false,
       hour: boundedInteger(dailySelfImprovement?.hour, 5, 0, 23),
       minute: boundedInteger(dailySelfImprovement?.minute, 0, 0, 59),
+      maxErrorRetries: clampInteger(dailySelfImprovement?.maxErrorRetries, 2, 0),
       timeZone: "Asia/Shanghai",
     },
     dailyPersonaAudit: {
       enabled: dailyPersonaAudit?.enabled !== false,
       hour: boundedInteger(dailyPersonaAudit?.hour, 6, 0, 23),
       minute: boundedInteger(dailyPersonaAudit?.minute, 0, 0, 59),
+      maxErrorRetries: clampInteger(dailyPersonaAudit?.maxErrorRetries, 2, 0),
       timeZone: "Asia/Shanghai",
     },
     ...(config?.databasePath?.trim() ? { databasePath: config.databasePath.trim() } : {}),

@@ -1395,12 +1395,16 @@ export class CompanyOsService {
   }
 
   private async deliverDailyAgentDispatch(dispatch: DailyAgentDispatch) {
+    const maxErrorRetries = dispatch.kind === "daily_self_improvement"
+      ? this.config.dailySelfImprovement.maxErrorRetries
+      : this.config.dailyPersonaAudit.maxErrorRetries;
     const result = await this.agentInvoker.invoke({
       agentId: dispatch.targetAgentId,
       sessionKey: dispatch.sessionKey,
       prompt: dispatch.prompt,
       timeoutSeconds: this.config.participantTurnTimeoutSeconds,
       maxInFlightRetries: 0,
+      maxErrorRetries,
       signal: this.lifecycleAbort.signal,
     });
     if (result.ok || (result.code === "empty_reply" && result.completed)) {
