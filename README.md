@@ -1,44 +1,56 @@
 # OpenClaw Company OS
 
-`company-os` 是**自研的 OpenClaw 独立插件**（针对 OpenClaw 平台用其 Plugin SDK 开发，非 OpenClaw 内置或官方插件），把公司治理收敛到一套共享基础设施和三种业务对象：会议、严格层级任务、公司公告。Boss 在统一 WebUI 操作，Agent 只能通过 `company_*` 工具参与。
+**人类与多智能体深度协作的研究与工程框架**
 
-## 核心约束
+> 让多智能体在人类可以理解、参与和校准的节奏中，自建研究与工程工作流。
 
-- 一个 Boss、一间会议室、单一 Gateway、单一 SQLite 数据库。
-- 任务是严格树，不是 DAG：根任务只能由 Boss 派给一级直属员工；子任务以分阶段任务流原子创建，阶段内并行、阶段间按屏障顺序激活，负责人仍只能选择自己的直属下属。
-- 任务只能自下而上关闭。负责人携 proof 提交 review，派发者验收后永久关闭。
-- 会议严格串行。任务会议结束时，子任务、会议总结、会议汇报公告、参会 Agent 的公告 read mark 和全员终局同步 outbox 在同一事务中原子提交。
-- 会议可设置 `bossParticipates=true`：进入会议室后等待 Boss 手动开始；主持人不能申请或执行结束，只能继续主持、提交总结或把控制权让渡给 Boss，最终结束权固定属于 Boss。
-- 未邀请 Boss 的会议也先提交结束申请，WebUI 显示 60 秒倒计时；到期后服务原子关会，Gateway 重启不会丢失倒计时。
-- 公告不可编辑；修正通过 `supersedesNoticeId` 发布新公告。Boss 还可在 WebUI 二次确认后审计删除公告。
-- Boss 写操作由服务端固定记录为 `actor=boss`；Agent 身份只读取可信的 `toolContext.agentId`。
-- 任务状态事件与定时工作提示彻底分离：验收结果、阻塞上下行、取消审批和终态纠错进入即时 outbox；可执行、待验收和阻塞审查事项进入每名员工自己的持久 FIFO 回转池。公告发布仍不立即唤醒 Agent。所有 Company OS session 调用共享会话级协调器。
-- 每位 Agent 预先准备一个名称为 `meeting` 的固定 session（推荐 key 为 `agent:<agentId>:meeting`）；`meeting_messages` 是共享事实源，main 只接收入会通知和散会总结。
-- 会议进入完成、取消或超时终态后，编排器向主持人及全部参会 Agent 的 main 写入可见系统总结；全员送达后释放本场会议绑定，但固定 meeting session 及 transcript 持续保留，曾占用会议室的会议随后才释放下一场。
+Company OS 面向开放性、探索性的研究与工程问题。在这类工作中，人类通常能够提出问题、约束和预期成果，但具体路线需要通过持续讨论、试验与反馈才能明确。我们希望让人类与多个具有不同职责的 AI Agent 共同经历这一过程，逐步建立适合具体问题的协作方式。
 
-## 技术结构
+项目以角色、会议、分工、验收与信息同步组织团队，让工作中的判断、成果与经验可以持续积累。人类参与目标校准和关键决策，Agent 在组织职责与任务规则内讨论方案、构建任务流并推进执行。
 
-```text
-OpenClaw Gateway
-├── CompanyOsService（同步会议编排、持久主持人/终局队列、自动关会、恢复、超时扫描、SSE）
-├── 32 个 company_* Agent 工具
-├── /plugins/company-os/api/v1/*（Gateway 鉴权，仅 API）
-├── /plugins/company-os-ui/*（无敏感数据的 WebUI 静态壳）
-├── Control UI 标签页「公司」（operator.write）
-└── company-os.sqlite
-    ├── organization + audit
-    ├── task tree + versions + proof + root-review email outbox
-    ├── notices + read marks + half-past reminder runs/dispatch outbox
-    ├── task check-in runs + batches + dispatch outbox
-    └── meeting queue + shared transcript + entry/session bindings + context/dispatch/email/closeout outbox
-```
+## 协作如何展开
 
-前端是 React + Vite，包含四个真实路由：
+| 环节 | 协作方式 |
+| --- | --- |
+| 人类定义任务 | 提出研究或工程问题，在根任务中明确目标、约束条件和验收标准。 |
+| AI 组织会议 | 主持 Agent 组织相关成员澄清问题、讨论方案、校准路线；人类可以参与并引导讨论。 |
+| AI 分配任务 | 将方案转化为分阶段的层级任务流，逐级派发；阶段内可并行，当前阶段的必需任务全部验收通过后再激活下一阶段。 |
+| AI 执行与验收 | 成员推进任务，派发者依据成果与证据验收；阻塞交由上级审查和指导，必要时继续向上反馈。 |
+| 人类最终验收 | 对照初始目标检查根任务成果，决定通过、退回修改或判定失败，保留最终决定权。 |
 
-- `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、全员入会屏障、Boss 三项决策、普通会议结束倒计时、插话、任务草案、散会同步进度、队列和历史。
-- `/plugins/company-os-ui/tasks`：任务树、风险、版本/proof/审计、Boss 催办与兜底操作和根任务创建。
-- `/plugins/company-os-ui/notices`：当前共识、历史更正、会议汇报、阅读覆盖和公告半点提醒状态。
-- `/plugins/company-os-ui/self-governance`：每日自省和人设治理的计划、队列及执行历史。
+人类在系统中以 **Boss** 身份参与，可通过统一 WebUI 查看会议记录、任务进展、验收材料与公告，并在探索过程中介入讨论和校准方向。
+
+## 匹配人类学习与决策的节奏
+
+**人类的学习与决策节奏，是这个框架的设计依据。** 人类需要时间理解进展、检查依据、学习新知识并修正判断。团队的持续推进应为这些活动留出空间，也应允许人在关键节点重新掌握节奏。
+
+Company OS 为每名 Agent 提供独立的 FIFO 任务回转池，将执行、成果验收和阻塞审查事项按需入队，投递时读取最新状态。不同 Agent 可以并行推进；某名 Agent 忙碌时，其队首事项保留，等待后续轮转。
+
+人类可以调整全公司节奏或单个 Agent 的间隔，设置包含跨午夜在内的工作时段，并暂停、恢复任务回转，以调节定时提示的调用频率与 token 消耗。这些设置作用于任务回转提示；会议、即时通知与每日自省遵循各自的调度机制。具体行为见[任务回转提示池](#任务回转提示池)。
+
+## 全局信息同步与持续积累
+
+协作需要共同的信息基础。会议结论、任务变更和公共规则通过公告同步，结合已读追踪和未读提醒，帮助成员及时获取与自己工作有关的变化。
+
+团队也需要从实践中积累经验。周期性的工作反思与独立 `self-audit` 会话，为经验沉淀、角色与规则更新提供机制：回顾近期工作，记录值得复用的经验教训，并检查角色文件与实际工作的偏差。这里的自我学习落实在可查看、可修正的经验记录、角色说明与工作规则上。我们希望这些积累能够逐步改善团队后续的判断与行动。
+
+## 预期演进
+
+长期目标是形成**面向特定问题、能够持续积累和自主推进的智能体研究与工程团队**。我们希望探索以下演进路径：
+
+1. **人类引导探索。** 人类频繁参会，校准目标、方法与判断标准，与 Agent 一起在讨论和实践中探索可行路线。
+2. **角色与技术路线逐渐明确。** 根据实际工作修正角色定位与协作接口，沉淀经验，建立可执行、可验收的阶段计划。
+3. **团队自主深入推进。** 当团队的能力与协作方式经过实践验证后，由 Agent 持续执行与逐层验收，人类逐步转向关键节点介入。
+
+人类过程干预的减少，应建立在经验积累和实际成果的验证之上。**目标设定与最终验收始终由人类掌握。**
+
+## 当前实现与探索边界
+
+Company OS 是基于 OpenClaw Plugin SDK 开发的**自研独立插件**，非 OpenClaw 内置或官方插件。当前已提供会议协作、分阶段的层级任务与验收、个人任务回转池、公告同步，以及周期性自省和人设治理等基础机制。Boss 在 WebUI 操作，Agent 通过 `company_*` 工具参与。
+
+这些机制为上述协作方式提供了基础。团队能否由此逐步形成稳定的专业分工、可复用的研究与工程方法，以及更强的自主推进能力，仍是项目持续探索与验证的方向。
+
+安装方式见[安装与开发](#安装与开发)，具体行为见[协作机制详解](#协作机制详解)，实现边界见[核心约束](#核心约束)，运行与恢复说明见 [RUNBOOK](docs/RUNBOOK.md)。
 
 ## 安装与开发
 
@@ -75,6 +87,8 @@ npm run build
 ```
 
 默认数据库位于 `~/.openclaw/plugins/company-os/company-os.sqlite`。配置样例见 [examples/openclaw.config.json5](examples/openclaw.config.json5)，运行与恢复说明见 [docs/RUNBOOK.md](docs/RUNBOOK.md)。
+
+## 协作机制详解
 
 ### Boss 直接参会
 
@@ -169,7 +183,47 @@ Company OS 默认在北京时间 05:00 建立每日经验沉淀任务、06:00 �
 
 调度记录持久化在 `daily_agent_runs` 与 `daily_agent_dispatches`。Gateway 不补建离线期间错过的每日轮次，但会恢复已经排队且从未尝试的 dispatch；已经领取过的任务不会自动重放，避免重复编辑 workspace。不同 Agent 可以并行执行，同一 Agent 的两类治理任务严格串行。可通过 `dailySelfImprovement.enabled/hour/minute` 与 `dailyPersonaAudit.enabled/hour/minute` 调整配置，时区固定为 `Asia/Shanghai`。每次日常治理调用独立使用 `dailyAgentTimeoutSeconds`，默认 1800 秒、最小 60 秒，不受会议轮次超时影响；两类任务各自支持 `maxErrorRetries`（0–10，默认 2）。人设审计读取 AGENTS、SOUL、IDENTITY、MEMORY、USER 五个文件。
 
+反思与人设修正由 Agent 在自己的 workspace 中执行，需要环境提供 `self-improving-agent`、`persona-audit` 技能及相应的记忆、会话与文件访问能力。Company OS 负责调度、下发工作要求和记录执行状态，具体的经验沉淀与文件更新由 Agent 完成。
+
 Boss 可从顶部导航进入“自省治理”页面，查看两个机制的下一轮时间、今日队列、失败原因及最近七个北京时间自然日的执行历史。页面只读，配置仍由 OpenClaw 插件配置文件管理。
+
+## 技术结构
+
+```text
+OpenClaw Gateway
+├── CompanyOsService（同步会议编排、持久主持人/终局队列、自动关会、恢复、超时扫描、SSE）
+├── 32 个 company_* Agent 工具
+├── /plugins/company-os/api/v1/*（Gateway 鉴权，仅 API）
+├── /plugins/company-os-ui/*（无敏感数据的 WebUI 静态壳）
+├── Control UI 标签页「公司」（operator.write）
+└── company-os.sqlite
+    ├── organization + audit
+    ├── task tree + versions + proof + root-review email outbox
+    ├── notices + read marks + half-past reminder runs/dispatch outbox
+    ├── task check-in runs + batches + dispatch outbox
+    └── meeting queue + shared transcript + entry/session bindings + context/dispatch/email/closeout outbox
+```
+
+前端是 React + Vite，包含四个真实路由：
+
+- `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、全员入会屏障、Boss 三项决策、普通会议结束倒计时、插话、任务草案、散会同步进度、队列和历史。
+- `/plugins/company-os-ui/tasks`：任务树、风险、版本/proof/审计、Boss 催办与兜底操作和根任务创建。
+- `/plugins/company-os-ui/notices`：当前共识、历史更正、会议汇报、阅读覆盖和公告半点提醒状态。
+- `/plugins/company-os-ui/self-governance`：每日自省和人设治理的计划、队列及执行历史。
+
+## 核心约束
+
+- 一个 Boss、一间会议室、单一 Gateway、单一 SQLite 数据库。
+- 任务是严格树，不是 DAG：根任务只能由 Boss 派给一级直属员工；子任务以分阶段任务流原子创建，阶段内并行、阶段间按屏障顺序激活，负责人仍只能选择自己的直属下属。
+- 任务只能自下而上关闭。负责人携 proof 提交 review，派发者验收通过后关闭；后续二次审查不通过时，可按权限重新打开任务并保留原验收记录。
+- 会议严格串行。任务会议结束时，子任务、会议总结、会议汇报公告、参会 Agent 的公告 read mark 和全员终局同步 outbox 在同一事务中原子提交。
+- 会议可设置 `bossParticipates=true`：进入会议室后等待 Boss 手动开始；主持人不能申请或执行结束，只能继续主持、提交总结或把控制权让渡给 Boss，最终结束权固定属于 Boss。
+- 未邀请 Boss 的会议也先提交结束申请，WebUI 显示 60 秒倒计时；到期后服务原子关会，Gateway 重启不会丢失倒计时。
+- 公告不可编辑；修正通过 `supersedesNoticeId` 发布新公告。Boss 还可在 WebUI 二次确认后审计删除公告。
+- Boss 写操作由服务端固定记录为 `actor=boss`；Agent 身份只读取可信的 `toolContext.agentId`。
+- 任务状态事件与定时工作提示彻底分离：验收结果、阻塞上下行、取消审批和终态纠错进入即时 outbox；可执行、待验收和阻塞审查事项进入每名员工自己的持久 FIFO 回转池。公告发布仍不立即唤醒 Agent。所有 Company OS session 调用共享会话级协调器。
+- 每位 Agent 预先准备一个名称为 `meeting` 的固定 session（推荐 key 为 `agent:<agentId>:meeting`）；`meeting_messages` 是共享事实源，main 只接收入会通知和散会总结。
+- 会议进入完成、取消或超时终态后，编排器向主持人及全部参会 Agent 的 main 写入可见系统总结；全员送达后释放本场会议绑定，但固定 meeting session 及 transcript 持续保留，曾占用会议室的会议随后才释放下一场。
 
 ## Agent 工具
 
