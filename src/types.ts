@@ -676,9 +676,6 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
   if (taskCheckinStartHour > taskCheckinEndHour) {
     throw new Error("taskHourlyCheckins.startHour must not be later than endHour");
   }
-  if (taskPromptStartHour > taskPromptEndHour) {
-    throw new Error("taskRollingPrompts.startHour must not be later than endHour");
-  }
   if (noticeReminderStartHour > noticeReminderEndHour) {
     throw new Error("noticeUnreadReminders.startHour must not be later than endHour");
   }

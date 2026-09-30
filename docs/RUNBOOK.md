@@ -176,7 +176,7 @@ Boss 不属于 `agents.list`，头像走独立逻辑。默认读取 `~/.openclaw
 
 ### 员工没有收到任务回转提示
 
-先在“公司 → 任务”的“任务回转提示池”面板确认功能已开启，并检查该员工的队列、池首、层级默认/覆盖间隔、剩余工作分钟和 `nextDueAt`。默认工作窗口为北京时间 `[08:00, 18:00)`；默认间隔是层级乘以 5 分钟，Boss 可在面板设置 1–600 分钟覆盖或恢复默认。旧 `taskRollingPrompts.intervalMinutes`、`taskHourlyCheckins` 和全局 `:00/:20/:40` tick 已废弃。
+先在“公司 → 任务”的“任务回转提示池”面板确认功能已开启，并检查该员工的队列、池首、层级默认/覆盖间隔、剩余工作分钟和 `nextDueAt`。默认工作窗口为北京时间 `[08:00, 18:00)`；支持跨天窗口，例如界面 `22:00–次日 06:00` 对应配置/API `startHour: 22, endHour: 5`（结束小时包含在内）。白天倒计时暂停，空池首项也须等到上班再投递；全天请选择 `00:00–24:00`。默认间隔是层级乘以 5 分钟，Boss 可在面板设置 1–600 分钟覆盖或恢复默认。旧 `taskRollingPrompts.intervalMinutes`、`taskHourlyCheckins` 和全局 `:00/:20/:40` tick 已废弃。
 
 检查 `task_prompt_pool_items`、`task_prompt_schedules`、`task_prompt_cycles`、`task_prompt_cycle_dispatches` 和 `entity_type=task_prompt_cycle` 的审计。`skipped_busy` 表示到期时 main session 已被用户、即时通知或其他系统激活，或员工正作为主持人/参会者处于活动会议中，池首不动并重走完整间隔；`skipped_empty` 表示池为空且计时停止；`skipped_offline` 表示 Gateway 离线错过到期点；`failed` 且 `started=0` 表示没有确认启动、池首不动；`started=1` 表示已经轮转到队尾，本次提示不会重放。日志关键字为 `company-os rolling task prompt countdown`。
 

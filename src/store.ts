@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { addShanghaiWorkMinutes, isShanghaiWorkTime, remainingShanghaiWorkMilliseconds, validWorkHours } from "./work-hours.js";
+export { addShanghaiWorkMinutes } from "./work-hours.js";
+
 import { normalizeGitLocation } from "./git-verifier.js";
 import type { WorkspaceReviewMaterialDelivery } from "./review-handoff.js";
 import type {
@@ -3215,7 +3218,7 @@ export class CompanyOsStore {
     if (![0, 20, 40].includes(slot.minute) || slot.second !== 0 || slot.millisecond !== 0) {
       throw new Error("task prompt ticks must be scheduled at :00, :20, or :40");
     }
-    if (slot.hour < this.taskPromptConfig.startHour || slot.hour > this.taskPromptConfig.endHour) {
+    if (!isShanghaiWorkTime(scheduledAt.getTime(), this.taskPromptConfig.startHour, this.taskPromptConfig.endHour)) {
       throw new Error("task prompt tick is outside the configured schedule");
     }
     const slotKey = `${slot.localDate}T${String(slot.hour).padStart(2, "0")}:${String(slot.minute).padStart(2, "0")}`;
@@ -3451,8 +3454,7 @@ export class CompanyOsStore {
     const endOverride = this.db.prepare("SELECT value FROM schema_meta WHERE key = 'task_prompt_work_end_hour'").get() as Row | undefined;
     const startHour = startOverride ? Number(startOverride.value) : this.taskPromptConfig.startHour;
     const endHour = endOverride ? Number(endOverride.value) : this.taskPromptConfig.endHour;
-    const validOverride = Number.isInteger(startHour) && Number.isInteger(endHour)
-      && startHour >= 0 && endHour <= 23 && startHour <= endHour;
+    const validOverride = validWorkHours(startHour, endHour);
     return {
       startHour: validOverride ? startHour : this.taskPromptConfig.startHour,
       endHour: validOverride ? endHour : this.taskPromptConfig.endHour,
@@ -3499,9 +3501,11 @@ export class CompanyOsStore {
       }
       if (!schedule.next_due_at && this.taskPromptConfig.enabled && !globalSettings.paused) {
         // An empty active queue has no countdown. Its first newly eligible item is
-        // immediately due; later rotations and busy/offline skips reset the full
+        // immediately due during work hours; outside them it waits for opening.
+        // Later rotations and busy/offline skips reset the full
         // personal interval in createTaskPromptCycleDispatch/recovery.
-        const nextDueAt = new Date(now).toISOString();
+        const workHours = this.taskPromptWorkHours();
+        const nextDueAt = addShanghaiWorkMinutes(now, 0, workHours.startHour, workHours.endHour);
         this.db.prepare("UPDATE task_prompt_schedules SET next_due_at = ?, updated_at = ? WHERE member_id = ?")
           .run(nextDueAt, createdAt, member.id);
       }
@@ -3651,9 +3655,8 @@ export class CompanyOsStore {
     if (!restoring && (startHour === null || endHour === null)) {
       throw new Error("startHour and endHour must both be integers or both be null");
     }
-    if (!restoring && (!Number.isInteger(startHour) || !Number.isInteger(endHour)
-      || startHour! < 0 || endHour! > 23 || startHour! > endHour!)) {
-      throw new Error("work hours must be integer hours between 0 and 23 with startHour no later than endHour");
+    if (!restoring && (!validWorkHours(startHour!, endHour!))) {
+      throw new Error("work hours must be integer hours between 0 and 23");
     }
     this.reconcileTaskPromptPool();
     return this.transaction(() => {
@@ -3710,11 +3713,18 @@ export class CompanyOsStore {
     const row = this.db.prepare(`
       SELECT next_due_at FROM task_prompt_schedules WHERE next_due_at IS NOT NULL ORDER BY next_due_at LIMIT 1
     `).get() as Row | undefined;
-    return (row?.next_due_at ?? null) as string | null;
+    if (!row?.next_due_at) return null;
+    const workHours = this.taskPromptWorkHours();
+    const due = Date.parse(row.next_due_at);
+    const now = Date.now();
+    const from = isShanghaiWorkTime(now, workHours.startHour, workHours.endHour) ? due : Math.max(now, due);
+    return addShanghaiWorkMinutes(from, 0, workHours.startHour, workHours.endHour);
   }
 
   dueTaskPromptMembers(now = Date.now()) {
-    if (this.taskPromptGlobalSettings().paused) return [];
+    if (!this.taskPromptConfig.enabled || this.taskPromptGlobalSettings().paused) return [];
+    const workHours = this.taskPromptWorkHours();
+    if (!isShanghaiWorkTime(now, workHours.startHour, workHours.endHour)) return [];
     this.reconcileTaskPromptPool();
     return (this.db.prepare(`
       SELECT member_id FROM task_prompt_schedules
@@ -3769,11 +3779,12 @@ export class CompanyOsStore {
   ): TaskPromptDispatch & { claimed: boolean } {
     return this.transaction(() => {
       if (this.taskPromptGlobalSettings().paused) throw new Error("task prompt pool is paused by Boss");
+      const workHours = this.taskPromptWorkHours();
+      if (!isShanghaiWorkTime(now, workHours.startHour, workHours.endHour)) throw new Error("task prompt countdown is outside work hours");
       this.reconcileTaskPromptPool();
       const schedule = this.db.prepare("SELECT * FROM task_prompt_schedules WHERE member_id = ?").get(memberId) as Row | undefined;
       if (!schedule?.next_due_at || Date.parse(schedule.next_due_at) > now) throw new Error("task prompt countdown is not due");
       const interval = this.taskPromptInterval(memberId).intervalMinutes;
-      const workHours = this.taskPromptWorkHours();
       const cycleId = randomUUID();
       const createdAt = new Date(now).toISOString();
       const nextDueAt = addShanghaiWorkMinutes(now, interval, workHours.startHour, workHours.endHour);
@@ -10863,44 +10874,6 @@ function shanghaiLocalDateDaysAgo(now: number, days: number) {
   return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
 }
 
-export function addShanghaiWorkMinutes(now: number, minutes: number, startHour: number, endHour: number) {
-  let local = now + SHANGHAI_OFFSET_MS;
-  let remaining = Math.max(0, minutes) * 60_000;
-  while (true) {
-    const date = new Date(local);
-    const dayStart = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), startHour);
-    const dayEnd = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), endHour + 1);
-    if (local < dayStart) local = dayStart;
-    if (local >= dayEnd) {
-      local = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, startHour);
-      continue;
-    }
-    const available = dayEnd - local;
-    if (remaining <= available) return new Date(local + remaining - SHANGHAI_OFFSET_MS).toISOString();
-    remaining -= available;
-    local = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, startHour);
-  }
-}
-
-function remainingShanghaiWorkMilliseconds(now: number, due: number, startHour: number, endHour: number) {
-  if (due <= now) return 0;
-  let cursor = now;
-  let total = 0;
-  while (cursor < due) {
-    const local = new Date(cursor + SHANGHAI_OFFSET_MS);
-    const start = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), startHour) - SHANGHAI_OFFSET_MS;
-    const end = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), endHour + 1) - SHANGHAI_OFFSET_MS;
-    const from = Math.max(cursor, start);
-    const to = Math.min(due, end);
-    if (to > from) total += to - from;
-    cursor = Math.max(cursor + 1, end);
-    if (cursor < due) {
-      cursor = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + 1, startHour) - SHANGHAI_OFFSET_MS;
-    }
-  }
-  return total;
-}
-
 function remainingShanghaiWorkMinutes(now: number, due: number, startHour: number, endHour: number) {
   return Math.ceil(remainingShanghaiWorkMilliseconds(now, due, startHour, endHour) / 60_000);
 }
@@ -10939,7 +10912,8 @@ export function nextTaskPromptTickAt(now: number, startHour: number, endHour: nu
   const baseMonth = local.getUTCMonth();
   const baseDate = local.getUTCDate();
   for (let dayOffset = 0; dayOffset < 3; dayOffset += 1) {
-    for (let hour = startHour; hour <= endHour; hour += 1) {
+    for (let hour = 0; hour < 24; hour += 1) {
+      if (startHour <= endHour ? hour < startHour || hour > endHour : hour < startHour && hour > endHour) continue;
       for (const minute of [0, 20, 40]) {
         const localCandidate = Date.UTC(baseYear, baseMonth, baseDate + dayOffset, hour, minute);
         const candidate = localCandidate - SHANGHAI_OFFSET_MS;

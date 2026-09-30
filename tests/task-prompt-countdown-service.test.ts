@@ -11,6 +11,35 @@ import { resolveConfig } from "../src/types.js";
 describe("personal task prompt countdown service", () => {
   afterEach(() => vi.useRealTimers());
 
+  it("wakes at an overnight shift opening and never dispatches at its exclusive closing boundary", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-23T21:59:00+08:00"));
+    const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-night-countdown-"));
+    const invoke = vi.fn(async () => ({ ok: true as const, text: "完成", raw: {}, attempts: 1 }));
+    const service = new CompanyOsService({
+      databasePath: path.join(directory, "company-os.sqlite"), allowedAgentIds: ["main"],
+      config: resolveConfig({ bossEmailNotifications: { enabled: false }, taskRollingPrompts: { startHour: 22, endHour: 5 } }),
+      runtimeConfig: {}, logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      agentInvoker: { invoke }, isSessionActive: () => false,
+    });
+    try {
+      await service.start();
+      service.store.createRootTask({ title: "夜间任务", description: "工作时间执行", acceptanceCriteria: "白天不投递", assigneeId: "main" });
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(invoke).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(201);
+      expect(invoke).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(new Date("2026-09-24T05:59:00+08:00"));
+      service.setTaskPromptInterval("main", 1);
+      expect(service.store.nextTaskPromptDueAt()).toBe("2026-09-24T14:00:00.000Z");
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(invoke).toHaveBeenCalledTimes(1);
+    } finally {
+      await service.stop();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("immediately dispatches the first item when an empty pool becomes nonempty and rotates it before the reply completes", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-07T02:00:00.000Z"));

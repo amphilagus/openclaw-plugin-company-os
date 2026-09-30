@@ -9,6 +9,31 @@ import type { TaskPromptPoolSummary } from "../web/src/types.js";
 describe("rolling task prompt pool Boss panel", () => {
   afterEach(() => vi.useRealTimers());
 
+  it.each([
+    ["2026-09-23T23:55:00+08:00", "2026-09-24T00:05:00+08:00", "倒计时进行中", "00:10:00"],
+    ["2026-09-24T12:00:00+08:00", "2026-09-24T22:05:00+08:00", "非工作时间暂停", "00:05:00"],
+    ["2026-09-24T12:00:00+08:00", "2026-09-24T22:00:00+08:00", "非工作时间暂停", "00:00:00"],
+  ])("shows overnight controls and the correct countdown at %s", (now, due, state, countdown) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(now));
+    const summary: TaskPromptPoolSummary = {
+      enabled: true, timeZone: "Asia/Shanghai", startHour: 22, endHour: 5, workHoursSource: "boss_override",
+      nextDueAt: due, totals: { employees: 1, items: 1, execution: 1, review: 0, blockedReview: 0 },
+      queues: [{
+        memberId: "cto", memberName: "CTO", level: 1, defaultIntervalMinutes: 5, intervalMinutes: 10,
+        intervalOverrideMinutes: 10, intervalSource: "boss_override", nextDueAt: due, remainingWorkMinutes: 10,
+        count: 1, head: { taskId: "task-a", title: "夜间任务", parentTitle: null, kind: "execution", enqueuedAt: now, lastPromptedAt: null, promptCount: 0 },
+        items: [], lastDispatch: null,
+      }],
+    };
+    const html = renderToStaticMarkup(<TaskRollingPoolPanel summary={summary} reload={vi.fn()} />);
+    expect(html).toContain("22:00–次日 06:00 · 个人倒计时");
+    expect(html).toContain("结束于次日");
+    expect(html).toContain('<button type="button">应用时间</button>');
+    expect(html).toContain(state);
+    expect(html).toContain(countdown);
+  });
+
   it("shows queue heads, next tick, item kinds, and busy skips", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-06T02:25:00.000Z"));

@@ -1,3 +1,5 @@
+import { isShanghaiWorkTime, remainingShanghaiWorkMilliseconds, validWorkHours } from "../../src/work-hours.js";
+
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { deleteNotice, getMeeting, getSnapshot, getTask, getTaskImageAttachment, post, put, subscribeToChanges } from "./api";
@@ -468,7 +470,7 @@ export function TaskRollingPoolPanel({ summary, organization = [], reload }: {
   return <section className="task-checkin-panel panel">
     <div className="task-checkin-heading">
       <div><span className="eyebrow">ROLLING TASK PROMPT POOL</span><h2>任务回转提示池</h2></div>
-      <Badge tone={!summary.enabled ? "canceled" : paused ? "blocked" : "completed"}>{!summary.enabled ? "已关闭" : paused ? "全公司回转已暂停" : `${String(summary.startHour).padStart(2, "0")}:00–${String(summary.endHour + 1).padStart(2, "0")}:00 · 个人倒计时`}</Badge>
+      <Badge tone={!summary.enabled ? "canceled" : paused ? "blocked" : "completed"}>{!summary.enabled ? "已关闭" : paused ? "全公司回转已暂停" : `${String(summary.startHour).padStart(2, "0")}:00–${summary.startHour > summary.endHour ? "次日 " : ""}${String(summary.endHour + 1).padStart(2, "0")}:00 · 个人倒计时`}</Badge>
     </div>
     {reload ? <TaskPromptWorkHoursControl summary={summary} reload={reload} /> : null}
     <div className="task-checkin-stats">
@@ -556,12 +558,13 @@ function TaskPromptWorkHoursControl({ summary, reload }: {
       setSaving(false);
     }
   };
-  const valid = Number(startHour) >= 0 && Number(endExclusiveHour) <= 24 && Number(startHour) < Number(endExclusiveHour);
+  const valid = validWorkHours(Number(startHour), Number(endExclusiveHour) - 1) && Number(startHour) !== Number(endExclusiveHour);
   const validMinutesPerLevel = /^\d+$/.test(minutesPerLevel) && Number(minutesPerLevel) >= 1 && Number(minutesPerLevel) <= 600;
   return <div className="task-prompt-work-hours">
-    <div><b>全公司回转节奏</b><small>上班时间内按层级 × 系数；暂停时保留队列和剩余倒计时</small></div>
+    <div><b>全公司回转节奏</b><small>北京时间；上班时间内倒计时，结束早于开始表示次日；全天请选择 00:00–24:00</small></div>
     <label>开始<select value={startHour} disabled={saving} onChange={(event) => setStartHour(event.target.value)}>{Array.from({ length: 24 }, (_, hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label>
     <label>结束<select value={endExclusiveHour} disabled={saving} onChange={(event) => setEndExclusiveHour(event.target.value)}>{Array.from({ length: 24 }, (_, index) => index + 1).map((hour) => <option key={hour} value={hour}>{String(hour).padStart(2, "0")}:00</option>)}</select></label>
+    <small>{Number(endExclusiveHour) < Number(startHour) ? "结束于次日" : Number(endExclusiveHour) === Number(startHour) ? "起止时间不能相同；全天请选择 00:00–24:00" : ""}</small>
     <button type="button" disabled={saving || !valid} onClick={() => void saveHours(false)}>应用时间</button>
     <button type="button" className="ghost" disabled={saving || summary.workHoursSource !== "boss_override"} onClick={() => void saveHours(true)}>恢复时间默认</button>
     <label>层级系数（分钟）<input type="number" min={1} max={600} value={minutesPerLevel} disabled={saving} onChange={(event) => setMinutesPerLevel(event.target.value)} /></label>
@@ -638,7 +641,7 @@ function TaskPromptCountdown({ summary, queue, now }: {
         ? queue.head
           ? { tone: "due", label: "等待调度器建立倒计时", value: "待调度" }
           : { tone: "paused", label: "暂无可投递池首", value: "已暂停" }
-        : remainingMs === 0
+        : remainingMs === 0 && inWorkWindow
           ? { tone: "due", label: "已到期", value: "00:00:00" }
           : inWorkWindow
             ? { tone: "running", label: "倒计时进行中", value: formatCountdown(remainingMs) }
@@ -1120,28 +1123,6 @@ function formatCountdown(milliseconds: number) {
   const minutes = Math.floor((totalSeconds % 3_600) / 60);
   const seconds = totalSeconds % 60;
   return [hours, minutes, seconds].map((value) => String(value).padStart(2, "0")).join(":");
-}
-function isShanghaiWorkTime(now: number, startHour: number, endHour: number) {
-  const local = new Date(now + 8 * 60 * 60 * 1_000);
-  const hour = local.getUTCHours();
-  return hour >= startHour && hour < endHour + 1;
-}
-function remainingShanghaiWorkMilliseconds(now: number, due: number, startHour: number, endHour: number) {
-  if (due <= now) return 0;
-  const offset = 8 * 60 * 60 * 1_000;
-  let cursor = now;
-  let total = 0;
-  while (cursor < due) {
-    const local = new Date(cursor + offset);
-    const start = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), startHour) - offset;
-    const end = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate(), endHour + 1) - offset;
-    const from = Math.max(cursor, start);
-    const to = Math.min(due, end);
-    if (to > from) total += to - from;
-    cursor = Math.max(cursor + 1, end);
-    if (cursor < due) cursor = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + 1, startHour) - offset;
-  }
-  return total;
 }
 function shortId(id: string) { return id.slice(0, 8); }
 function messageOf(error: unknown) { return error instanceof Error ? error.message : String(error); }
