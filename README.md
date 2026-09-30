@@ -33,19 +33,20 @@ OpenClaw Gateway
     └── meeting queue + shared transcript + entry/session bindings + context/dispatch/email/closeout outbox
 ```
 
-前端是 React + Vite，包含三个真实路由：
+前端是 React + Vite，包含四个真实路由：
 
 - `/plugins/company-os-ui/meeting-room`：默认页面，当前会议、全员入会屏障、Boss 三项决策、普通会议结束倒计时、插话、任务草案、散会同步进度、队列和历史。
 - `/plugins/company-os-ui/tasks`：任务树、风险、版本/proof/审计、Boss 催办与兜底操作和根任务创建。
 - `/plugins/company-os-ui/notices`：当前共识、历史更正、会议汇报、阅读覆盖和公告半点提醒状态。
+- `/plugins/company-os-ui/self-governance`：每日自省和人设治理的计划、队列及执行历史。
 
 ## 安装与开发
 
-要求 OpenClaw `>=2026.7.1` 和支持 `node:sqlite` 的 Node.js。
+要求 OpenClaw `>=2026.7.1` 和支持 `node:sqlite` 的 Node.js。开发 SDK 固定为 `2026.9.3`，使用已提交的锁文件安装依赖。
 
 ```bash
 cd /Users/amphilagusgu/.openclaw/company/openclaw-plugin-company-os
-npm install
+npm ci
 npm test
 npm run plugin:validate
 openclaw plugins install --link /Users/amphilagusgu/.openclaw/company/openclaw-plugin-company-os
@@ -53,9 +54,11 @@ openclaw config set gateway.controlUi.embedSandbox trusted
 openclaw gateway restart
 ```
 
-`trusted` 让同源插件 iframe 在静态壳加载后复用 Control UI 保存在同一顶层浏览上下文 `sessionStorage` 中的 Gateway 登录令牌；页面本身不提供第二套认证。静态壳不包含公司数据，所有读取、写入和 SSE 请求仍访问 Gateway 鉴权的 `/plugins/company-os/api/v1/*`。标签页和写接口面向拥有 `operator.write` 的 Boss 操作者。
+`trusted` 让同源插件 iframe 复用父 Control UI 已认证的 Gateway client，经 `companyOs.api` 调用业务接口；兼容新版连接状态 `phase` 和旧版 `connected`。没有可用 client 时回退到 Gateway 鉴权的 HTTP API；事件订阅优先轮询 Gateway，旧版环境可使用 HTTP SSE。页面不提供第二套认证，静态壳不包含公司数据，标签页和写接口面向拥有 `operator.write` 的 Boss 操作者。
 
 插件必须设置 `plugins.entries.company-os.hooks.allowConversationAccess=true`，用于通过可信工具上下文完成会议专属 session 的记录回写。会议基本规则不由插件注入，而由现有 `company-guidelines` Hook 在 `agent:bootstrap` 时从 `~/.openclaw/company-info/company-hard-rules.md` 统一添加到临时 `AGENTS.md` 头部。完整配置见样例。
+
+也可使用 pnpm 11：`pnpm install --frozen-lockfile`。依赖变更后先更新 npm 锁文件，再运行 `pnpm import` 同步 pnpm 锁文件。
 
 开发前端：
 
@@ -63,7 +66,7 @@ openclaw gateway restart
 npm run dev:web
 ```
 
-无业务写入的三页视觉验收：`npm run build && npm run preview:fixture`。
+无业务写入的页面视觉验收：`npm run build && npm run preview:fixture`。
 
 生产构建：
 
@@ -164,7 +167,7 @@ Boss 创建根任务时默认要求负责人通过任务会完成拆解，但默
 
 Company OS 默认在北京时间 05:00 建立每日经验沉淀任务、06:00 建立每日人设治理任务。每轮冻结当时所有在职 Agent，按组织层级升序、同级按 Agent ID 排序，并从基础时间开始每人错开一分钟。两类任务都进入每名 Agent 固定的 `agent:<agentId>:self-audit` custom session，跨天保留治理上下文；CLI 不启用 `--deliver`，最终回复不会自动发送到聊天渠道。
 
-调度记录持久化在 `daily_agent_runs` 与 `daily_agent_dispatches`。Gateway 不补建离线期间错过的每日轮次，但会恢复已经排队且从未尝试的 dispatch；已经领取过的任务不会自动重放，避免重复编辑 workspace。不同 Agent 可以并行执行，同一 Agent 的两类治理任务严格串行。可通过 `dailySelfImprovement.enabled/hour/minute` 与 `dailyPersonaAudit.enabled/hour/minute` 调整配置，时区固定为 `Asia/Shanghai`。
+调度记录持久化在 `daily_agent_runs` 与 `daily_agent_dispatches`。Gateway 不补建离线期间错过的每日轮次，但会恢复已经排队且从未尝试的 dispatch；已经领取过的任务不会自动重放，避免重复编辑 workspace。不同 Agent 可以并行执行，同一 Agent 的两类治理任务严格串行。可通过 `dailySelfImprovement.enabled/hour/minute` 与 `dailyPersonaAudit.enabled/hour/minute` 调整配置，时区固定为 `Asia/Shanghai`。每次日常治理调用独立使用 `dailyAgentTimeoutSeconds`，默认 1800 秒、最小 60 秒，不受会议轮次超时影响；两类任务各自支持 `maxErrorRetries`（0–10，默认 2）。人设审计读取 AGENTS、SOUL、IDENTITY、MEMORY、USER 五个文件。
 
 Boss 可从顶部导航进入“自省治理”页面，查看两个机制的下一轮时间、今日队列、失败原因及最近七个北京时间自然日的执行历史。页面只读，配置仍由 OpenClaw 插件配置文件管理。
 
@@ -178,7 +181,7 @@ Boss 可从顶部导航进入“自省治理”页面，查看两个机制的下
 | 会议 | `company_meeting_request`、`company_meeting_list`、`company_meeting_status`、`company_meeting_speak`、`company_meeting_delegate`、`company_meeting_set_task_drafts`、`company_meeting_yield_to_boss`、`company_meeting_submit_summary`、`company_meeting_end`、`company_meeting_cancel` |
 | 任务 | `company_task_list`、`company_task_read`、`company_task_create`、`company_task_flow_update`、`company_task_start`、`company_task_progress`、`company_task_revise`、`company_task_block`、`company_task_unblock`、`company_task_submit`、`company_task_review`、`company_task_reassign`、`company_task_cancel`、`company_task_correct` |
 
-首次启动固定建立虚拟成员 `boss`，并以 OpenClaw 默认 Agent 的真实 ID 建立组织架构师；也可通过 `organizationAdminAgentId` 显式指定。只有该架构师能修改组织，新增员工的 Agent ID 必须已经存在于 `agents.list`。
+首次启动固定建立虚拟成员 `boss`，并以 OpenClaw 默认 Agent 的真实 ID 建立组织架构师；也可通过 `organizationAdminAgentId` 显式指定。只有该架构师能修改组织，新增员工的 Agent ID 必须已经存在于 `agents.entries`（兼容旧版 `agents.list`）。新版名单优先；组织架构师优先取显式配置，其次取 `agents.defaults.systemAgent.agentId`，再回退到旧版默认 Agent。
 
 ## 测试
 

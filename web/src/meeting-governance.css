@@ -36,6 +36,15 @@
   padding: 0 12px;
 }
 
+.entry-cancel-reason {
+  margin: 16px 0 12px;
+  text-align: left;
+}
+
+.entry-cancel-reason textarea {
+  margin-top: 2px;
+}
+
 .entry-session {
   grid-template-columns: 8px 1fr;
 }

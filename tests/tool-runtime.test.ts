@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe("agent tool runtime lifecycle", () => {
-  it("opens the shared store lazily when Gateway services are not started in the tool process", async () => {
+  it.each(["legacy", "canonical"])("opens the shared store lazily with %s agent config", async (format) => {
     const stateDir = mkdtempSync(path.join(os.tmpdir(), "company-os-tool-runtime-"));
     temporaryDirectories.push(stateDir);
     const tools = new Map<string, (context: any) => any>();
@@ -31,7 +31,9 @@ describe("agent tool runtime lifecycle", () => {
       config: resolveConfig(undefined),
     });
     seeded.close();
-    const config = { agents: { list: [{ id: "jia-goushi", default: true }, { id: "engineer" }] } };
+    const config = format === "canonical"
+      ? { agents: { entries: { engineer: {}, "jia-goushi": {} }, defaults: { systemAgent: { agentId: "jia-goushi" } } } }
+      : { agents: { list: [{ id: "jia-goushi", default: true }, { id: "engineer" }] } };
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 
     entry.register!({

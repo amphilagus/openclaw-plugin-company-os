@@ -25,6 +25,16 @@ plugins: {
 
 首次启动后，数据库应包含 `boss` 和组织架构师的真实 Agent ID。本机默认 Agent 是 `jia-goushi`，因此不应再出现作为别名的 `main`；可用 `organizationAdminAgentId` 显式覆盖架构师。
 
+## OpenClaw 2026.9.3 兼容性
+
+- 开发 SDK 固定为 `2026.9.3`，使用 `npm ci` 和仓库的 `package-lock.json` 安装依赖。
+- Agent 名单、头像和工作目录统一通过 `src/agent-config.ts` 读取。新版 `agents.entries` 优先于旧版 `agents.list`，即使新版名单为空也不恢复旧名单。
+- 组织架构师优先使用插件 `organizationAdminAgentId`，其次使用 `agents.defaults.systemAgent.agentId`；旧版配置仍支持 `default: true`。
+- 该版本发布的 `session-transcript-runtime` 缺少 TypeScript 声明，`src/openclaw-session-transcript.d.ts` 仅补齐插件使用的三个接口；运行时仍使用 OpenClaw 的 SQLite 会话接口。
+- WebUI 复用父控制台已认证的 Gateway client，兼容新版 `snapshot.phase === "connected"` 和旧版 `snapshot.connected === true`。新版 phase 优先，重连期间不使用遗留 client。
+- 升级或重新构建后，检查插件能力授权；审核后可用 `openclaw plugins enable company-os --accept-capabilities` 补齐，再执行 `openclaw gateway restart`。
+- `loaded` 只表示登记成功。还应确认日志出现 `company-os database ready`，并确认公司页面的 `/snapshot` 请求成功；日志不应再有 `plugin service failed (company-os`。
+
 ## 日常操作
 
 - Boss 在任务页创建根任务；一级员工从 `company_inbox` 看到派发。
@@ -96,7 +106,7 @@ openclaw config get gateway.controlUi.embedSandbox
 
 ### 新员工无法加入组织
 
-`company_org_add` 只接受已经存在于 OpenClaw `agents.list` 的 Agent ID。先创建 Agent，再由配置的组织架构师加入组织。
+`company_org_add` 只接受已经存在于 OpenClaw `agents.entries` 的 Agent ID（也兼容旧版 `agents.list`）。先创建 Agent，再由配置的组织架构师加入组织。
 
 ### 员工无法停用或换上级
 

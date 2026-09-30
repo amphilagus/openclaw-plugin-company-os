@@ -69,7 +69,9 @@
           },
           "intervalMinutes": {
             "type": "integer",
-            "enum": [20],
+            "enum": [
+              20
+            ],
             "default": 20,
             "description": "Deprecated: personal intervals are level defaults or Boss per-agent overrides."
           }
@@ -116,6 +118,12 @@
             "minimum": 0,
             "maximum": 59,
             "default": 0
+          },
+          "maxErrorRetries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+            "default": 2
           }
         },
         "additionalProperties": false
@@ -138,6 +146,12 @@
             "minimum": 0,
             "maximum": 59,
             "default": 0
+          },
+          "maxErrorRetries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+            "default": 2
           }
         },
         "additionalProperties": false
@@ -171,6 +185,12 @@
           }
         },
         "additionalProperties": false
+      },
+      "dailyAgentTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 60,
+        "default": 1800,
+        "description": "Per-run timeout for scheduled daily self-improvement / persona-audit dispatches (decoupled from participantTurnTimeoutSeconds)."
       }
     },
     "additionalProperties": false

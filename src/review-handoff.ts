@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { resolveConfiguredAgent } from "./agent-config.js";
 
 import type { EvidenceInput, PreparedTaskReviewHandoff, TaskReviewHandoffInput } from "./types.js";
 
@@ -147,11 +148,7 @@ function optionalText(value: unknown) {
 }
 
 export function resolveAgentWorkspace(runtimeConfig: unknown, agentId: string) {
-  const agents = (runtimeConfig as { agents?: { list?: unknown[] } } | undefined)?.agents?.list ?? [];
-  const agent = agents.find((candidate): candidate is Record<string, unknown> => (
-    Boolean(candidate) && typeof candidate === "object" && !Array.isArray(candidate)
-      && (candidate as Record<string, unknown>).id === agentId
-  ));
+  const agent = resolveConfiguredAgent(runtimeConfig, agentId);
   const configured = agent?.workspace;
   if (typeof configured !== "string" || !configured.trim()) {
     throw new Error(`OpenClaw workspace is not configured for agent: ${agentId}`);

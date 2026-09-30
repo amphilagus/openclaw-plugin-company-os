@@ -40,7 +40,12 @@ function clientFromContext(value: unknown): ControlUiGatewayClient | null {
   const gateway = value.gateway;
   if (!isRecord(gateway)) return null;
   const snapshot = gateway.snapshot;
-  if (!isRecord(snapshot) || snapshot.connected !== true) return null;
+  if (!isRecord(snapshot)) return null;
+  // 2026.9 uses a connection phase; older hosts expose a connected boolean.
+  const connected = typeof snapshot.phase === "string"
+    ? snapshot.phase === "connected"
+    : snapshot.connected === true;
+  if (!connected) return null;
   const client = snapshot.client;
   return isRecord(client) && typeof client.request === "function"
     ? client as ControlUiGatewayClient

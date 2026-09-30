@@ -33,6 +33,8 @@ export function BossMeetingGate({
   const [ending, setEnding] = useState(false);
   const [finalSummary, setFinalSummary] = useState("");
   const [publishNotice, setPublishNotice] = useState(false);
+  const [cancelingEntry, setCancelingEntry] = useState(false);
+  const [cancelEntryReason, setCancelEntryReason] = useState("");
 
   if (meeting.awaitingBossStart) {
     if (rejectingMeeting) {
@@ -66,10 +68,16 @@ export function BossMeetingGate({
       <h3>{meeting.entryState === "notifying" ? `正在通知全员 · 已到 ${delivered}/${total}` : `正在绑定固定 meeting Sessions · ${meeting.entryStatus.ready}/${total}`}</h3>
       <p>全员 main 通知和预建 meeting session 绑定全部成功前，主持人不会启动；任务与公告只对已收到入会通知的成员暂缓。</p>
       {meeting.entryStatus.waitingMembers.length ? <div className="entry-member-list">{meeting.entryStatus.waitingMembers.map((member) => <div key={`${member.memberId}:${member.status}`}><b>{member.memberName}</b><span>{member.lastError ?? member.status}</span>{member.nextRetryAt ? <time>下次重试 {new Date(member.nextRetryAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time> : null}</div>)}</div> : null}
-      <div className="boss-gate-actions">
+      {cancelingEntry ? <>
+        <label className="entry-cancel-reason">取消原因<textarea autoFocus rows={3} value={cancelEntryReason} disabled={busy} onChange={(event) => setCancelEntryReason(event.target.value)} placeholder="说明为什么不再召开这场会议……" /></label>
+        <div className="boss-gate-actions">
+          <button type="button" className="danger-button" disabled={busy || !cancelEntryReason.trim() || !cancelEntry} onClick={() => { cancelEntry?.(cancelEntryReason.trim()); setCancelingEntry(false); setCancelEntryReason(""); }}>{busy ? "正在取消…" : "确认取消会议"}</button>
+          <button type="button" className="ghost" disabled={busy} onClick={() => { setCancelingEntry(false); setCancelEntryReason(""); }}>返回</button>
+        </div>
+      </> : <div className="boss-gate-actions">
         <button type="button" className="primary" disabled={busy || !retryEntry || failed.length === 0} onClick={retryEntry}>立即重试</button>
-        <button type="button" className="danger-button" disabled={busy || !cancelEntry} onClick={() => { const reason = window.prompt("取消会议的原因："); if (reason) cancelEntry?.(reason); }}>取消会议</button>
-      </div>
+        <button type="button" className="danger-button" disabled={busy || !cancelEntry} onClick={() => setCancelingEntry(true)}>取消会议</button>
+      </div>}
     </div>;
   }
   if (meeting.endRequestedAt) {

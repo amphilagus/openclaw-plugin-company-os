@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { resolveConfiguredAgent } from "./agent-config.js";
 
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const MIME_TYPES: Record<string, string> = {
@@ -20,8 +21,7 @@ export type AgentVisualIdentity = {
 };
 
 export function resolveAgentVisualIdentity(runtimeConfig: unknown, agentId: string): AgentVisualIdentity {
-  const agents = (runtimeConfig as { agents?: { list?: unknown[] } } | undefined)?.agents?.list ?? [];
-  const agent = agents.find((candidate) => isRecord(candidate) && candidate.id === agentId);
+  const agent = resolveConfiguredAgent(runtimeConfig, agentId);
   if (!isRecord(agent)) return { agentId, configuredName: null, emoji: null, avatarUrl: null };
   const identity = isRecord(agent.identity) ? agent.identity : {};
   const configuredName = optionalString(identity.name) ?? optionalString(agent.name) ?? null;

@@ -7,6 +7,7 @@ import {
   type OpenClawPluginApi,
 } from "openclaw/plugin-sdk/core";
 import { Type } from "typebox";
+import { resolveConfiguredAgentIds } from "./agent-config.js";
 
 import {
   COMPANY_OS_API_PREFIX,
@@ -25,6 +26,7 @@ const SQLITE_FILE = "company-os.sqlite";
 
 const ConfigSchema = Type.Object({
   participantTurnTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 60, default: 600 })),
+  dailyAgentTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 60, default: 1800, description: "Per-run timeout for scheduled daily self-improvement / persona-audit dispatches (decoupled from participantTurnTimeoutSeconds)." })),
   hostIdleTimeoutSeconds: Type.Optional(Type.Integer({ minimum: 60, default: 1800 })),
   meetingAutoEndDelaySeconds: Type.Optional(Type.Integer({ minimum: 1, default: 60 })),
   taskStaleAfterHours: Type.Optional(Type.Integer({ minimum: 1, default: 72 })),
@@ -181,9 +183,4 @@ function resolveDatabasePath(api: OpenClawPluginApi, configured: string | undefi
   }
   const stateDir = serviceStateDir ?? api.runtime.state.resolveStateDir();
   return path.join(stateDir, "plugins", PLUGIN_ID, SQLITE_FILE);
-}
-
-function resolveConfiguredAgentIds(config: unknown) {
-  const list = (config as { agents?: { list?: Array<{ id?: unknown }> } } | undefined)?.agents?.list ?? [];
-  return list.flatMap((agent) => typeof agent.id === "string" && agent.id.trim() ? [agent.id.trim()] : []);
 }

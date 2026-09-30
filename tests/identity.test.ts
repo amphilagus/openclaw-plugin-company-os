@@ -15,12 +15,15 @@ afterEach(() => {
 });
 
 describe("agent visual identity", () => {
-  it("loads a configured workspace avatar as an embeddable data URL", () => {
+  it.each(["legacy", "canonical"])("loads a workspace avatar with %s agent config", (format) => {
     const workspace = mkdtempSync(path.join(os.tmpdir(), "company-os-avatar-"));
     directories.push(workspace);
     mkdirSync(path.join(workspace, "assets"));
     writeFileSync(path.join(workspace, "assets", "avatar.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-    const config = { agents: { list: [{ id: "main", name: "架构师", workspace, identity: { emoji: "⚙️", avatar: "assets/avatar.png" } }] } };
+    const agent = { name: "架构师", workspace, identity: { emoji: "⚙️", avatar: "assets/avatar.png" } };
+    const config = format === "canonical"
+      ? { agents: { entries: { main: agent } } }
+      : { agents: { list: [{ ...agent, id: "main" }] } };
 
     expect(resolveAgentVisualIdentity(config, "main")).toEqual({
       agentId: "main",

@@ -95,7 +95,7 @@ const DAILY_AGENT_PROMPTS: Record<DailyAgentKind, string> = {
 5. 如果有已验证的规则，promote 到 MEMORY.md
 只记录值得记住的内容，不记录日常噪音。完成后简要记录到 memory/YYYY-MM-DD.md。`,
   daily_persona_audit: `这是每日人设文件治理任务。执行 persona-audit 技能：
-1. 读取你的 6 个 persona 文件（AGENTS/SOUL/IDENTITY/MEMORY/TOOLS/USER）
+1. 读取你的 5 个 persona 文件（AGENTS/SOUL/IDENTITY/MEMORY/USER）
 2. 检查行数预算、Hook 重复、跨文件矛盾、workspace 清洁度
 3. 做 reality sync：检查最近 24h 的 session 和 memory，确保人设文件与真实状态匹配
 4. 直接编辑修复问题

@@ -1,4 +1,5 @@
 import React from "react";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { describe, expect, it, vi } from "vitest";
@@ -126,5 +127,36 @@ describe("Boss direct meeting controls", () => {
     expect(html).toContain("3</b> 结束会议");
     expect(html).toContain("主持人总结第一版");
     expect(html).not.toContain("批准并结束");
+  });
+
+  it("keeps entry cancellation inside the page instead of using unsupported WebView prompts", () => {
+    const html = renderToStaticMarkup(<BossMeetingGate
+      meeting={{
+        ...meeting,
+        sessionMode: "dedicated",
+        entryState: "provisioning",
+        entryStatus: {
+          state: "provisioning",
+          total: 3,
+          notified: 3,
+          ready: 0,
+          waitingMembers: [{ memberId: "cto", memberName: "CTO", status: "pending", lastError: null, nextRetryAt: null }],
+          nextRetryAt: null,
+        },
+        awaitingBossStart: false,
+        memberSessions: [],
+      }}
+      busy={false}
+      start={vi.fn()}
+      rejectMeeting={vi.fn()}
+      retryEntry={vi.fn()}
+      cancelEntry={vi.fn()}
+    />);
+    const source = readFileSync(new URL("../web/src/BossMeetingGate.tsx", import.meta.url), "utf8");
+
+    expect(html).toContain("取消会议");
+    expect(source).not.toContain("window.prompt");
+    expect(source).toContain("确认取消会议");
+    expect(source).toContain("取消原因");
   });
 });

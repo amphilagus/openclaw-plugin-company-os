@@ -11,8 +11,8 @@ import { GIT_INPUT, fakeGitRemoteVerifier } from "./test-git.js";
 const PROOF = [{ type: "proof" as const, label: "tests", command: "npm test" }];
 
 describe("task review handoff", () => {
-  it("freezes child-task files and delivers versioned review material to the issuer workspace", async () => {
-    const fixture = createFixture();
+  it.each(["legacy", "canonical"])("delivers versioned review material with %s agent config", async (format) => {
+    const fixture = createFixture(undefined, false, format === "canonical");
     try {
       const { service, ctoWorkspace, engineerWorkspace } = fixture;
       const { child } = createChildTask(service);
@@ -234,7 +234,7 @@ describe("task review handoff", () => {
   });
 });
 
-function createFixture(send = vi.fn(async () => undefined), missingReviewerWorkspace = false) {
+function createFixture(send = vi.fn(async () => undefined), missingReviewerWorkspace = false, canonical = false) {
   const directory = mkdtempSync(path.join(os.tmpdir(), "company-os-review-handoff-"));
   const ctoWorkspace = path.join(directory, "workspace-cto");
   const engineerWorkspace = path.join(directory, "workspace-eng-a");
@@ -248,7 +248,10 @@ function createFixture(send = vi.fn(async () => undefined), missingReviewerWorks
     databasePath: path.join(directory, "company-os.sqlite"),
     allowedAgentIds: ["main", "cto", "eng-a"],
     config: resolveConfig(undefined),
-    runtimeConfig: { agents: { list: [
+    runtimeConfig: canonical ? { agents: {
+      entries: { cto: { workspace: ctoWorkspace }, main: { workspace: mainWorkspace }, "eng-a": { workspace: engineerWorkspace } },
+      defaults: { systemAgent: { agentId: "main" } },
+    } } : { agents: { list: [
       { id: "main", workspace: mainWorkspace },
       { id: "cto", workspace: ctoWorkspace },
       { id: "eng-a", workspace: engineerWorkspace },

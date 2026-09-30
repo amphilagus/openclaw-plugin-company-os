@@ -44,6 +44,7 @@ export type Actor = "boss" | string;
 
 export type CompanyOsConfig = {
   participantTurnTimeoutSeconds?: number;
+  dailyAgentTimeoutSeconds?: number;
   hostIdleTimeoutSeconds?: number;
   meetingAutoEndDelaySeconds?: number;
   taskStaleAfterHours?: number;
@@ -88,6 +89,7 @@ export type CompanyOsConfig = {
 
 export type ResolvedCompanyOsConfig = {
   participantTurnTimeoutSeconds: number;
+  dailyAgentTimeoutSeconds: number;
   hostIdleTimeoutSeconds: number;
   meetingAutoEndDelaySeconds: number;
   taskStaleAfterHours: number;
@@ -681,6 +683,7 @@ export function resolveConfig(config: CompanyOsConfig | undefined): ResolvedComp
   }
   return {
     participantTurnTimeoutSeconds: clampInteger(config?.participantTurnTimeoutSeconds, 600, 60),
+    dailyAgentTimeoutSeconds: clampInteger(config?.dailyAgentTimeoutSeconds, 1800, 60),
     hostIdleTimeoutSeconds: clampInteger(config?.hostIdleTimeoutSeconds, 1800, 60),
     meetingAutoEndDelaySeconds: clampInteger(config?.meetingAutoEndDelaySeconds, 60, 1),
     taskStaleAfterHours: clampInteger(config?.taskStaleAfterHours, 72, 1),

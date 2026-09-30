@@ -1,0 +1,9 @@
+# Match the installed SDK/toolchain lifecycle requirements; genai's preinstall is a no-op.
+allowBuilds:
+  '@google/genai': false
+  esbuild: true
+  fsevents: true
+  koffi: true
+  openclaw: true
+  protobufjs: true
+  tree-sitter-bash: true

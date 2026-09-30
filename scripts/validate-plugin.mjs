@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(path.join(root, "openclaw.plugin.json"), "utf8"));
@@ -17,6 +18,15 @@ assert(typeof entry.register === "function", "native plugin entry must expose re
 assert(pkg.peerDependencies?.openclaw === ">=2026.7.1", "OpenClaw peer dependency must be >=2026.7.1");
 assert(JSON.stringify(manifest.contracts?.tools) === JSON.stringify(COMPANY_TOOL_NAMES), "manifest tool contracts must exactly match runtime tools");
 assert(existsSync(path.join(root, "web", "dist", "index.html")), "built WebUI index is missing");
+
+const manifestProperties = manifest.configSchema.properties;
+const runtimeProperties = entry.configSchema.jsonSchema.properties;
+assert(isDeepStrictEqual(manifestProperties.dailyAgentTimeoutSeconds, runtimeProperties.dailyAgentTimeoutSeconds),
+  "dailyAgentTimeoutSeconds must match the runtime schema");
+for (const mechanism of ["dailySelfImprovement", "dailyPersonaAudit"]) {
+  assert(isDeepStrictEqual(manifestProperties[mechanism].properties.maxErrorRetries, runtimeProperties[mechanism].properties.maxErrorRetries),
+    `${mechanism}.maxErrorRetries must match the runtime schema`);
+}
 
 const registered = { tools: [], services: [], routes: [], tabs: [], gatewayMethods: [], hooks: [] };
 entry.register({

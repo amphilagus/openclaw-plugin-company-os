@@ -2,6 +2,7 @@ import type { PluginLogger } from "openclaw/plugin-sdk/core";
 import { resolveActiveEmbeddedRunSessionId } from "openclaw/plugin-sdk/agent-harness-runtime";
 
 import { OpenClawCliAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
+import { resolveOrganizationAdminAgentId } from "./agent-config.js";
 import { SmtpMeetingEmailSender, type MeetingEmailSender } from "./email.js";
 import { GitCliRemoteVerifier, type GitRemoteVerifier } from "./git-verifier.js";
 import { materializeWorkspaceReviewMaterial, prepareTaskReviewHandoff, resolveAgentWorkspace } from "./review-handoff.js";
@@ -1402,7 +1403,7 @@ export class CompanyOsService {
       agentId: dispatch.targetAgentId,
       sessionKey: dispatch.sessionKey,
       prompt: dispatch.prompt,
-      timeoutSeconds: this.config.participantTurnTimeoutSeconds,
+      timeoutSeconds: this.config.dailyAgentTimeoutSeconds,
       maxInFlightRetries: 0,
       maxErrorRetries,
       signal: this.lifecycleAbort.signal,
@@ -1556,12 +1557,4 @@ function requiredIdentity(value: string, field: string) {
   const normalized = value.trim();
   if (!normalized) throw new Error(`meeting session ${field} is required`);
   return normalized;
-}
-
-function resolveOrganizationAdminAgentId(runtimeConfig: unknown, configured?: string) {
-  if (configured?.trim()) return configured.trim();
-  const agents = (runtimeConfig as { agents?: { list?: Array<{ id?: unknown; default?: unknown }> } } | undefined)?.agents?.list ?? [];
-  const ids = agents.flatMap((agent) => typeof agent.id === "string" && agent.id.trim() ? [agent.id.trim()] : []);
-  const selected = agents.find((agent) => agent.default === true && typeof agent.id === "string" && agent.id.trim());
-  return typeof selected?.id === "string" ? selected.id.trim() : ids.includes("main") ? "main" : ids[0] ?? "main";
 }

@@ -24,6 +24,7 @@ describe("daily self-governance service", () => {
         agentId: "main",
         sessionKey: "agent:main:self-audit",
         maxInFlightRetries: 0,
+        timeoutSeconds: 1800,
       }));
       expect(fixture.logger.info).toHaveBeenCalledWith(expect.stringContaining("scheduled daily self-improvement run"));
     } finally {
@@ -65,18 +66,20 @@ describe("daily self-governance service", () => {
     const fixture = createService({
       dailySelfImprovement: { hour: 5, minute: 0 },
       dailyPersonaAudit: { hour: 5, minute: 0 },
+      participantTurnTimeoutSeconds: 60,
+      dailyAgentTimeoutSeconds: 300,
     }, ["main"], invoke);
     try {
       fixture.service.dispatchDailySelfImprovementRun("2030-01-01T21:00:00.000Z");
       fixture.service.dispatchDailyPersonaAuditRun("2030-01-01T21:00:00.000Z");
       await vi.advanceTimersByTimeAsync(0);
       expect(invoke).toHaveBeenCalledTimes(1);
-      expect(invoke.mock.calls[0]?.[0]).toMatchObject({ sessionKey: "agent:main:self-audit" });
+      expect(invoke.mock.calls[0]?.[0]).toMatchObject({ sessionKey: "agent:main:self-audit", timeoutSeconds: 300 });
 
       resolvers[0]?.({ ok: true, text: "self done", attempts: 1, raw: null });
       await vi.advanceTimersByTimeAsync(0);
       expect(invoke).toHaveBeenCalledTimes(2);
-      expect(invoke.mock.calls[1]?.[0]).toMatchObject({ sessionKey: "agent:main:self-audit" });
+      expect(invoke.mock.calls[1]?.[0]).toMatchObject({ sessionKey: "agent:main:self-audit", timeoutSeconds: 300 });
       expect(invoke.mock.calls[0]?.[0].prompt).toContain("self-improving-agent");
       expect(invoke.mock.calls[1]?.[0].prompt).toContain("persona-audit");
 
